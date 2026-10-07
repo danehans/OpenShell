@@ -43,4 +43,8 @@ type ExecOptions struct {
 	// command. The zero value (false) preserves login-shell behavior. Set it
 	// for automation and managed checks that need predictable startup behavior.
 	NoLoginShell bool
+	// DisableTTY runs Interactive without a pseudo-terminal. The zero value
+	// preserves terminal behavior. Terminal dimensions are ignored when true.
+	// Run and Stream never allocate a pseudo-terminal.
+	DisableTTY bool
 }

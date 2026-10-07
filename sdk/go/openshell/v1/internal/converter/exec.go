@@ -53,9 +53,11 @@ func ExecRequestToProto(sandboxName string, command []string, opts *types.ExecOp
 // ExecInteractiveRequestToProto builds a proto ExecSandboxRequest for Interactive mode.
 func ExecInteractiveRequestToProto(sandboxName string, command []string, cols, rows uint32, opts *types.ExecOptions) *pb.ExecSandboxRequest {
 	req := ExecRequestToProto(sandboxName, command, opts)
-	req.Tty = true
-	req.Cols = cols
-	req.Rows = rows
+	req.Tty = opts == nil || !opts.DisableTTY
+	if req.Tty {
+		req.Cols = cols
+		req.Rows = rows
+	}
 	return req
 }
 

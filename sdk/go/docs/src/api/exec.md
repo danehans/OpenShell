@@ -102,6 +102,21 @@ fmt.Println("Exited with:", exitCode)
 
 The SDK wraps the bidirectional stream as an `InteractiveSession` with `Read`/`Write`/`Resize` methods.
 
+For automation that needs stdin without terminal processing or echo, pass
+`v1.ExecOptions{DisableTTY: true}`. The SDK then requests no pseudo-terminal and
+ignores the initial terminal dimensions. Omitting the option preserves terminal
+behavior, including when dimensions are zero. `Run` and `Stream` never request a
+pseudo-terminal.
+
+```go
+session, err := client.Exec().Interactive(ctx, "default", "sbx-123",
+    []string{"cat"}, 0, 0, v1.ExecOptions{DisableTTY: true, NoLoginShell: true})
+```
+
+Use `CloseInteractiveInput(session)` after writing input to send EOF while
+continuing to drain output. Disabling the terminal does not prevent the executed
+program from printing or retaining its input.
+
 ## ExecStream
 
 `ExecStream` provides an iterator interface over command output chunks. Call `Next()` repeatedly to receive output as it is produced. When the command finishes, `Next()` returns `io.EOF`.

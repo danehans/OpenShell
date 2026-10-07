@@ -145,13 +145,16 @@ func (s *mockExecServer) ExecSandboxInteractive(stream grpc.BidiStreamingServer[
 	}
 	if waitEOF {
 		for {
-			_, recvErr := stream.Recv()
+			msg, recvErr := stream.Recv()
 			if recvErr == io.EOF {
 				break
 			}
 			if recvErr != nil {
 				return recvErr
 			}
+			s.mu.Lock()
+			s.receivedInputs = append(s.receivedInputs, msg)
+			s.mu.Unlock()
 		}
 	}
 
@@ -761,4 +764,43 @@ func stubConn(t *testing.T) *grpc.ClientConn {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
+}
+
+func TestExecInteractive_DisableTTYCloseWriteDrainsOutput(t *testing.T) {
+	mock := newMockExecServer()
+	mock.interactiveWaitEOF = true
+	mock.interactiveEvents = []*pb.ExecSandboxEvent{
+		{Payload: &pb.ExecSandboxEvent_Stdout{Stdout: &pb.ExecSandboxStdout{Data: []byte("after EOF")}}},
+		{Payload: &pb.ExecSandboxEvent_Exit{Exit: &pb.ExecSandboxExit{ExitCode: 7}}},
+	}
+	client, cleanup := setupExecTest(t, mock)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	session, err := client.Interactive(ctx, "default", "test-sandbox", []string{"cat"}, 80, 24, ExecOptions{DisableTTY: true, NoLoginShell: true})
+	require.NoError(t, err)
+	defer func() { _ = session.Close() }()
+	require.Implements(t, (*InteractiveSessionControl)(nil), session)
+	require.NoError(t, func() error { _, err := session.Write([]byte("synthetic stdin")); return err }())
+	require.NoError(t, CloseInteractiveInput(session))
+	require.NoError(t, CloseInteractiveInput(session))
+	_, err = session.Write([]byte("late"))
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+	require.ErrorIs(t, session.Resize(80, 24), io.ErrClosedPipe)
+	output, err := io.ReadAll(session)
+	require.NoError(t, err)
+	require.Equal(t, "after EOF", string(output))
+	code, err := session.ExitCode()
+	require.NoError(t, err)
+	require.Equal(t, 7, code)
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.Len(t, mock.receivedInputs, 2)
+	start := mock.receivedInputs[0].GetStart()
+	require.NotNil(t, start)
+	assert.False(t, start.GetTty())
+	assert.Zero(t, start.GetCols())
+	assert.Zero(t, start.GetRows())
+	assert.True(t, start.GetNoLoginShell())
+	assert.Equal(t, []byte("synthetic stdin"), mock.receivedInputs[1].GetStdin())
 }
