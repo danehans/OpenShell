@@ -192,3 +192,30 @@ func TestExecResultFromEvents_OnlyExit(t *testing.T) {
 	assert.Empty(t, result.Stdout)
 	assert.Empty(t, result.Stderr)
 }
+
+func TestInteractiveTerminalSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts *v1.ExecOptions
+		tty  bool
+	}{
+		{"nil preserves terminal", nil, true},
+		{"default preserves terminal", &v1.ExecOptions{}, true},
+		{"disabled", &v1.ExecOptions{DisableTTY: true, NoLoginShell: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := ExecInteractiveRequestToProto("sandbox", []string{"cat"}, 80, 24, tc.opts)
+			assert.Equal(t, tc.tty, req.GetTty())
+			if tc.tty {
+				assert.Equal(t, uint32(80), req.GetCols())
+				assert.Equal(t, uint32(24), req.GetRows())
+			} else {
+				assert.Zero(t, req.GetCols())
+				assert.Zero(t, req.GetRows())
+				assert.True(t, req.GetNoLoginShell())
+			}
+		})
+	}
+	assert.False(t, ExecInteractiveRequestToProto("sandbox", []string{"cat"}, 0, 0, &v1.ExecOptions{DisableTTY: true}).GetTty())
+	assert.True(t, ExecInteractiveRequestToProto("sandbox", []string{"cat"}, 0, 0, nil).GetTty())
+}
