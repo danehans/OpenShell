@@ -91,6 +91,8 @@ type SandboxConfig struct {
 	GlobalPolicyVersion uint32
 	// ProviderEnvRevision is the fingerprint for provider credential inputs.
 	ProviderEnvRevision uint64
+	// ProviderAttachmentEpoch binds the current provider attachment lineage.
+	ProviderAttachmentEpoch string
 	// PolicyValidationFailureMode is the gateway-configured posture for rejected
 	// policy generations ("fail_closed" or "retain_last_valid").
 	PolicyValidationFailureMode string

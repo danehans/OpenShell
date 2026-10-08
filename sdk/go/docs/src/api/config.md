@@ -63,3 +63,8 @@ fmt.Printf("Config updated: revision=%d\n", result.SettingsRevision)
 ```
 
 See also: [Error Handling](../error-handling.md)
+
+`SandboxConfig.ProviderAttachmentEpoch` preserves the gateway-owned provider
+attachment lineage. Runtime-origin verifiers must include it in the configuration
+digest; a provider revision alone does not identify attachment replacement.
+Older servers may omit it, which is not proof of a current attachment.

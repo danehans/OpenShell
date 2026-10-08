@@ -938,6 +938,7 @@ func TestCopyByteSlice_Empty(t *testing.T) {
 func TestSandboxConfigFromProto_TrafficIdentityAndAdmission(t *testing.T) {
 	response := &sbv1.GetSandboxConfigResponse{
 		Workspace: "default", ConfigurationInstanceId: "instance-a", ConfigurationAdmitted: true,
+		ProviderAttachmentEpoch: "attachment-a",
 		TrafficIdentityTargets: []*sbv1.TrafficIdentityTarget{{
 			Name: "shared-gateway", HttpsEndpoint: "https://traffic.example.test:8443/",
 			Audience:     "urn:openshell:traffic:shared-gateway",
@@ -949,6 +950,7 @@ func TestSandboxConfigFromProto_TrafficIdentityAndAdmission(t *testing.T) {
 	assert.Equal(t, "default", config.Workspace)
 	assert.Equal(t, "instance-a", config.ConfigurationInstanceID)
 	assert.True(t, config.ConfigurationAdmitted)
+	assert.Equal(t, "attachment-a", config.ProviderAttachmentEpoch)
 	require.Len(t, config.TrafficIdentityTargets, 1)
 	assert.Equal(t, v1.TrafficIdentityTarget{
 		Name: "shared-gateway", HTTPSEndpoint: "https://traffic.example.test:8443/",
@@ -981,6 +983,7 @@ func TestSandboxConfigFromProto_OlderServerHasNoTrafficIdentity(t *testing.T) {
 	assert.Equal(t, uint32(3), config.PolicyVersion)
 	assert.Empty(t, config.Workspace)
 	assert.Empty(t, config.ConfigurationInstanceID)
+	assert.Empty(t, config.ProviderAttachmentEpoch)
 	assert.False(t, config.ConfigurationAdmitted)
 	assert.Nil(t, config.TrafficIdentityTargets)
 }

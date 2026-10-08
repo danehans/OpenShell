@@ -133,6 +133,7 @@ func SandboxConfigFromProto(resp *sbv1.GetSandboxConfigResponse) *v1.SandboxConf
 		PolicySource:                PolicySourceFromProto(resp.GetPolicySource()),
 		GlobalPolicyVersion:         resp.GetGlobalPolicyVersion(),
 		ProviderEnvRevision:         resp.GetProviderEnvRevision(),
+		ProviderAttachmentEpoch:     resp.GetProviderAttachmentEpoch(),
 		PolicyValidationFailureMode: resp.GetPolicyValidationFailureMode(),
 	}
 

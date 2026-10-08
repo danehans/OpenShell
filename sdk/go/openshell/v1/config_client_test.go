@@ -107,6 +107,7 @@ func TestConfigGetSandbox(t *testing.T) {
 	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{
 		Workspace:               "default",
 		ConfigurationInstanceId: "instance-a",
+		ProviderAttachmentEpoch: "attachment-a",
 		ConfigurationAdmitted:   true,
 		TrafficIdentityTargets: []*sbv1.TrafficIdentityTarget{{
 			Name: "traffic-a", HttpsEndpoint: "https://traffic.example.test/",
@@ -157,6 +158,7 @@ func TestConfigGetSandbox(t *testing.T) {
 	// The authorized runtime projection survives the real protobuf/gRPC path.
 	assert.Equal(t, "default", sc.Workspace)
 	assert.Equal(t, "instance-a", sc.ConfigurationInstanceID)
+	assert.Equal(t, "attachment-a", sc.ProviderAttachmentEpoch)
 	assert.True(t, sc.ConfigurationAdmitted)
 	require.Len(t, sc.TrafficIdentityTargets, 1)
 	assert.Equal(t, "traffic-a", sc.TrafficIdentityTargets[0].Name)
