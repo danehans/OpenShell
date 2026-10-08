@@ -87,6 +87,10 @@ pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
 };
 
 #[cfg(test)]
+#[path = "../build_git.rs"]
+mod build_git;
+
+#[cfg(test)]
 #[path = "../build_version.rs"]
 mod build_version;
 

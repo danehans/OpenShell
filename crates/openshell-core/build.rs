@@ -4,20 +4,23 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+mod build_git;
 mod build_version;
 
 const PROTO_REL: &str = "../../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     // --- Git-derived version ---
     // Compute a version from tags and commit metadata for local builds. In
     // Docker/CI builds where .git is absent, this silently does nothing and
     // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
     // by the build pipeline).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
-    println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    // Linked worktrees use a .git pointer file; missing paths make Cargo
+    // perpetually dirty. Resolve actual existing inputs without watching objects.
+    for path in build_git::watch_paths(&manifest_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
@@ -37,7 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("PROTOC_INCLUDE", protoc_bin_vendored::include_path()?);
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;

@@ -279,6 +279,12 @@ each worktree. Cache reuse therefore depends on the compiler inputs: outputs
 that embed absolute paths, including Rust dependencies in some builds, can
 still miss across worktrees.
 
+Local version tracking resolves Git's actual HEAD, refs and existing packed/shallow
+metadata, including linked worktrees. It does not watch nonexistent `.git/HEAD`
+paths or recursively scan Git objects. Source archives retain the package-version
+fallback. With unchanged inputs, repeated Cargo checks can reuse their artifacts;
+keep target directories, profiles and feature selection consistent across checks.
+
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
