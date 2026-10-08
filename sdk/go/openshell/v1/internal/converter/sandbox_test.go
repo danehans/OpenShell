@@ -31,12 +31,12 @@ func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
 	} {
 		t.Run(string(tc.want), func(t *testing.T) {
 			wire := &pb.SandboxStatus{ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
-				State: tc.wire, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				InstanceId: "instance-a", State: tc.wire, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
 				ProviderEnvRevision: 6, Error: "invalid endpoint",
 			}}
 			got := sandboxStatusFromProto(wire)
 			assert.Equal(t, &v1.SandboxConfigurationAdmission{
-				State: tc.want, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				InstanceID: "instance-a", State: tc.want, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
 				ProviderEnvRevision: 6, Error: "invalid endpoint",
 			}, got.ConfigurationAdmission)
 			wire.ConfigurationAdmission.Error = "changed"

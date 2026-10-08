@@ -124,6 +124,9 @@ func SandboxConfigFromProto(resp *sbv1.GetSandboxConfigResponse) *v1.SandboxConf
 		return nil
 	}
 	sc := &v1.SandboxConfig{
+		Workspace:                   resp.GetWorkspace(),
+		ConfigurationInstanceID:     resp.GetConfigurationInstanceId(),
+		ConfigurationAdmitted:       resp.GetConfigurationAdmitted(),
 		PolicyVersion:               resp.GetVersion(),
 		PolicyHash:                  resp.GetPolicyHash(),
 		ConfigRevision:              resp.GetConfigRevision(),
@@ -131,6 +134,22 @@ func SandboxConfigFromProto(resp *sbv1.GetSandboxConfigResponse) *v1.SandboxConf
 		GlobalPolicyVersion:         resp.GetGlobalPolicyVersion(),
 		ProviderEnvRevision:         resp.GetProviderEnvRevision(),
 		PolicyValidationFailureMode: resp.GetPolicyValidationFailureMode(),
+	}
+
+	if targets := resp.GetTrafficIdentityTargets(); targets != nil {
+		sc.TrafficIdentityTargets = make([]v1.TrafficIdentityTarget, len(targets))
+		for i, target := range targets {
+			// Preserve order and malformed empty entries for caller validation.
+			// Protobuf getters are nil-safe and slices never alias wire buffers.
+			sc.TrafficIdentityTargets[i] = v1.TrafficIdentityTarget{
+				Name:          target.GetName(),
+				HTTPSEndpoint: target.GetHttpsEndpoint(),
+				Audience:      target.GetAudience(),
+				TLSCACertPEM:  slices.Clone(target.GetTlsCaCertPem()),
+				Transports:    slices.Clone(target.GetTransports()),
+				TargetSHA256:  target.GetTargetSha256(),
+			}
+		}
 	}
 
 	// Convert proto SandboxPolicy to typed SDK SandboxPolicy.

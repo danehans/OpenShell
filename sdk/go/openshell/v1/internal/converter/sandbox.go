@@ -137,6 +137,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			state = types.ConfigurationAdmissionRejected
 		}
 		result.ConfigurationAdmission = &types.SandboxConfigurationAdmission{
+			InstanceID:          admission.GetInstanceId(),
 			State:               state,
 			PolicyVersion:       admission.GetPolicyVersion(),
 			PolicyHash:          admission.GetPolicyHash(),

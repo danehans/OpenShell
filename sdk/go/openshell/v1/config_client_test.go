@@ -105,6 +105,14 @@ func setupConfigTest(t *testing.T, mock *mockConfigServer) (*configClient, func(
 func TestConfigGetSandbox(t *testing.T) {
 	mock := newMockConfigServer()
 	mock.sandboxResp = &sbv1.GetSandboxConfigResponse{
+		Workspace:               "default",
+		ConfigurationInstanceId: "instance-a",
+		ConfigurationAdmitted:   true,
+		TrafficIdentityTargets: []*sbv1.TrafficIdentityTarget{{
+			Name: "traffic-a", HttpsEndpoint: "https://traffic.example.test/",
+			Audience: "urn:openshell:traffic:traffic-a", Transports: []string{"http"},
+			TargetSha256: "synthetic-target-fingerprint",
+		}},
 		Policy: &sbv1.SandboxPolicy{
 			Version: 4,
 			Filesystem: &sbv1.FilesystemPolicy{
@@ -145,6 +153,14 @@ func TestConfigGetSandbox(t *testing.T) {
 	mock.mu.Lock()
 	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetName())
 	mock.mu.Unlock()
+
+	// The authorized runtime projection survives the real protobuf/gRPC path.
+	assert.Equal(t, "default", sc.Workspace)
+	assert.Equal(t, "instance-a", sc.ConfigurationInstanceID)
+	assert.True(t, sc.ConfigurationAdmitted)
+	require.Len(t, sc.TrafficIdentityTargets, 1)
+	assert.Equal(t, "traffic-a", sc.TrafficIdentityTargets[0].Name)
+	assert.Equal(t, []string{"http"}, sc.TrafficIdentityTargets[0].Transports)
 
 	// Scalar fields.
 	assert.Equal(t, uint32(3), sc.PolicyVersion)

@@ -17,6 +17,19 @@ fmt.Printf("Sandbox config: policy_version=%d, revision=%d\n",
     config.PolicyVersion, config.ConfigRevision)
 ```
 
+`Workspace`, `ConfigurationInstanceID` and `ConfigurationAdmitted` preserve the
+Gateway's effective configuration projection. Check the sandbox's reported
+admission status separately before treating that configuration as active, including
+its `InstanceID` and configuration revisions.
+
+`TrafficIdentityTargets` contains public traffic gateway grants authorized for
+that sandbox UUID and workspace: target name, HTTPS endpoint, audience, public TLS
+roots, supported transports and target fingerprint. Certificate and transport
+slices are copied from the protobuf response. These fields contain no traffic
+credential and do not authorize issuing one; issuance is supervisor-only. Older
+servers omit the fields, producing false admission and no targets rather than
+implied origin attestation.
+
 ## GetGateway
 
 Retrieve the gateway-level configuration.

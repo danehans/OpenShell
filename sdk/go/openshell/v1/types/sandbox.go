@@ -144,8 +144,9 @@ const (
 )
 
 // SandboxConfigurationAdmission identifies a validated or rejected configuration.
-// Supervisor instance fencing remains available through the raw protobuf API.
 type SandboxConfigurationAdmission struct {
+	// InstanceID binds reported admission to one supervisor startup instance.
+	InstanceID          string
 	State               ConfigurationAdmissionState
 	PolicyVersion       uint32
 	PolicyHash          string

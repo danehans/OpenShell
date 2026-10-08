@@ -934,3 +934,53 @@ func TestCopyByteSlice_Empty(t *testing.T) {
 	assert.NotNil(t, copied)
 	assert.Empty(t, copied)
 }
+
+func TestSandboxConfigFromProto_TrafficIdentityAndAdmission(t *testing.T) {
+	response := &sbv1.GetSandboxConfigResponse{
+		Workspace: "default", ConfigurationInstanceId: "instance-a", ConfigurationAdmitted: true,
+		TrafficIdentityTargets: []*sbv1.TrafficIdentityTarget{{
+			Name: "shared-gateway", HttpsEndpoint: "https://traffic.example.test:8443/",
+			Audience:     "urn:openshell:traffic:shared-gateway",
+			TlsCaCertPem: []byte("SYNTHETIC PUBLIC CERTIFICATE"),
+			Transports:   []string{"http", "mcp"}, TargetSha256: "target-fingerprint",
+		}},
+	}
+	config := SandboxConfigFromProto(response)
+	assert.Equal(t, "default", config.Workspace)
+	assert.Equal(t, "instance-a", config.ConfigurationInstanceID)
+	assert.True(t, config.ConfigurationAdmitted)
+	require.Len(t, config.TrafficIdentityTargets, 1)
+	assert.Equal(t, v1.TrafficIdentityTarget{
+		Name: "shared-gateway", HTTPSEndpoint: "https://traffic.example.test:8443/",
+		Audience:     "urn:openshell:traffic:shared-gateway",
+		TLSCACertPEM: []byte("SYNTHETIC PUBLIC CERTIFICATE"),
+		Transports:   []string{"http", "mcp"}, TargetSHA256: "target-fingerprint",
+	}, config.TrafficIdentityTargets[0])
+	response.TrafficIdentityTargets[0].TlsCaCertPem[0] = '!'
+	response.TrafficIdentityTargets[0].Transports[0] = "changed"
+	assert.Equal(t, byte('S'), config.TrafficIdentityTargets[0].TLSCACertPEM[0])
+	assert.Equal(t, "http", config.TrafficIdentityTargets[0].Transports[0])
+	config.TrafficIdentityTargets[0].TLSCACertPEM[1] = '?'
+	config.TrafficIdentityTargets[0].Transports[1] = "different"
+	assert.Equal(t, byte('Y'), response.TrafficIdentityTargets[0].TlsCaCertPem[1])
+	assert.Equal(t, "mcp", response.TrafficIdentityTargets[0].Transports[1])
+}
+
+func TestSandboxConfigFromProto_TrafficIdentityPreservesMalformedEntries(t *testing.T) {
+	config := SandboxConfigFromProto(&sbv1.GetSandboxConfigResponse{
+		TrafficIdentityTargets: []*sbv1.TrafficIdentityTarget{nil, {Name: "second", Transports: []string{"unknown"}}},
+	})
+	require.Len(t, config.TrafficIdentityTargets, 2)
+	assert.Equal(t, v1.TrafficIdentityTarget{}, config.TrafficIdentityTargets[0])
+	assert.Equal(t, "second", config.TrafficIdentityTargets[1].Name)
+	assert.Equal(t, []string{"unknown"}, config.TrafficIdentityTargets[1].Transports)
+}
+
+func TestSandboxConfigFromProto_OlderServerHasNoTrafficIdentity(t *testing.T) {
+	config := SandboxConfigFromProto(&sbv1.GetSandboxConfigResponse{Version: 3})
+	assert.Equal(t, uint32(3), config.PolicyVersion)
+	assert.Empty(t, config.Workspace)
+	assert.Empty(t, config.ConfigurationInstanceID)
+	assert.False(t, config.ConfigurationAdmitted)
+	assert.Nil(t, config.TrafficIdentityTargets)
+}

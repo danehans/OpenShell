@@ -50,9 +50,31 @@ type EffectiveSetting struct {
 	Scope SettingScope
 }
 
+// TrafficIdentityTarget is a public, operator-owned traffic gateway grant.
+// It is not a credential or proof that a sandbox is currently admitted.
+type TrafficIdentityTarget struct {
+	Name          string
+	HTTPSEndpoint string
+	Audience      string
+	// TLSCACertPEM contains public certificates only. Empty selects platform roots.
+	TLSCACertPEM []byte
+	Transports   []string
+	TargetSHA256 string
+}
+
 // SandboxConfig represents the full configuration state of a sandbox,
 // including policy, effective settings, and revision metadata.
 type SandboxConfig struct {
+	// Workspace is the authorized workspace resolved by the gateway.
+	Workspace string
+	// ConfigurationInstanceID identifies the current supervisor admission instance.
+	ConfigurationInstanceID string
+	// ConfigurationAdmitted reports effective policy/configuration acceptance.
+	// It does not replace the sandbox's reported configuration-admission status.
+	ConfigurationAdmitted bool
+	// TrafficIdentityTargets are the grants authorized for this sandbox UUID.
+	// An empty list grants no runtime-origin traffic identity capability.
+	TrafficIdentityTargets []TrafficIdentityTarget
 	// Policy is the typed security policy for this sandbox. Nil means no policy in the response.
 	Policy *SandboxPolicy
 	// PolicyVersion is monotonically increasing per sandbox.

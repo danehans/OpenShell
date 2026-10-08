@@ -12,6 +12,9 @@ import (
 // SandboxConfig represents the full configuration state of a sandbox.
 type SandboxConfig = types.SandboxConfig
 
+// TrafficIdentityTarget is a public traffic gateway grant.
+type TrafficIdentityTarget = types.TrafficIdentityTarget
+
 // GatewayConfig represents gateway-global settings.
 type GatewayConfig = types.GatewayConfig
 
