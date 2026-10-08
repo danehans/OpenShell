@@ -152,6 +152,83 @@ data:
     gateway_id       = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
     ttl_secs         = {{ .Values.server.sandboxJwt.ttlSecs | default 3600 }}
 
+    {{- $targets := list }}
+    {{- if hasKey .Values.server.sandboxJwt "trafficTargets" }}
+    {{- $targets = .Values.server.sandboxJwt.trafficTargets }}
+    {{- end }}
+    {{- if not (kindIs "slice" $targets) }}
+    {{- fail "server.sandboxJwt.trafficTargets must be a list" }}
+    {{- end }}
+    {{- if gt (len $targets) 32 }}
+    {{- fail "server.sandboxJwt.trafficTargets supports at most 32 targets" }}
+    {{- end }}
+    {{- $names := dict }}
+    {{- $allowed := dict "name" true "httpsEndpoint" true "audience" true "workspace" true "sandboxIds" true "transports" true "tlsCaCertPath" true }}
+    {{- range $target := $targets }}
+    {{- if not (kindIs "map" $target) }}
+    {{- fail "traffic target must be a closed object" }}
+    {{- end }}
+    {{- range $key, $value := $target }}
+    {{- if not (hasKey $allowed $key) }}
+    {{- fail "traffic target contains an unsupported field" }}
+    {{- end }}
+    {{- end }}
+    {{- range $key := list "name" "httpsEndpoint" "audience" "workspace" }}
+    {{- $value := get $target $key }}
+    {{- if not (kindIs "string" $value) }}
+    {{- fail "traffic target requires nonempty name, httpsEndpoint, audience and workspace" }}
+    {{- end }}
+    {{- if empty (trim $value) }}
+    {{- fail "traffic target requires nonempty name, httpsEndpoint, audience and workspace" }}
+    {{- end }}
+    {{- end }}
+    {{- if hasKey $names $target.name }}
+    {{- fail "traffic target names must be unique" }}
+    {{- end }}
+    {{- $_ := set $names $target.name true }}
+    {{- range $key := list "sandboxIds" "transports" }}
+    {{- $values := get $target $key }}
+    {{- if not (kindIs "slice" $values) }}
+    {{- fail "traffic target sandboxIds and transports must be nonempty lists" }}
+    {{- end }}
+    {{- if empty $values }}
+    {{- fail "traffic target sandboxIds and transports must be nonempty lists" }}
+    {{- end }}
+    {{- $seen := dict }}
+    {{- range $value := $values }}
+    {{- if not (kindIs "string" $value) }}
+    {{- fail "traffic target grants must be nonempty strings" }}
+    {{- end }}
+    {{- if empty (trim $value) }}
+    {{- fail "traffic target grants must be nonempty strings" }}
+    {{- end }}
+    {{- if hasKey $seen $value }}
+    {{- fail "traffic target grants must be unique" }}
+    {{- end }}
+    {{- $_ := set $seen $value true }}
+    {{- if and (eq $key "transports") (not (has $value (list "http" "mcp"))) }}
+    {{- fail "traffic target transports must be http or mcp" }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if hasKey $target "tlsCaCertPath" }}
+    {{- if not (kindIs "string" $target.tlsCaCertPath) }}
+    {{- fail "traffic target tlsCaCertPath must be a public certificate path" }}
+    {{- end }}
+    {{- end }}
+
+    [[openshell.gateway.gateway_jwt.traffic_targets]]
+    name = {{ $target.name | toJson }}
+    https_endpoint = {{ $target.httpsEndpoint | toJson }}
+    audience = {{ $target.audience | toJson }}
+    workspace = {{ $target.workspace | toJson }}
+    sandbox_ids = {{ $target.sandboxIds | toJson }}
+    transports = {{ $target.transports | toJson }}
+    {{- if $target.tlsCaCertPath }}
+    tls_ca_cert_path = {{ $target.tlsCaCertPath | toJson }}
+    {{- end }}
+    {{- end }}
+
     {{- if .Values.server.oidc.issuer }}
 
     [openshell.gateway.oidc]

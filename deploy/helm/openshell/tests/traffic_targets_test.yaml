@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: explicit runtime traffic grants
+templates:
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: disables traffic issuance by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'traffic_targets'
+
+  - it: renders immutable two-actor grants and separate public roots
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: [actor-a, actor-b]
+          transports: [http, mcp]
+          tlsCaCertPath: /public-trust/ca.crt
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[\[openshell\.gateway\.gateway_jwt\.traffic_targets\]\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_ids = \["actor-a","actor-b"\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'transports = \["http","mcp"\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'tls_ca_cert_path = "/public-trust/ca\.crt"'
+
+  - it: renders optional system trust without a CA path
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: [actor-a]
+          transports: [http]
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'https_endpoint = "https://gateway\.example\.test:3000/"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'tls_ca_cert_path'
+
+  - it: refuses implicit all-sandbox grants
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: []
+          transports: [http]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'sandboxIds and transports must be nonempty lists'
+
+  - it: refuses unknown fields including signing material
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - signingKey: SYNTHETIC-NOT-A-KEY
+    asserts:
+      - failedTemplate:
+          errorPattern: 'unsupported field'
+
+  - it: refuses unsupported transports
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: [actor-a]
+          transports: [grpc]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'transports must be http or mcp'
+
+  - it: refuses duplicate names
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - &target
+          name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: [actor-a]
+          transports: [http]
+        - *target
+    asserts:
+      - failedTemplate:
+          errorPattern: 'names must be unique'
+
+  - it: refuses duplicate sandbox grants
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: [actor-a, actor-a]
+          transports: [http]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'grants must be unique'
+
+  - it: preserves legacy values that omit the new field
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets: null
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'traffic_targets'
+
+  - it: refuses numeric identity fields without coercion
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: 42
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires nonempty name, httpsEndpoint, audience and workspace'

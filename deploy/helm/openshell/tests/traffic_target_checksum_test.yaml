@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: traffic grant rollout checksum
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: retains the existing config checksum rollout annotation
+    template: templates/statefulset.yaml
+    set:
+      server.sandboxJwt.trafficTargets:
+        - name: shared
+          httpsEndpoint: https://gateway.example.test:3000/
+          audience: shared-gateway
+          workspace: default
+          sandboxIds: [actor-a]
+          transports: [http]
+    asserts:
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/gateway-config"]
+          pattern: '^[0-9a-f]{64}$'
+

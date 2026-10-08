@@ -543,6 +543,12 @@ server:
     # (owner-read only). Override to 0440 or 0444 if the container UID
     # does not match the volume file owner.
     secretDefaultMode: ""
+    # -- Explicit runtime-origin traffic grants. Empty disables issuance. Each
+    # target requires name, httpsEndpoint, audience, workspace, sandboxIds and
+    # transports (http and/or mcp); tlsCaCertPath optionally selects a mounted
+    # public CA file. Mount it read-only through server.extraVolumes and
+    # server.extraVolumeMounts. Never supply a signing key or wildcard grant.
+    trafficTargets: []
   # Dynamic provider token grants. When SPIFFE is enabled here, both the
   # gateway and sandbox supervisors mount the SPIFFE Workload API socket so
   # token-exchange profiles can use gateway- and sandbox-scoped JWT-SVIDs.
