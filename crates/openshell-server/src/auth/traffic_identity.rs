@@ -263,19 +263,14 @@ pub fn configuration_sha256(
     config: &openshell_core::proto::GetSandboxConfigResponse,
     target: &TrafficIdentityTarget,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hash_part(&mut hasher, b"openshell-traffic-origin-configuration-v1");
-    hash_part(&mut hasher, &config.config_revision.to_be_bytes());
-    hash_part(&mut hasher, &config.provider_env_revision.to_be_bytes());
-    for part in [
+    openshell_core::traffic_identity::configuration_sha256_parts(
+        config.config_revision,
+        config.provider_env_revision,
         &config.policy_hash,
         &config.provider_attachment_epoch,
         &config.configuration_instance_id,
         &target.target_sha256,
-    ] {
-        hash_part(&mut hasher, part.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
+    )
 }
 
 #[cfg(test)]

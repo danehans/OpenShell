@@ -8,7 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 This crate owns gateway authentication, policy discovery and sandbox lifecycle.
 The following experimental contract adds supervisor-owned traffic origin credentials.
 
-Status: discovery/issuance checkpoint; injection and live qualification pending.
+Status: discovery, issuance and supervisor-forwarding source checkpoint;
+shared-origin gateway and live integration qualification remain pending.
 
 A workload Pod is capability free. Its separate supervisor authenticates the
 Sandbox Protocol boundary and holds its gateway session. Do not project another
@@ -37,8 +38,11 @@ Native policy can change immediately afterward, as can runtime generation and
 revocation. The supervisor must authorize each request under its current native
 policy before injecting `x-openshield-traffic-token`, pin the exact target TLS
 identity, replace workload-supplied carriers, refuse redirects/downgrades and
-never return the token to the workload. This forwarding work is not implemented
-by this checkpoint. Provider Authorization is a separate credential channel.
+never return the token to the workload. The
+[supervisor contract](../openshell-supervisor/README.md#runtime-origin-traffic-credentials)
+implements authenticated-boundary injection, admitted snapshot activation, bounded
+caching and cancellation on revocation or expiry. Provider Authorization is a
+separate credential channel.
 
 The downstream gateway must validate type, purpose, signature, issuer, exact
 audience, lifetime and all origin/configuration relationships, strip the carrier
@@ -47,8 +51,8 @@ OpenShield must independently recheck execution currency, adopted configuration
 and durable fences at every request and response stage. Canary authority remains
 independent of origin authentication; a probe alone cannot impersonate an actor.
 
-Required follow-up includes supervisor authenticated-boundary/TLS/injection tests,
+Required follow-up includes deployed supervisor/gateway nondisclosure tests,
 neutral runtime identity descriptors, shared-gateway HTTP/MCP multiplexing with
 independent actor snapshots and canaries, two-actor revocation/replacement/outage
 qualification, Calico bypass/quarantine and real-agent/cloud gates. No deployed
-or production-security claim follows from host issuance tests.
+or production-security claim follows from host or standalone Linux library tests.

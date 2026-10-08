@@ -807,6 +807,29 @@ async fn run_sandbox_with_backend(
         },
     )
     .await?;
+    if loaded_policy_origin.allows_gateway_policy_reload()
+        && let (Some(engine), Some(id), Some(endpoint)) = (
+            opa_engine.as_ref(),
+            sandbox_id.as_deref(),
+            openshell_endpoint.as_deref(),
+        )
+        && endpoint.starts_with("https://")
+    {
+        let execution = openshell_core::traffic_identity::execution_id(
+            id,
+            auth_bundle.runtime_generation.as_str(),
+            auth_bundle.auth_epoch.get(),
+        );
+        let source =
+            openshell_supervisor_network::traffic_identity::GatewayTrafficTokenSource::new(
+                endpoint, execution,
+            )
+            .map_err(miette::Report::new)?;
+        engine
+            .traffic_identity()
+            .configure_source(Arc::new(source))
+            .map_err(miette::Report::new)?;
+    }
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
@@ -4076,6 +4099,10 @@ async fn report_runtime_configuration(
     accepted: bool,
     error: &str,
 ) -> bool {
+    if !accepted {
+        ctx.opa_engine.traffic_identity().revoke();
+    }
+
     let LoadedPolicyOrigin::Gateway {
         revision: Some(revision),
         ..
@@ -4111,6 +4138,98 @@ async fn report_runtime_configuration(
     )
     .await
     .is_ok()
+}
+
+fn traffic_snapshot_matches_admission_instance(
+    origin: &LoadedPolicyOrigin,
+    snapshot: &openshell_core::grpc_client::SettingsPollResult,
+) -> bool {
+    matches!(origin, LoadedPolicyOrigin::Gateway { revision: Some(revision), .. }
+    if revision.admission_instance_id.as_deref().is_some_and(|instance| {
+        !instance.is_empty() && instance == snapshot.configuration_instance_id
+    }))
+}
+
+async fn reconcile_runtime_traffic_identity(
+    ctx: &PolicyPollLoopContext,
+    snapshot: &openshell_core::grpc_client::SettingsPollResult,
+    generation: Option<&PolicyGenerationGuard>,
+) -> bool {
+    if !ctx.loaded_policy_origin.allows_gateway_policy_reload() {
+        ctx.opa_engine.traffic_identity().revoke();
+        return report_runtime_configuration(ctx, snapshot, true, "").await;
+    }
+    if ctx
+        .opa_engine
+        .traffic_identity()
+        .observe_snapshot(snapshot)
+        .is_err()
+    {
+        ctx.opa_engine.traffic_identity().revoke();
+        report_runtime_configuration(
+            ctx,
+            snapshot,
+            false,
+            "Traffic identity destinations are invalid",
+        )
+        .await;
+        return false;
+    }
+    if !ctx
+        .opa_engine
+        .traffic_identity()
+        .matches_snapshot(snapshot, ctx.opa_engine.current_generation())
+    {
+        ctx.opa_engine.traffic_identity().revoke();
+    }
+    if snapshot.traffic_identity_targets.is_empty() {
+        // Preserve legacy acknowledgement without inferring traffic authority.
+        let Ok(prepared) = ctx
+            .opa_engine
+            .traffic_identity()
+            .prepare(snapshot, ctx.opa_engine.current_generation())
+        else {
+            return false;
+        };
+        if !report_runtime_configuration(ctx, snapshot, true, "").await {
+            ctx.opa_engine.traffic_identity().revoke();
+            return false;
+        }
+        return ctx.opa_engine.traffic_identity().activate(prepared).is_ok();
+    }
+    if !traffic_snapshot_matches_admission_instance(&ctx.loaded_policy_origin, snapshot) {
+        ctx.opa_engine.traffic_identity().revoke();
+        return false;
+    }
+    let Some(generation) = generation.filter(|g| !g.is_stale()) else {
+        ctx.opa_engine.traffic_identity().revoke();
+        return false;
+    };
+    let Ok(prepared) = ctx
+        .opa_engine
+        .traffic_identity()
+        .prepare(snapshot, generation.captured_generation())
+    else {
+        ctx.opa_engine.traffic_identity().revoke();
+        report_runtime_configuration(
+            ctx,
+            snapshot,
+            false,
+            "Traffic identity configuration is unavailable or invalid",
+        )
+        .await;
+        return false;
+    };
+    let acknowledged = timeout(
+        Duration::from_secs(5),
+        report_runtime_configuration(ctx, snapshot, true, ""),
+    )
+    .await;
+    if !matches!(acknowledged, Ok(true)) || generation.is_stale() {
+        ctx.opa_engine.traffic_identity().revoke();
+        return false;
+    }
+    ctx.opa_engine.traffic_identity().activate(prepared).is_ok()
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
@@ -4187,6 +4306,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     if middleware_registry_status == MiddlewareRegistryStatus::Synchronized
                         && !generation.is_stale() =>
                 {
+                    if !result.traffic_identity_targets.is_empty() {
+                        reconcile_runtime_traffic_identity(&ctx, &result, Some(generation)).await;
+                    }
                     ctx.provider_readiness.policy_activated(
                         &EnvironmentIdentity::from_settings(&result),
                         result.config_revision,
@@ -4255,6 +4377,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             }
         }
         Err(e) => {
+            ctx.opa_engine.traffic_identity().revoke();
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
     }
@@ -4271,6 +4394,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     result
                 }
                 Err(e) => {
+                    ctx.opa_engine.traffic_identity().revoke();
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
                     if current_extension_authentication_enabled
                         && let Err(refresh_error) =
@@ -4285,6 +4409,32 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
             }
         };
+
+        if reloads_gateway_policy {
+            if ctx
+                .opa_engine
+                .traffic_identity()
+                .observe_snapshot(&result)
+                .is_err()
+            {
+                ctx.opa_engine.traffic_identity().revoke();
+                report_runtime_configuration(
+                    &ctx,
+                    &result,
+                    false,
+                    "Traffic identity destinations are invalid",
+                )
+                .await;
+                continue;
+            }
+            if !ctx
+                .opa_engine
+                .traffic_identity()
+                .matches_snapshot(&result, ctx.opa_engine.current_generation())
+            {
+                ctx.opa_engine.traffic_identity().revoke();
+            }
+        }
 
         // Reuse installed per-service credentials, rotating only when one is
         // missing or due. Rotation happens on the existing gateway channel and
@@ -4406,6 +4556,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             && !provider_env_changed
             && !policy_runtime_changed
             && unchanged_policy_revision.is_none()
+            && ctx
+                .opa_engine
+                .traffic_identity()
+                .matches_snapshot(&result, ctx.opa_engine.current_generation())
         {
             continue;
         }
@@ -4860,7 +5014,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             skills::install_static_skills,
         );
 
-        if !report_runtime_configuration(&ctx, &result, true, "").await {
+        if !reconcile_runtime_traffic_identity(&ctx, &result, current_policy_generation.as_ref())
+            .await
+        {
             // Retry the exact status tuple on the next poll before advancing
             // the observed revision; an old instance cannot claim readiness.
             continue;
@@ -5582,6 +5738,49 @@ network_policies:
             configuration_error: String::new(),
             configuration_instance_id: String::new(),
         }
+    }
+
+    #[test]
+    fn traffic_identity_requires_an_exact_runtime_admission_instance() {
+        let mut snapshot =
+            settings_poll_result(None, 1, openshell_core::proto::PolicySource::Sandbox);
+        snapshot.configuration_instance_id = "runtime-instance".into();
+        let mut revision = LoadedPolicyRevision::from_snapshot(&snapshot);
+        for instance in [
+            None,
+            Some("".to_string()),
+            Some("foreign-instance".to_string()),
+            Some("runtime-instance".to_string()),
+        ] {
+            revision.admission_instance_id = instance.clone();
+            let origin = LoadedPolicyOrigin::Gateway {
+                revision: Some(revision.clone()),
+                has_last_valid_policy: true,
+            };
+            assert_eq!(
+                traffic_snapshot_matches_admission_instance(&origin, &snapshot),
+                instance.as_deref() == Some("runtime-instance")
+            );
+        }
+        assert!(!traffic_snapshot_matches_admission_instance(
+            &LoadedPolicyOrigin::LocalOverride,
+            &snapshot
+        ));
+        assert!(!traffic_snapshot_matches_admission_instance(
+            &LoadedPolicyOrigin::Gateway {
+                revision: None,
+                has_last_valid_policy: true
+            },
+            &snapshot
+        ));
+        snapshot.configuration_instance_id.clear();
+        assert!(!traffic_snapshot_matches_admission_instance(
+            &LoadedPolicyOrigin::Gateway {
+                revision: Some(revision),
+                has_last_valid_policy: true
+            },
+            &snapshot
+        ));
     }
 
     #[derive(Clone)]

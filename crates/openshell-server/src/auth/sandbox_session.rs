@@ -32,14 +32,7 @@ pub fn execution_id(
     generation: &SandboxGenerationId,
     epoch: CredentialEpoch,
 ) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"openshell-execution-v1\0");
-    for value in [sandbox_id, generation.as_str()] {
-        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-        digest.update(value.as_bytes());
-    }
-    digest.update(epoch.get().to_be_bytes());
-    format!("exec-v1:{}", hex::encode(digest.finalize()))
+    openshell_core::traffic_identity::execution_id(sandbox_id, generation.as_str(), epoch.get())
 }
 
 #[allow(clippy::result_large_err)]

@@ -42,7 +42,7 @@ use std::fmt::{self, Write as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
-const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
+pub(crate) const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
@@ -304,7 +304,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         action: method,
         target: canonical.path,
         query_params,
-        raw_header: buf, // exact header bytes up to and including \r\n\r\n
+        raw_header: crate::traffic_identity::strip_carrier(&buf)?,
         body_length,
     }))
 }
@@ -330,6 +330,7 @@ pub(crate) fn request_from_buffered_http(
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let body_length = parse_body_length(header_str)?;
     let (_, query_params) = parse_target_query(query_target)?;
+    let raw_header = crate::traffic_identity::strip_carrier(&raw_header)?;
 
     Ok(L7Request {
         action: action.into(),
@@ -751,6 +752,8 @@ where
             mcp_request_validation: None,
             credential_generation: None,
             generation_guard,
+            traffic_transport: None,
+            traffic_credential: None,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
             deny_uninspected_credentials: false,
@@ -779,6 +782,8 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) mcp_request_validation: Option<McpRequestValidation<'a>>,
     pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
+    pub(crate) traffic_transport: Option<openshell_core::traffic_identity::TrafficTransport>,
+    pub(crate) traffic_credential: Option<&'a crate::traffic_identity::TrafficCredential>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
     pub(crate) deny_uninspected_credentials: bool,
@@ -926,7 +931,7 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result =
+    let mut rewrite_result =
         rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
 
     if let Some(validation) = options.mcp_request_validation {
@@ -958,6 +963,18 @@ where
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
+    }
+
+    // Internal origin authority is added after middleware, provider rewriting
+    // and hop-by-hop cleanup, so workload Connection nominations cannot remove it.
+    rewrite_result.rewritten = crate::traffic_identity::strip_carrier(&rewrite_result.rewritten)?;
+    if let Some(credential) = options.traffic_credential {
+        if options.credential_signing.is_sigv4() || websocket_request.is_some() {
+            return Err(miette::Report::new(
+                crate::traffic_identity::TrafficIdentityError::Unsupported,
+            ));
+        }
+        rewrite_result.rewritten = credential.header(&rewrite_result.rewritten)?;
     }
 
     // Apply SigV4 signing if configured.
@@ -1117,7 +1134,7 @@ where
                             .into_diagnostic()?;
 
                         let overflow = &req.raw_header[header_end..];
-                        if !overflow.is_empty() {
+                        if !overflow.is_empty() && !matches!(req.body_length, BodyLength::Chunked) {
                             if let Some(guard) = options.generation_guard {
                                 guard.ensure_current()?;
                             }
@@ -1223,7 +1240,7 @@ where
             .into_diagnostic()?;
 
         let overflow = &req.raw_header[header_end..];
-        if !overflow.is_empty() {
+        if !overflow.is_empty() && !matches!(req.body_length, BodyLength::Chunked) {
             if let Some(guard) = options.generation_guard {
                 guard.ensure_current()?;
             }
@@ -1467,6 +1484,11 @@ where
                     read_chunked_line(client, already_read, &mut read_state, generation_guard)
                         .await
                         .map_err(CollectChunkedError::into_report)?;
+                if crate::traffic_identity::is_carrier_field(&trailer) {
+                    return Err(miette::Report::new(
+                        crate::traffic_identity::TrafficIdentityError::InvalidCredential,
+                    ));
+                }
                 if contains_reserved_credential_marker_bytes(&trailer) {
                     return Err(BodyCredentialError::Trailer.into());
                 }
@@ -2285,7 +2307,7 @@ fn set_content_length(headers: &[u8], len: usize) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
+pub(crate) fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let mut out = String::with_capacity(header_str.len());
@@ -3234,13 +3256,12 @@ where
 /// boundaries so we can stop exactly at the end of the current message body.
 /// Handles chunk extensions and trailers per RFC 7230.
 ///
-/// `already_forwarded` are overflow bytes that were already written to the
-/// writer during header parsing. The parser consumes them before reading more
-/// bytes so it can detect boundaries without forwarding them twice.
+/// `buffered_body` contains buffered body bytes that have not been written.
+/// Parse these before forwarding so reserved identity trailers cannot leak.
 async fn relay_chunked<R, W>(
     reader: &mut R,
     writer: &mut W,
-    already_forwarded: &[u8],
+    buffered_body: &[u8],
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()>
 where
@@ -3248,7 +3269,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut input = ChunkedRelayInput::new(already_forwarded);
+    let mut input = ChunkedRelayInput::new(buffered_body);
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
 
@@ -3283,6 +3304,11 @@ where
                         "Chunk trailer line exceeds limit",
                     )
                     .await?;
+                if crate::traffic_identity::is_carrier_field(&trailer_line) {
+                    return Err(miette::Report::new(
+                        crate::traffic_identity::TrafficIdentityError::InvalidCredential,
+                    ));
+                }
                 trailer_bytes = trailer_bytes
                     .checked_add(trailer_line.len() + 2)
                     .ok_or_else(|| miette!("Chunk trailer size overflow"))?;
@@ -3339,16 +3365,16 @@ where
 }
 
 struct ChunkedRelayInput<'a> {
-    already_forwarded: &'a [u8],
-    already_forwarded_pos: usize,
+    buffered_body: &'a [u8],
+    buffered_body_pos: usize,
     pending: Vec<u8>,
 }
 
 impl<'a> ChunkedRelayInput<'a> {
-    fn new(already_forwarded: &'a [u8]) -> Self {
+    fn new(buffered_body: &'a [u8]) -> Self {
         Self {
-            already_forwarded,
-            already_forwarded_pos: 0,
+            buffered_body,
+            buffered_body_pos: 0,
             pending: Vec::with_capacity(RELAY_BUF_SIZE),
         }
     }
@@ -3391,10 +3417,13 @@ impl<'a> ChunkedRelayInput<'a> {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        if self.already_forwarded_pos < self.already_forwarded.len() {
-            let available = self.already_forwarded.len() - self.already_forwarded_pos;
+        if self.buffered_body_pos < self.buffered_body.len() {
+            let available = self.buffered_body.len() - self.buffered_body_pos;
             let consumed = available.min(remaining);
-            self.already_forwarded_pos += consumed;
+            self.pending.extend_from_slice(
+                &self.buffered_body[self.buffered_body_pos..self.buffered_body_pos + consumed],
+            );
+            self.buffered_body_pos += consumed;
             remaining -= consumed;
         }
 
@@ -3427,9 +3456,10 @@ impl<'a> ChunkedRelayInput<'a> {
     where
         R: AsyncRead + Unpin,
     {
-        if self.already_forwarded_pos < self.already_forwarded.len() {
-            let byte = self.already_forwarded[self.already_forwarded_pos];
-            self.already_forwarded_pos += 1;
+        if self.buffered_body_pos < self.buffered_body.len() {
+            let byte = self.buffered_body[self.buffered_body_pos];
+            self.buffered_body_pos += 1;
+            self.pending.push(byte);
             return Ok(byte);
         }
         let byte = match reader.read_u8().await {
@@ -4109,6 +4139,47 @@ mod tests {
             _context: &mut Context<'_>,
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_identity_reserved_response_fields_never_reach_workload() {
+        for wire in [
+            b"HTTP/1.1 200 OK\r\nX-OpenShield-Traffic-Token: synthetic-credential\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 103 Early Hints\r\nx-openshield-traffic-token: synthetic-credential\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nx-openshield-traffic-token: synthetic-credential",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-OpenShield-Traffic-Token: synthetic-credential\r\n\r\n",
+        ] {
+            let mut reader=CountingReader::new(wire.to_vec()); let mut writer=CountingWriter::default();
+            let error=relay_response("GET", &mut reader, &mut writer, RelayResponseOptions::default(), None).await.unwrap_err();
+            assert!(!error.to_string().contains("synthetic-credential"));
+            assert!(!writer.bytes.windows(b"synthetic-credential".len()).any(|w|w==b"synthetic-credential"));
+            assert!(!writer.bytes.windows(b"Traffic-Token".len()).any(|w|w==b"Traffic-Token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_identity_reserved_trailer_is_withheld_for_every_buffer_split() {
+        let body = b"2\r\nok\r\n0\r\nx-openshield-traffic-token: synthetic-credential\r\n\r\n";
+        for split in 0..=body.len() {
+            let mut reader = CountingReader::new(body[split..].to_vec());
+            let mut writer = CountingWriter::default();
+            let error = relay_chunked(&mut reader, &mut writer, &body[..split], None)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("synthetic-credential"));
+            assert!(
+                !writer
+                    .bytes
+                    .windows(b"synthetic-credential".len())
+                    .any(|w| w == b"synthetic-credential")
+            );
+            assert!(
+                !writer
+                    .bytes
+                    .windows(b"x-openshield-traffic-token".len())
+                    .any(|w| w == b"x-openshield-traffic-token")
+            );
         }
     }
 
@@ -4917,8 +4988,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_chunked_with_forwarded_prefix_and_trailers_preserves_pipeline_boundary() {
-        let already_forwarded = b"3\r\na";
+    async fn relay_chunked_with_buffered_prefix_and_trailers_preserves_pipeline_boundary() {
+        let buffered_body = b"3\r\na";
         let body_remainder = b"bc\r\n0\r\nX-Checksum: abc123\r\n\r\n";
         let pipelined_request =
             b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
@@ -4929,16 +5000,10 @@ mod tests {
         client_writer.write_all(&later_read).await.unwrap();
         let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
-        relay_writer.write_all(already_forwarded).await.unwrap();
 
-        relay_chunked(
-            &mut relay_reader,
-            &mut relay_writer,
-            already_forwarded,
-            None,
-        )
-        .await
-        .expect("chunked body with trailers should relay");
+        relay_chunked(&mut relay_reader, &mut relay_writer, buffered_body, None)
+            .await
+            .expect("chunked body with trailers should relay");
 
         let mut remaining = vec![0; pipelined_request.len()];
         relay_reader.read_exact(&mut remaining).await.unwrap();
@@ -4947,7 +5012,7 @@ mod tests {
         drop(relay_writer);
         let mut forwarded = Vec::new();
         upstream_reader.read_to_end(&mut forwarded).await.unwrap();
-        let mut expected = already_forwarded.to_vec();
+        let mut expected = buffered_body.to_vec();
         expected.extend_from_slice(body_remainder);
         assert_eq!(forwarded, expected);
     }

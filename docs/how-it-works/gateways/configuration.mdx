@@ -348,13 +348,24 @@ has type `openshell-traffic+jwt`, purpose `traffic`, an exact traffic audience a
 identities, never extension caller authority. Issuance does not rotate the
 supervisor session; consumed refresh bearers cannot issue traffic tokens.
 
-This checkpoint implements discovery and issuance only. Supervisor injection,
-trusted gateway forwarding and shared-origin integration qualification remain
-pending. Registering a target does not enable forwarding or establish protection.
-Native request policy must authorize every exchange before credentials can be
-injected. Credentials stay in supervisor memory and never enter workload
-processes; traffic grants cannot override native policy. See
-[the implementation design](https://github.com/danehans/OpenShell/blob/traffic-origin-identity/crates/openshell-server/README.md).
+The supervisor activates target identity after successful runtime reconciliation
+and a configuration acknowledgement. It requires an authenticated isolation
+boundary, hostname-verifying HTTPS and native enforce-mode REST, GraphQL,
+JSON-RPC or MCP inspection. Raw tunnels, audit mode, plaintext, upgrades and
+request signing are unsupported for registered targets. Explicit target roots
+replace platform roots.
+
+Credentials remain in supervisor memory. The supervisor strips workload-supplied
+`x-openshield-traffic-token` headers before middleware and injects its own after
+native admission and header transformations; provider Authorization is independent.
+Failed configuration polling or acknowledgement revokes bindings. Policy changes,
+configuration replacement and expiry cancel earlier upstream exchanges.
+
+The selected traffic gateway must verify the dedicated JWT profile, remove the
+carrier before backend forwarding and never reflect or record it. Shared-origin
+integration and forced-routing qualification remain pending. Registering a target
+alone does not establish protection. See
+[the supervisor contract](https://github.com/danehans/OpenShell/blob/traffic-origin-identity/crates/openshell-supervisor/README.md#runtime-origin-traffic-credentials).
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 

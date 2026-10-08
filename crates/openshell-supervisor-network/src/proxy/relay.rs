@@ -72,6 +72,7 @@ pub(super) fn http_context(
         host: decision.intent.destination.host.clone(),
         port: decision.intent.destination.port,
         request_default_port: None,
+        traffic_binding: None,
         policy_name,
         binary_path: decision
             .binary
@@ -371,6 +372,7 @@ mod tests {
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
             endpoint_observation_tx: None,
+            traffic_binding: None,
         }
     }
 

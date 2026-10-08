@@ -50,6 +50,7 @@ pub struct L7EvalContext {
     /// Default authority port for the inspected HTTP transport (80 for
     /// plaintext, 443 after TLS termination).
     pub(crate) request_default_port: Option<u16>,
+    pub(crate) traffic_binding: Option<crate::traffic_identity::TrafficTargetBinding>,
     /// Matched policy name from L4 evaluation.
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
@@ -573,11 +574,42 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    let credential = if let Some(binding) = ctx.traffic_binding.as_ref() {
+        if ctx.request_default_port != Some(443)
+            || options.credential_signing.is_sigv4()
+            || crate::l7::rest::request_is_websocket_upgrade(&request.raw_header)
+        {
+            return Err(miette::Report::new(
+                crate::traffic_identity::TrafficIdentityError::Unsupported,
+            ));
+        }
+        let transport = options.traffic_transport.ok_or_else(|| {
+            miette::Report::new(crate::traffic_identity::TrafficIdentityError::Unsupported)
+        })?;
+        let generation = options.generation_guard.ok_or_else(|| {
+            miette::Report::new(crate::traffic_identity::TrafficIdentityError::Unsupported)
+        })?;
+        Some(
+            binding
+                .credential(transport, generation)
+                .await
+                .map_err(miette::Report::new)?,
+        )
+    } else {
+        None
+    };
+    let options = crate::l7::rest::RelayRequestOptions {
+        traffic_credential: credential.as_ref(),
+        ..options
+    };
+    let mut upstream =
+        crate::traffic_identity::TrafficBoundStream::new(upstream, credential.as_ref());
+    let mut client = crate::traffic_identity::TrafficBoundStream::new(client, credential.as_ref());
     match Box::pin(
         crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
             request,
-            client,
-            upstream,
+            &mut client,
+            &mut upstream,
             options,
             response_middleware,
             observer,
@@ -595,14 +627,14 @@ where
                     observer.observe(EndpointResult::PolicyDenied);
                 }
                 let _ = upstream.shutdown().await;
-                reject_body_credential(client, *error).await?;
+                reject_body_credential(&mut client, *error).await?;
                 Ok(None)
             } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
             {
                 if let Some(observer) = observer {
                     observer.observe_credential_failure(error.is_endpoint_mismatch());
                 }
-                reject_credential_resolution(client, ctx, &request.action, error).await?;
+                reject_credential_resolution(&mut client, ctx, &request.action, error).await?;
                 Ok(None)
             } else if report
                 .downcast_ref::<crate::l7::rest::CredentialUnavailableError>()
@@ -1318,6 +1350,14 @@ where
                     ),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
+                    traffic_transport: (config.enforcement == EnforcementMode::Enforce).then_some(
+                        if config.protocol == L7Protocol::Mcp {
+                            openshell_core::traffic_identity::TrafficTransport::Mcp
+                        } else {
+                            openshell_core::traffic_identity::TrafficTransport::Http
+                        },
+                    ),
+                    traffic_credential: None,
                     websocket_extensions: websocket_extension_mode(
                         config,
                         middleware_session.is_some(),
@@ -2096,6 +2136,14 @@ where
                     mcp_request_validation: None,
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
+                    traffic_transport: (config.enforcement == EnforcementMode::Enforce).then_some(
+                        if config.protocol == L7Protocol::Mcp {
+                            openshell_core::traffic_identity::TrafficTransport::Mcp
+                        } else {
+                            openshell_core::traffic_identity::TrafficTransport::Http
+                        },
+                    ),
+                    traffic_credential: None,
                     websocket_extensions: websocket_extension_mode(
                         config,
                         middleware_session.is_some(),
@@ -2532,6 +2580,13 @@ where
                     ),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
+                    traffic_transport: (config.enforcement == EnforcementMode::Enforce).then_some(
+                        if config.protocol == L7Protocol::Mcp {
+                            openshell_core::traffic_identity::TrafficTransport::Mcp
+                        } else {
+                            openshell_core::traffic_identity::TrafficTransport::Http
+                        },
+                    ),
                     ..Default::default()
                 },
                 ctx,
@@ -2815,6 +2870,13 @@ where
                     body_classifier: ctx.body_classifier.as_deref(),
                     credential_generation: credential_generation_guard(ctx),
                     generation_guard: Some(engine.generation_guard()),
+                    traffic_transport: (config.enforcement == EnforcementMode::Enforce).then_some(
+                        if config.protocol == L7Protocol::Mcp {
+                            openshell_core::traffic_identity::TrafficTransport::Mcp
+                        } else {
+                            openshell_core::traffic_identity::TrafficTransport::Http
+                        },
+                    ),
                     ..Default::default()
                 },
                 ctx,

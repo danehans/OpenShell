@@ -2927,6 +2927,39 @@ async fn handle_mediated_connection(
         return Ok(());
     }
 
+    // Only isolation-boundary streams can carry runtime-origin authority.
+    // A direct listener's synthetic/static identity is not that provenance.
+    let traffic_binding = opa_engine
+        .traffic_identity()
+        .bind(
+            &host_lc,
+            port,
+            decision.policy_generation,
+            socket_addrs.is_none() && supplied_identity.as_ref().is_some_and(Result::is_ok),
+        )
+        .map_err(miette::Report::new)?;
+    if traffic_binding.is_some()
+        && (effective_tls_skip
+            || decision.endpoint.l7_route.as_ref().is_none_or(|route| {
+                route.configs.is_empty()
+                    || route.configs.iter().any(|selected| {
+                        selected.config.enforcement != crate::l7::EnforcementMode::Enforce
+                            || !matches!(
+                                selected.config.protocol,
+                                crate::l7::L7Protocol::Rest
+                                    | crate::l7::L7Protocol::Graphql
+                                    | crate::l7::L7Protocol::JsonRpc
+                                    | crate::l7::L7Protocol::Mcp
+                            )
+                            || selected.config.credential_signing.is_sigv4()
+                    })
+            }))
+    {
+        return Err(miette::Report::new(
+            crate::traffic_identity::TrafficIdentityError::Unsupported,
+        ));
+    }
+
     // CONNECT must use one policy generation from authorization through route
     // materialization and relay startup.
     let l7_route = decision.endpoint.l7_route.as_ref();
@@ -3018,6 +3051,8 @@ async fn handle_mediated_connection(
         },
     );
 
+    ctx.traffic_binding = traffic_binding;
+
     if effective_tls_skip {
         // Policy validation rejects fail-closed middleware overlapping
         // `tls: skip` endpoints; this runtime gate is defense in depth.
@@ -3066,6 +3101,12 @@ async fn handle_mediated_connection(
         return Ok(());
     };
 
+    if ctx.traffic_binding.is_some() && tunnel_protocol != TunnelProtocol::Tls {
+        return Err(miette::Report::new(
+            crate::traffic_identity::TrafficIdentityError::Unsupported,
+        ));
+    }
+
     if tunnel_protocol == TunnelProtocol::Tls {
         // TLS detected — terminate unconditionally.
         if let Some(ref tls) = tls_state {
@@ -3084,7 +3125,9 @@ async fn handle_mediated_connection(
             let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
                 upstream,
                 &host_lc,
-                tls.upstream_config(),
+                ctx.traffic_binding
+                    .as_ref()
+                    .map_or_else(|| tls.upstream_config(), |binding| binding.tls_config()),
             )
             .await
             {
@@ -5181,6 +5224,8 @@ where
             mcp_request_validation: None,
             credential_generation: options.credential_generation,
             generation_guard: Some(options.generation_guard),
+            traffic_transport: None,
+            traffic_credential: None,
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
             deny_uninspected_credentials: options.deny_uninspected_credentials,
@@ -5286,6 +5331,15 @@ async fn handle_forward_proxy(
     let raw_host = host;
     let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
+    if opa_engine
+        .traffic_identity()
+        .requires_identity(&host_lc, port)
+        .map_err(miette::Report::new)?
+    {
+        return Err(miette::Report::new(
+            crate::traffic_identity::TrafficIdentityError::Unsupported,
+        ));
+    }
 
     if scheme == "http"
         && ((host_lc == openshell_core::google_cloud::METADATA_HOST && port == 80)

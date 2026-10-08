@@ -73,3 +73,100 @@ impl std::fmt::Debug for TrafficJwtClaims {
         f.debug_struct("TrafficJwtClaims").finish_non_exhaustive()
     }
 }
+
+/// Stable launch identity shared by the gateway and trusted supervisor.
+pub fn execution_id(sandbox_id: &str, generation: &str, epoch: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"openshell-execution-v1\0");
+    for value in [sandbox_id, generation] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.update(epoch.to_be_bytes());
+    format!("exec-v1:{:x}", digest.finalize())
+}
+
+pub fn valid_execution_id(value: &str) -> bool {
+    value.strip_prefix("exec-v1:").is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Frozen issuance identity; framing stays compatible with the first traffic RPC.
+pub fn configuration_sha256_parts(
+    config_revision: u64,
+    provider_revision: u64,
+    policy_hash: &str,
+    attachment: &str,
+    instance: &str,
+    target_sha256: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut part = |value: &[u8]| {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    };
+    part(b"openshell-traffic-origin-configuration-v1");
+    part(&config_revision.to_be_bytes());
+    part(&provider_revision.to_be_bytes());
+    for value in [policy_hash, attachment, instance, target_sha256] {
+        part(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Bound the aggregate encoded discovery contract without importing wire traits downstream.
+pub fn target_encoded_len(target: &crate::proto::TrafficIdentityTarget) -> usize {
+    use prost::Message;
+    target.encoded_len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_framing_preserves_legacy_vector() {
+        assert_eq!(
+            execution_id("sandbox-one", "generation-one", 1),
+            "exec-v1:bd467847de5288a9688e11174c21d6f3ef5dce054321d6746970ebcef6061b53"
+        );
+        assert_ne!(execution_id("ab", "c", 1), execution_id("a", "bc", 1));
+        assert_ne!(
+            execution_id("sandbox-one", "generation-one", 1),
+            execution_id("sandbox-one", "generation-one", 2)
+        );
+        assert!(valid_execution_id(&execution_id(
+            "sandbox-one",
+            "generation-one",
+            1
+        )));
+        assert!(!valid_execution_id(
+            &execution_id("sandbox-one", "generation-one", 1).to_uppercase()
+        ));
+    }
+
+    #[test]
+    fn configuration_framing_preserves_issuance_vector() {
+        assert_eq!(
+            configuration_sha256_parts(
+                7,
+                3,
+                &"a".repeat(64),
+                "attachment-one",
+                "instance-one",
+                &"b".repeat(64)
+            ),
+            "6b7cda8715ab087a683b929a73a7eb25288cad09e42c652ff2a8db6b47a8474b"
+        );
+        assert_ne!(
+            configuration_sha256_parts(7, 3, "ab", "c", "instance", "target"),
+            configuration_sha256_parts(7, 3, "a", "bc", "instance", "target")
+        );
+    }
+}

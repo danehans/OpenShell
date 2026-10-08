@@ -162,6 +162,7 @@ pub struct OpaEngine {
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
+    traffic_identity: crate::traffic_identity::TrafficIdentityState,
 }
 
 #[cfg(test)]
@@ -279,6 +280,10 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    pub fn traffic_identity(&self) -> &crate::traffic_identity::TrafficIdentityState {
+        &self.traffic_identity
+    }
+
     pub(crate) fn websocket_assembly_budget(
         &self,
     ) -> crate::l7::websocket::WebSocketAssemblyBudget {
@@ -296,6 +301,7 @@ impl OpaEngine {
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
+            traffic_identity: crate::traffic_identity::TrafficIdentityState::default(),
         }
     }
 

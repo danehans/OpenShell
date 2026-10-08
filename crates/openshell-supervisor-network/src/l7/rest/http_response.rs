@@ -73,6 +73,11 @@ where
         }
 
         if let Some(header_end) = header_end {
+            if crate::traffic_identity::response_has_carrier(&buf[..header_end]) {
+                return Err(miette::Report::new(
+                    crate::traffic_identity::TrafficIdentityError::InvalidCredential,
+                ));
+            }
             let header_str = String::from_utf8_lossy(&buf[..header_end]);
             if matches!(
                 parse_observed_http_status_code(&header_str),
@@ -94,6 +99,11 @@ where
         if n == 0 {
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
+            }
+            if crate::traffic_identity::response_has_carrier(&buf) {
+                return Err(miette::Report::new(
+                    crate::traffic_identity::TrafficIdentityError::InvalidCredential,
+                ));
             }
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
@@ -237,7 +247,14 @@ where
     }
 
     // Forward response headers + any overflow body bytes
-    client.write_all(&buf).await.into_diagnostic()?;
+    if matches!(body_length, BodyLength::Chunked) {
+        client
+            .write_all(&buf[..header_end])
+            .await
+            .into_diagnostic()?;
+    } else {
+        client.write_all(&buf).await.into_diagnostic()?;
+    }
     let overflow_len = (buf.len() - header_end) as u64;
 
     // Forward remaining response body
@@ -817,7 +834,9 @@ where
         });
     }
 
-    client.write_all(overflow).await.into_diagnostic()?;
+    if !matches!(body_length, BodyLength::Chunked) {
+        client.write_all(overflow).await.into_diagnostic()?;
+    }
     match body_length {
         BodyLength::ContentLength(length) => {
             let remaining = length.saturating_sub(overflow.len() as u64);
@@ -1206,7 +1225,8 @@ fn validate_http_field_value(value: &str) -> Result<()> {
 }
 
 fn is_protected_response_field(name: &str) -> bool {
-    name.eq_ignore_ascii_case("content-length")
+    name.eq_ignore_ascii_case(openshell_core::traffic_identity::TRAFFIC_TOKEN_HEADER)
+        || name.eq_ignore_ascii_case("content-length")
         || is_hidden_response_field(name)
         || openshell_supervisor_middleware::headers::is_response_credential_header(name)
 }
