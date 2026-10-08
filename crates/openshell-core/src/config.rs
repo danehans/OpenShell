@@ -837,6 +837,9 @@ pub struct GatewayJwtConfig {
     /// Explicit zero is invalid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<NonZeroU64>,
+    /// Explicit runtime-origin traffic grants; empty disables traffic issuance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub traffic_targets: Vec<crate::traffic_identity::TrafficTargetConfig>,
 }
 
 impl GatewayJwtConfig {
@@ -1276,6 +1279,7 @@ mod tests {
 
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
         assert!(serialized.get("ttl_secs").is_none());
+        assert!(serialized.get("traffic_targets").is_none());
     }
 
     #[test]

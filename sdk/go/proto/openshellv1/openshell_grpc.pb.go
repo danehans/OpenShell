@@ -99,6 +99,7 @@ const (
 	OpenShell_GetDraftHistory_FullMethodName               = "/openshell.v1.OpenShell/GetDraftHistory"
 	OpenShell_IssueSandboxToken_FullMethodName             = "/openshell.v1.OpenShell/IssueSandboxToken"
 	OpenShell_RefreshSandboxToken_FullMethodName           = "/openshell.v1.OpenShell/RefreshSandboxToken"
+	OpenShell_IssueTrafficToken_FullMethodName             = "/openshell.v1.OpenShell/IssueTrafficToken"
 	OpenShell_CreateWorkspace_FullMethodName               = "/openshell.v1.OpenShell/CreateWorkspace"
 	OpenShell_GetWorkspace_FullMethodName                  = "/openshell.v1.OpenShell/GetWorkspace"
 	OpenShell_ListWorkspaces_FullMethodName                = "/openshell.v1.OpenShell/ListWorkspaces"
@@ -318,13 +319,17 @@ type OpenShellClient interface {
 	// drivers receive the gateway JWT directly from the create-sandbox flow
 	// and never call this RPC.
 	IssueSandboxToken(ctx context.Context, in *IssueSandboxTokenRequest, opts ...grpc.CallOption) (*IssueSandboxTokenResponse, error)
-	// Renew the calling sandbox's gateway JWT. Older tokens remain valid
-	// until their own expiry; deployments should keep token TTLs short to
-	// bound replay exposure. The supervisor calls this from a background
+	// Renew the calling sandbox's gateway JWT. Rotation immediately invalidates
+	// the consumed bearer for ordinary RPCs; only request-matched refresh replay
+	// may recover its successor during the bounded recovery window. The supervisor
+	// calls this from a background
 	// task at ~80% of the token's lifetime; the new token is cached in
 	// memory only — the on-disk bootstrap file is intentionally not
 	// rewritten.
 	RefreshSandboxToken(ctx context.Context, in *RefreshSandboxTokenRequest, opts ...grpc.CallOption) (*RefreshSandboxTokenResponse, error)
+	// Issue a distinct 60-second traffic-origin token to the current supervisor.
+	// This RPC never rotates the supervisor session or grants native policy access.
+	IssueTrafficToken(ctx context.Context, in *IssueTrafficTokenRequest, opts ...grpc.CallOption) (*IssueTrafficTokenResponse, error)
 	// Create a workspace.
 	CreateWorkspace(ctx context.Context, in *CreateWorkspaceRequest, opts ...grpc.CallOption) (*CreateWorkspaceResponse, error)
 	// Fetch a workspace by name.
@@ -1145,6 +1150,16 @@ func (c *openShellClient) RefreshSandboxToken(ctx context.Context, in *RefreshSa
 	return out, nil
 }
 
+func (c *openShellClient) IssueTrafficToken(ctx context.Context, in *IssueTrafficTokenRequest, opts ...grpc.CallOption) (*IssueTrafficTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IssueTrafficTokenResponse)
+	err := c.cc.Invoke(ctx, OpenShell_IssueTrafficToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) CreateWorkspace(ctx context.Context, in *CreateWorkspaceRequest, opts ...grpc.CallOption) (*CreateWorkspaceResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateWorkspaceResponse)
@@ -1425,13 +1440,17 @@ type OpenShellServer interface {
 	// drivers receive the gateway JWT directly from the create-sandbox flow
 	// and never call this RPC.
 	IssueSandboxToken(context.Context, *IssueSandboxTokenRequest) (*IssueSandboxTokenResponse, error)
-	// Renew the calling sandbox's gateway JWT. Older tokens remain valid
-	// until their own expiry; deployments should keep token TTLs short to
-	// bound replay exposure. The supervisor calls this from a background
+	// Renew the calling sandbox's gateway JWT. Rotation immediately invalidates
+	// the consumed bearer for ordinary RPCs; only request-matched refresh replay
+	// may recover its successor during the bounded recovery window. The supervisor
+	// calls this from a background
 	// task at ~80% of the token's lifetime; the new token is cached in
 	// memory only — the on-disk bootstrap file is intentionally not
 	// rewritten.
 	RefreshSandboxToken(context.Context, *RefreshSandboxTokenRequest) (*RefreshSandboxTokenResponse, error)
+	// Issue a distinct 60-second traffic-origin token to the current supervisor.
+	// This RPC never rotates the supervisor session or grants native policy access.
+	IssueTrafficToken(context.Context, *IssueTrafficTokenRequest) (*IssueTrafficTokenResponse, error)
 	// Create a workspace.
 	CreateWorkspace(context.Context, *CreateWorkspaceRequest) (*CreateWorkspaceResponse, error)
 	// Fetch a workspace by name.
@@ -1683,6 +1702,9 @@ func (UnimplementedOpenShellServer) IssueSandboxToken(context.Context, *IssueSan
 }
 func (UnimplementedOpenShellServer) RefreshSandboxToken(context.Context, *RefreshSandboxTokenRequest) (*RefreshSandboxTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RefreshSandboxToken not implemented")
+}
+func (UnimplementedOpenShellServer) IssueTrafficToken(context.Context, *IssueTrafficTokenRequest) (*IssueTrafficTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IssueTrafficToken not implemented")
 }
 func (UnimplementedOpenShellServer) CreateWorkspace(context.Context, *CreateWorkspaceRequest) (*CreateWorkspaceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateWorkspace not implemented")
@@ -3014,6 +3036,24 @@ func _OpenShell_RefreshSandboxToken_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_IssueTrafficToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IssueTrafficTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).IssueTrafficToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_IssueTrafficToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).IssueTrafficToken(ctx, req.(*IssueTrafficTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_CreateWorkspace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateWorkspaceRequest)
 	if err := dec(in); err != nil {
@@ -3418,6 +3458,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RefreshSandboxToken",
 			Handler:    _OpenShell_RefreshSandboxToken_Handler,
+		},
+		{
+			MethodName: "IssueTrafficToken",
+			Handler:    _OpenShell_IssueTrafficToken_Handler,
 		},
 		{
 			MethodName: "CreateWorkspace",

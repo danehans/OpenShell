@@ -2956,6 +2956,13 @@ pub(super) async fn load_sandbox_config(
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
+    let traffic_identity_targets = state.traffic_identity_registry.authorized_targets(
+        sandbox
+            .metadata
+            .as_ref()
+            .map_or("", |metadata| metadata.id.as_str()),
+        &workspace,
+    );
     let config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
@@ -2963,6 +2970,10 @@ pub(super) async fn load_sandbox_config(
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
         state.extension_jwt_issuer.is_some(),
+    );
+    let config_revision = crate::auth::traffic_identity::configuration_revision(
+        config_revision,
+        &traffic_identity_targets,
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_binding_context(
@@ -2995,6 +3006,7 @@ pub(super) async fn load_sandbox_config(
         global_policy_version,
         provider_env_revision,
         supervisor_middleware_services,
+        traffic_identity_targets,
         workspace,
         policy_validation_failure_mode: state
             .config

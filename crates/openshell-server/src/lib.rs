@@ -327,6 +327,9 @@ pub struct ServerState {
     /// Typed extension JWT issuer and public verification metadata.
     pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
+    pub traffic_identity_registry: Arc<auth::traffic_identity::TrafficIdentityRegistry>,
+    pub(crate) traffic_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
+
     /// Launch-scoped gateway and Sandbox Protocol token authority.
     pub sandbox_session_jwt_authority: Option<Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>>,
 
@@ -442,6 +445,11 @@ impl ServerState {
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             extension_jwt_issuer: None,
+            traffic_identity_registry: Arc::default(),
+            traffic_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::new(
+                Duration::from_mins(1),
+                64,
+            ),
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
             peer_authenticator: None,
@@ -549,6 +557,16 @@ pub(crate) async fn run_server(
         } else {
             (None, None)
         };
+
+    let traffic_identity_registry = Arc::new(
+        auth::traffic_identity::TrafficIdentityRegistry::from_configs(
+            config
+                .gateway_jwt
+                .as_ref()
+                .map_or(&[], |jwt| jwt.traffic_targets.as_slice()),
+        )
+        .map_err(Error::config)?,
+    );
 
     let middleware_registrations = config_file
         .as_ref()
@@ -698,6 +716,7 @@ pub(crate) async fn run_server(
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
     state.extension_jwt_issuer = extension_jwt_issuer.clone();
+    state.traffic_identity_registry = traffic_identity_registry;
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);

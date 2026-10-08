@@ -96,6 +96,7 @@ mod tests {
         let material = generate_jwt_key().expect("generate signing material");
         std::fs::create_dir_all(directory).unwrap();
         let config = GatewayJwtConfig {
+            traffic_targets: Vec::new(),
             signing_key_path: directory.join("signing.pem"),
             public_key_path: directory.join("public.pem"),
             kid_path: directory.join("kid"),

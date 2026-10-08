@@ -58,6 +58,7 @@ pub mod shell;
 pub mod spiffe;
 pub mod telemetry;
 pub mod time;
+pub mod traffic_identity;
 pub mod transport_errors;
 
 pub use config::{

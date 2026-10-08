@@ -746,9 +746,10 @@ service OpenShell {
     };
   }
 
-  // Renew the calling sandbox's gateway JWT. Older tokens remain valid
-  // until their own expiry; deployments should keep token TTLs short to
-  // bound replay exposure. The supervisor calls this from a background
+  // Renew the calling sandbox's gateway JWT. Rotation immediately invalidates
+  // the consumed bearer for ordinary RPCs; only request-matched refresh replay
+  // may recover its successor during the bounded recovery window. The supervisor
+  // calls this from a background
   // task at ~80% of the token's lifetime; the new token is cached in
   // memory only — the on-disk bootstrap file is intentionally not
   // rewritten.
@@ -757,6 +758,12 @@ service OpenShell {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
+  }
+
+  // Issue a distinct 60-second traffic-origin token to the current supervisor.
+  // This RPC never rotates the supervisor session or grants native policy access.
+  rpc IssueTrafficToken(IssueTrafficTokenRequest) returns (IssueTrafficTokenResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
   }
 
   // ---------------------------------------------------------------------------
@@ -3859,4 +3866,22 @@ enum ServiceAuthorizationMode {
   SERVICE_AUTHORIZATION_MODE_STRIP = 1;
   // Forward one syntactically valid bearer Authorization header unchanged.
   SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH = 2;
+}
+
+// Authenticated supervisor exchange. Workspace/sandbox selectors are omitted:
+// the current gateway session supplies both; the caller cannot select an actor.
+message IssueTrafficTokenRequest {
+  // Operator registration name obtained from admitted GetSandboxConfig.
+  string target_name = 1;
+  string expected_execution_id = 2;
+  string expected_target_sha256 = 3;
+  uint64 expected_config_revision = 4;
+}
+
+message IssueTrafficTokenResponse {
+  string token = 1 [(openshell.options.v1.secret) = true];
+  google.protobuf.Timestamp expiration_time = 2;
+  string execution_id = 3;
+  openshell.sandbox.v1.TrafficIdentityTarget target = 4;
+  string configuration_sha256 = 5;
 }

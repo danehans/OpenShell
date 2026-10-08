@@ -136,8 +136,10 @@ mod tests {
     // decoding or deadline updates cannot claim an existing attempt.
     // Conditional stop adds two public messages and a status execution ID;
     // stored statuses without that additive field decode with an empty ID.
+    // Traffic issuance adds three public messages and one sandbox-only RPC.
+    // Durable and public/durable overlap inventories remain byte-identical.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "0a8c356f04c34e0ea81652971f5543fb6aea91a1964f9e3ea859562e658cd99b";
+        "e9b6a6b07b486997a16706906111c87b66d414691ff54fcb1fd9657985909333";
     const DURABLE_SCHEMA_SHA256: &str =
         "b91b4d8fac43f95a80e81218961fbd6e4772a7a163abc9b9f2f13ff1d6f9b430";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -549,12 +551,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            104 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -562,7 +564,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -606,7 +608,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (308, 27),
+                (311, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

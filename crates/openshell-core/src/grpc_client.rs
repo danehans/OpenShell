@@ -1272,6 +1272,7 @@ pub struct SettingsPollResult {
     /// Attachment identity captured with this effective configuration.
     pub provider_attachment_epoch: String,
     pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
+    pub traffic_identity_targets: Vec<crate::proto::TrafficIdentityTarget>,
     /// Workspace the sandbox belongs to.
     pub workspace: String,
     /// Gateway-configured posture for rejected policy generations.
@@ -1296,6 +1297,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         provider_env_revision: inner.provider_env_revision,
         provider_attachment_epoch: inner.provider_attachment_epoch,
         supervisor_middleware_services: inner.supervisor_middleware_services,
+        traffic_identity_targets: inner.traffic_identity_targets,
         workspace: inner.workspace,
         policy_validation_failure_mode: inner
             .policy_validation_failure_mode

@@ -98,6 +98,7 @@ async fn setup(url: &str, directory: &tempfile::TempDir) -> Arc<ServerState> {
     let state_mut = Arc::get_mut(&mut state).unwrap();
     state_mut.admin_role = "openshell-admin".into();
     state_mut.config.gateway_jwt = Some(openshell_core::config::GatewayJwtConfig {
+        traffic_targets: Vec::new(),
         signing_key_path: key,
         public_key_path: directory.path().join("public"),
         kid_path: directory.path().join("kid"),

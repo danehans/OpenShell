@@ -104,6 +104,7 @@ pub fn local_jwt_config(dir: &Path) -> Result<Option<GatewayJwtConfig>> {
     match present {
         0 => Ok(None),
         3 => Ok(Some(GatewayJwtConfig {
+            traffic_targets: Vec::new(),
             signing_key_path: paths.signing_key,
             public_key_path: paths.public_key,
             kid_path: paths.kid,

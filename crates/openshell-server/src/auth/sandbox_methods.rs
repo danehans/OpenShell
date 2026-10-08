@@ -23,6 +23,9 @@ mod tests {
     #[test]
     fn supervisor_callbacks_are_allowed() {
         assert!(is_sandbox_callable(
+            "/openshell.v1.OpenShell/IssueTrafficToken"
+        ));
+        assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(is_sandbox_callable("/openshell.v1.OpenShell/RelayStream"));

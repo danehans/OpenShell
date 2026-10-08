@@ -434,6 +434,68 @@ impl ExtensionJwtIssuer {
         })
     }
 
+    /// Mint a distinct traffic credential after current-session and target authorization.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn mint_traffic_token(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        target: &openshell_core::proto::TrafficIdentityTarget,
+        configuration_sha256: &str,
+    ) -> Result<MintedToken, Status> {
+        use openshell_core::traffic_identity::{
+            TRAFFIC_JWT_TYP, TRAFFIC_TOKEN_TTL, TrafficJwtClaims, TrafficTokenPurpose,
+        };
+        let id = uuid::Uuid::parse_str(sandbox_id)
+            .map_err(|_| Status::invalid_argument("invalid traffic sandbox UUID"))?;
+        if id.is_nil() || id.to_string() != sandbox_id {
+            return Err(Status::invalid_argument("invalid traffic sandbox UUID"));
+        }
+        crate::auth::sandbox_session::validate_execution_id(execution_id)?;
+        if !target.audience.starts_with("urn:openshell:traffic:")
+            || target.audience == self.gateway_audience
+        {
+            return Err(Status::invalid_argument("invalid traffic audience"));
+        }
+        for hash in [target.target_sha256.as_str(), configuration_sha256] {
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+            {
+                return Err(Status::invalid_argument(
+                    "invalid traffic configuration identity",
+                ));
+            }
+        }
+        let iat = now_secs();
+        let exp = iat
+            .checked_add(i64::try_from(TRAFFIC_TOKEN_TTL.as_secs()).expect("bounded traffic TTL"))
+            .ok_or_else(|| Status::internal("invalid traffic issuance time"))?;
+        let claims = TrafficJwtClaims {
+            iss: self.issuer.clone(),
+            aud: target.audience.clone(),
+            sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
+            iat,
+            exp,
+            jti: uuid::Uuid::new_v4().to_string(),
+            purpose: TrafficTokenPurpose::Traffic,
+            sandbox_id: sandbox_id.to_string(),
+            execution_id: execution_id.to_string(),
+            target_sha256: target.target_sha256.clone(),
+            configuration_sha256: configuration_sha256.to_string(),
+        };
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(self.kid.clone());
+        header.typ = Some(TRAFFIC_JWT_TYP.to_string());
+        let token = encode(&header, &claims, &self.encoding_key)
+            .map_err(|_| Status::internal("failed to mint traffic token"))?;
+        Ok(MintedToken {
+            token,
+            expires_at_ms: exp.saturating_mul(1000),
+        })
+    }
+
     pub const fn token_ttl(&self) -> Duration {
         self.ttl
     }
@@ -511,6 +573,106 @@ mod tests {
 
     fn extension_audience(value: &str) -> ExtensionAudience {
         ExtensionAudience::new(value).expect("valid extension audience")
+    }
+
+    #[test]
+    fn traffic_credential_signature_type_identity_and_audience_are_independent() {
+        use openshell_core::traffic_identity::{TRAFFIC_JWT_TYP, TrafficJwtClaims};
+        let material = generate_jwt_key().unwrap();
+        let issuer = ExtensionJwtIssuer::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid.clone(),
+            "traffic-test",
+            Duration::from_mins(15),
+        )
+        .unwrap();
+        let id = "c1bf54a4-7789-4091-b682-e183f71a3fca";
+        let target = openshell_core::proto::TrafficIdentityTarget {
+            audience: "urn:openshell:traffic:shared-gateway".into(),
+            target_sha256: "a".repeat(64),
+            ..Default::default()
+        };
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let execution = crate::auth::sandbox_session::execution_id(
+            id,
+            &identity.runtime_generation,
+            identity.auth_epoch,
+        );
+        let minted = issuer
+            .mint_traffic_token(id, &execution, &target, &"b".repeat(64))
+            .unwrap();
+        let header = decode_header(&minted.token).unwrap();
+        assert_eq!(header.typ.as_deref(), Some(TRAFFIC_JWT_TYP));
+        let key = DecodingKey::from_ed_pem(material.public_key_pem.as_bytes()).unwrap();
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&[issuer.issuer()]);
+        validation.set_audience(&[target.audience.as_str()]);
+        validation.leeway = 0;
+        let claims = decode::<TrafficJwtClaims>(&minted.token, &key, &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(claims.sandbox_id, id);
+        assert_eq!(claims.execution_id, execution);
+        assert_eq!(claims.exp - claims.iat, 60);
+        assert!(decode::<ExtensionJwtClaims>(&minted.token, &key, &validation).is_err());
+        let authority = SandboxSessionJwtAuthority::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid,
+            "traffic-test",
+            None,
+        )
+        .unwrap();
+        assert!(authority.verify_gateway_token(&minted.token).is_err());
+        validation.set_audience(&["urn:openshell:traffic:other"]);
+        assert!(decode::<TrafficJwtClaims>(&minted.token, &key, &validation).is_err());
+        validation.set_audience(&[target.audience]);
+        validation.set_issuer(&["openshell-gateway:other"]);
+        assert!(decode::<TrafficJwtClaims>(&minted.token, &key, &validation).is_err());
+        validation.set_issuer(&[issuer.issuer()]);
+        let other = generate_jwt_key().unwrap();
+        let other = DecodingKey::from_ed_pem(other.public_key_pem.as_bytes()).unwrap();
+        assert!(decode::<TrafficJwtClaims>(&minted.token, &other, &validation).is_err());
+    }
+
+    #[test]
+    fn traffic_issuer_refuses_invalid_actor_and_configuration_identity() {
+        let issuer = issuer(Duration::from_mins(15));
+        let target = openshell_core::proto::TrafficIdentityTarget {
+            audience: "urn:openshell:traffic:shared-gateway".into(),
+            target_sha256: "a".repeat(64),
+            ..Default::default()
+        };
+        let id = "c1bf54a4-7789-4091-b682-e183f71a3fca";
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let execution = crate::auth::sandbox_session::execution_id(
+            id,
+            &identity.runtime_generation,
+            identity.auth_epoch,
+        );
+        assert!(
+            issuer
+                .mint_traffic_token("sandbox-name", &execution, &target, &"b".repeat(64))
+                .is_err()
+        );
+        assert!(
+            issuer
+                .mint_traffic_token(id, "invalid-execution", &target, &"b".repeat(64))
+                .is_err()
+        );
+        assert!(
+            issuer
+                .mint_traffic_token(id, &execution, &target, &"B".repeat(64))
+                .is_err()
+        );
+        let mut unsafe_target = target;
+        unsafe_target.audience = "urn:openshell:extension:middleware:shared-gateway".into();
+        assert!(
+            issuer
+                .mint_traffic_token(id, &execution, &unsafe_target, &"b".repeat(64))
+                .is_err()
+        );
     }
 
     #[test]

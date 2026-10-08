@@ -100,6 +100,7 @@ async fn create_sandbox_replay_preserves_service_urls() {
     let mut state = test_server_state().await;
     Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
         Some(openshell_core::config::GatewayJwtConfig {
+            traffic_targets: Vec::new(),
             signing_key_path: key,
             public_key_path: directory.path().join("public"),
             kid_path: directory.path().join("kid"),

@@ -91,6 +91,16 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 ### Step 3: Check Gateway Startup Dependencies
 
+The experimental runtime-origin traffic contract is separate from session and
+extension authentication. If explicitly configured, inspect only registration
+names, exact HTTPS authority, grant scope and fingerprint metadata from the
+installed gateway's configuration reference. A traffic JWT cannot repair a
+supervisor session, and session refresh cannot authorize an unregistered target.
+Never print bearers, copy them into workloads, weaken TLS or substitute a sandbox
+name for its immutable UUID. Discovery/issuance alone does not establish traffic
+forwarding or protection; confirm the installed supervisor/gateway capabilities.
+
+
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
 For resource-admission failures, distinguish disabled caller driver config from

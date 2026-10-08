@@ -1028,6 +1028,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn issue_traffic_token(
+        &self,
+        _request: tonic::Request<proto::IssueTrafficTokenRequest>,
+    ) -> Result<Response<proto::IssueTrafficTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn refresh_sandbox_token(
         &self,
         _: tonic::Request<proto::RefreshSandboxTokenRequest>,

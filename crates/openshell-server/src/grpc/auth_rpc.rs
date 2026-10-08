@@ -20,7 +20,8 @@ use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
     ExtensionServiceCredential, GetCurrentUserRequest, GetCurrentUserResponse,
     GetSandboxConfigRequest, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
+    IssueTrafficTokenRequest, IssueTrafficTokenResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, Sandbox,
 };
 use openshell_extension_core::{ExtensionAudience, ExtensionCallerKind, MAX_EXTENSION_TOKEN_TTL};
 use std::collections::{HashMap, HashSet};
@@ -429,6 +430,137 @@ fn mint_extension_credentials(
         .collect()
 }
 
+/// Traffic issuance has no refresh recovery exception and never changes lineage.
+#[allow(clippy::result_large_err)]
+pub async fn handle_issue_traffic_token(
+    state: &Arc<ServerState>,
+    request: Request<IssueTrafficTokenRequest>,
+) -> Result<Response<IssueTrafficTokenResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let Principal::Sandbox(sandbox) = principal else {
+        return Err(Status::permission_denied(
+            "traffic issuance requires a supervisor",
+        ));
+    };
+    if !matches!(sandbox.source, SandboxIdentitySource::BootstrapJwt { .. }) {
+        return Err(Status::permission_denied(
+            "traffic issuance requires a current gateway session",
+        ));
+    }
+    let authority = state
+        .sandbox_session_jwt_authority
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("sandbox session minting is not configured"))?;
+    let issuer = state
+        .extension_jwt_issuer
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("traffic token minting is not configured"))?;
+    let mut values = request.metadata().get_all("authorization").iter();
+    let value = values
+        .next()
+        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?;
+    if values.next().is_some() {
+        return Err(Status::unauthenticated("duplicate authorization metadata"));
+    }
+    let bearer = value
+        .to_str()
+        .ok()
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
+    let authenticated = authority.verify_gateway_token(bearer)?;
+    if authenticated.sandbox_id.as_str() != sandbox.sandbox_id {
+        return Err(Status::unauthenticated(
+            "gateway token does not match the authenticated sandbox",
+        ));
+    }
+    let identity =
+        crate::auth::sandbox_session::authorize_persisted(&state.store, &authenticated).await?;
+    let execution_id = crate::auth::sandbox_session::execution_id(
+        &sandbox.sandbox_id,
+        &identity.runtime_generation,
+        identity.auth_epoch,
+    );
+    let input = request.get_ref();
+    if input.expected_execution_id != execution_id {
+        return Err(Status::failed_precondition(
+            "traffic execution identity changed",
+        ));
+    }
+    let record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+    if record.phase() != openshell_core::proto::SandboxPhase::Ready as i32 {
+        return Err(Status::failed_precondition(
+            "traffic execution is not running",
+        ));
+    }
+    let metadata = record
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is unavailable"))?;
+    let target = state.traffic_identity_registry.authorize(
+        &input.target_name,
+        &sandbox.sandbox_id,
+        &metadata.workspace,
+    )?;
+    if input.expected_target_sha256 != target.target_sha256 {
+        return Err(Status::failed_precondition(
+            "traffic target identity changed",
+        ));
+    }
+    if !state.traffic_mint_limiter.try_acquire(&sandbox.sandbox_id) {
+        return Err(Status::resource_exhausted(
+            "traffic credential issuance limit exceeded",
+        ));
+    }
+    let mut config_request = Request::new(GetSandboxConfigRequest {
+        name: metadata.name.clone(),
+        workspace_scope: None,
+    });
+    config_request
+        .extensions_mut()
+        .insert(Principal::Sandbox(sandbox));
+    let config = super::policy::handle_get_sandbox_config(state, config_request)
+        .await?
+        .into_inner();
+    if !config.configuration_admitted
+        || config.config_revision != input.expected_config_revision
+        || !config
+            .traffic_identity_targets
+            .iter()
+            .any(|candidate| candidate == &target)
+    {
+        return Err(Status::failed_precondition(
+            "traffic configuration is not current and admitted",
+        ));
+    }
+    // Recheck after asynchronous policy resolution; no refresh or persistence writes.
+    crate::auth::sandbox_session::authorize_persisted(&state.store, &authenticated).await?;
+    let current = ensure_sandbox_exists(state, authenticated.sandbox_id.as_str()).await?;
+    if current.metadata.as_ref().map(|meta| meta.resource_version)
+        != Some(metadata.resource_version)
+        || current.phase() != openshell_core::proto::SandboxPhase::Ready as i32
+    {
+        return Err(Status::aborted("sandbox changed during traffic issuance"));
+    }
+    let configuration_sha256 =
+        crate::auth::traffic_identity::configuration_sha256(&config, &target);
+    let token = issuer.mint_traffic_token(
+        authenticated.sandbox_id.as_str(),
+        &execution_id,
+        &target,
+        &configuration_sha256,
+    )?;
+    Ok(Response::new(IssueTrafficTokenResponse {
+        token: token.token,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            token.expires_at_ms,
+        )
+        .map_err(|_| Status::internal("invalid traffic token expiry"))?,
+        execution_id,
+        target: Some(target),
+        configuration_sha256,
+    }))
+}
+
 async fn ensure_sandbox_exists(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -606,6 +738,354 @@ mod tests {
             .parse()
             .expect("authorization metadata");
         request.metadata_mut().insert("authorization", value);
+    }
+
+    const TRAFFIC_SANDBOX: &str = "c1bf54a4-7789-4091-b682-e183f71a3fca";
+
+    async fn traffic_state() -> Arc<ServerState> {
+        use openshell_core::traffic_identity::{TrafficTargetConfig, TrafficTransport};
+        let mut state = state_with_issuer().await;
+        Arc::get_mut(&mut state).unwrap().traffic_identity_registry = Arc::new(
+            crate::auth::traffic_identity::TrafficIdentityRegistry::from_configs(&[
+                TrafficTargetConfig {
+                    name: "shared-gateway".into(),
+                    https_endpoint: "https://gateway.example.test:8443".into(),
+                    audience: "urn:openshell:traffic:shared-gateway".into(),
+                    workspace: "default".into(),
+                    sandbox_ids: vec![TRAFFIC_SANDBOX.into()],
+                    transports: vec![TrafficTransport::Http, TrafficTransport::Mcp],
+                    tls_ca_cert_path: None,
+                },
+            ])
+            .unwrap(),
+        );
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        insert_sandbox(&state, TRAFFIC_SANDBOX, &identity).await;
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>(TRAFFIC_SANDBOX)
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.spec.as_mut().unwrap().policy =
+            Some(openshell_core::proto::SandboxPolicy::default());
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+    }
+
+    async fn traffic_request(state: &Arc<ServerState>) -> Request<IssueTrafficTokenRequest> {
+        traffic_request_for_configuration(state, true).await
+    }
+
+    async fn traffic_request_for_configuration(
+        state: &Arc<ServerState>,
+        require_admitted: bool,
+    ) -> Request<IssueTrafficTokenRequest> {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(TRAFFIC_SANDBOX)
+            .await
+            .unwrap()
+            .unwrap();
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        let authentication = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .unwrap()
+            .mint_persisted_launch(TRAFFIC_SANDBOX, &identity)
+            .unwrap();
+        let config = super::super::policy::load_sandbox_config(state, &sandbox)
+            .await
+            .unwrap();
+        assert!(
+            !require_admitted || config.configuration_admitted,
+            "fixture must have an admitted policy: {}",
+            config.configuration_error
+        );
+        let target = config.traffic_identity_targets.first().unwrap();
+        let mut request = Request::new(IssueTrafficTokenRequest {
+            target_name: target.name.clone(),
+            expected_execution_id: crate::auth::sandbox_session::sandbox_execution_id(&sandbox)
+                .unwrap(),
+            expected_target_sha256: target.target_sha256.clone(),
+            expected_config_revision: config.config_revision,
+        });
+        request
+            .extensions_mut()
+            .insert(sandbox_principal(TRAFFIC_SANDBOX));
+        request.metadata_mut().insert(
+            "authorization",
+            format!(
+                "Bearer {}",
+                authentication.supervisor.gateway_token.expose_secret()
+            )
+            .parse()
+            .unwrap(),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn traffic_issuance_is_distinct_short_lived_and_preserves_lineage() {
+        let state = traffic_state().await;
+        let before = state
+            .store
+            .get_message::<Sandbox>(TRAFFIC_SANDBOX)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = traffic_request(&state).await;
+        let original_bearer = request
+            .metadata()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("Bearer ")
+            .unwrap()
+            .to_string();
+        let result = handle_issue_traffic_token(&state, request)
+            .await
+            .unwrap()
+            .into_inner();
+        let header = jsonwebtoken::decode_header(&result.token).unwrap();
+        assert_eq!(
+            header.typ.as_deref(),
+            Some(openshell_core::traffic_identity::TRAFFIC_JWT_TYP)
+        );
+        assert_eq!(header.alg, jsonwebtoken::Algorithm::EdDSA);
+        let issuer = state.extension_jwt_issuer.as_ref().unwrap();
+        let key = issuer.jwks().keys.first().unwrap();
+        let public_jwk: jsonwebtoken::jwk::Jwk =
+            serde_json::from_value(serde_json::to_value(key).unwrap()).unwrap();
+        let decoding_key = jsonwebtoken::DecodingKey::from_jwk(&public_jwk).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        validation.set_issuer(&[issuer.issuer()]);
+        validation.set_audience(&["urn:openshell:traffic:shared-gateway"]);
+        validation.leeway = 0;
+        let claims = jsonwebtoken::decode::<openshell_core::traffic_identity::TrafficJwtClaims>(
+            &result.token,
+            &decoding_key,
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(claims.exp - claims.iat, 60);
+        assert_eq!(claims.sandbox_id, TRAFFIC_SANDBOX);
+        assert_eq!(claims.execution_id, result.execution_id);
+        assert_eq!(claims.target_sha256, result.target.unwrap().target_sha256);
+        assert_eq!(claims.configuration_sha256, result.configuration_sha256);
+        assert!(uuid::Uuid::parse_str(&claims.jti).is_ok());
+        assert!(!format!("{claims:?}").contains(TRAFFIC_SANDBOX));
+        assert!(
+            state
+                .sandbox_session_jwt_authority
+                .as_ref()
+                .unwrap()
+                .verify_gateway_token(&result.token)
+                .is_err()
+        );
+        assert!(
+            state
+                .sandbox_session_jwt_authority
+                .as_ref()
+                .unwrap()
+                .verify_gateway_token(&original_bearer)
+                .is_ok()
+        );
+        let after = state
+            .store
+            .get_message::<Sandbox>(TRAFFIC_SANDBOX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "traffic minting must not mutate persistence or refresh lineage"
+        );
+        let second = handle_issue_traffic_token(&state, traffic_request(&state).await)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(result.token, second.token, "issuance IDs must be fresh");
+    }
+
+    #[tokio::test]
+    async fn traffic_issuance_rejects_frozen_identity_substitution() {
+        let state = traffic_state().await;
+        for case in 0..4 {
+            let mut request = traffic_request(&state).await;
+            match case {
+                0 => request.get_mut().target_name = "unregistered".into(),
+                1 => request.get_mut().expected_execution_id = "exec-v1-wrong".into(),
+                2 => request.get_mut().expected_target_sha256 = "f".repeat(64),
+                _ => request.get_mut().expected_config_revision ^= 1,
+            }
+            let error = handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail");
+            assert!(matches!(
+                error.code(),
+                tonic::Code::PermissionDenied | tonic::Code::FailedPrecondition
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_issuance_rejects_consumed_session_and_replaced_execution() {
+        let state = traffic_state().await;
+        let consumed_request = traffic_request(&state).await;
+        let bearer = consumed_request
+            .metadata()
+            .get("authorization")
+            .unwrap()
+            .clone();
+        let mut refresh = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: vec![],
+        });
+        refresh
+            .extensions_mut()
+            .insert(sandbox_principal(TRAFFIC_SANDBOX));
+        refresh.metadata_mut().insert("authorization", bearer);
+        handle_refresh_sandbox_token(&state, refresh).await.unwrap();
+        assert_eq!(
+            handle_issue_traffic_token(&state, consumed_request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let replaced = traffic_request(&state).await;
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        insert_sandbox(&state, TRAFFIC_SANDBOX, &identity).await;
+        assert_eq!(
+            handle_issue_traffic_token(&state, replaced)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_issuance_rejects_duplicate_credentials_and_other_principals() {
+        let state = traffic_state().await;
+        let mut request = traffic_request(&state).await;
+        let bearer = request.metadata().get("authorization").unwrap().clone();
+        request.metadata_mut().append("authorization", bearer);
+        assert_eq!(
+            handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut request = traffic_request(&state).await;
+        request.metadata_mut().remove("authorization");
+        assert_eq!(
+            handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut request = traffic_request(&state).await;
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: TRAFFIC_SANDBOX.into(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".into(),
+                    runtime_identity: "test-runtime".into(),
+                },
+                trust_domain: None,
+            }));
+        assert_eq!(
+            handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut request = traffic_request(&state).await;
+        request
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        assert_eq!(
+            handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_issuance_requires_live_phase_and_admitted_configuration() {
+        let state = traffic_state().await;
+        let mut request = traffic_request(&state).await;
+        let mut record = state
+            .store
+            .get_message::<Sandbox>(TRAFFIC_SANDBOX)
+            .await
+            .unwrap()
+            .unwrap();
+        record.set_phase(SandboxPhase::Completed as i32);
+        state.store.put_message(&record).await.unwrap();
+        assert_eq!(
+            handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        // A separate sandbox starts without any effective policy history.
+        let state = traffic_state().await;
+        let mut record = state
+            .store
+            .get_message::<Sandbox>(TRAFFIC_SANDBOX)
+            .await
+            .unwrap()
+            .unwrap();
+        record.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&record).await.unwrap();
+        request = traffic_request_for_configuration(&state, false).await;
+        assert_eq!(
+            handle_issue_traffic_token(&state, request)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_issuance_is_rate_limited_independently_of_session_refresh() {
+        let state = traffic_state().await;
+        for _ in 0..64 {
+            assert!(state.traffic_mint_limiter.try_acquire(TRAFFIC_SANDBOX));
+        }
+        assert_eq!(
+            handle_issue_traffic_token(&state, traffic_request(&state).await)
+                .await
+                .map(|_| ())
+                .expect_err("traffic issuance must fail")
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert!(state.extension_mint_limiter.try_acquire(TRAFFIC_SANDBOX));
     }
 
     #[tokio::test]

@@ -5574,6 +5574,7 @@ network_policies:
             provider_env_revision: 0,
             provider_attachment_epoch: String::new(),
             supervisor_middleware_services: Vec::new(),
+            traffic_identity_targets: Vec::new(),
             workspace: String::new(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             extension_authentication_enabled: false,

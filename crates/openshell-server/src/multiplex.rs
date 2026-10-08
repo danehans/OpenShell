@@ -1752,6 +1752,7 @@ mod tests {
         let mut state = crate::grpc::test_support::test_server_state().await;
         Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
             Some(openshell_core::config::GatewayJwtConfig {
+                traffic_targets: Vec::new(),
                 signing_key_path: key,
                 public_key_path: directory.path().join("public"),
                 kid_path: directory.path().join("kid"),
@@ -2960,6 +2961,7 @@ mod tests {
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
+                "/openshell.v1.OpenShell/IssueTrafficToken",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

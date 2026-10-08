@@ -285,6 +285,7 @@ mock_gateway! {
         clear_draft_chunks(proto::ClearDraftChunksRequest) -> proto::ClearDraftChunksResponse;
         get_draft_history(proto::GetDraftHistoryRequest) -> proto::GetDraftHistoryResponse;
         issue_sandbox_token(proto::IssueSandboxTokenRequest) -> proto::IssueSandboxTokenResponse;
+        issue_traffic_token(proto::IssueTrafficTokenRequest) -> proto::IssueTrafficTokenResponse;
         refresh_sandbox_token(proto::RefreshSandboxTokenRequest) -> proto::RefreshSandboxTokenResponse;
         create_workspace(proto::CreateWorkspaceRequest) -> proto::CreateWorkspaceResponse;
         get_workspace(proto::GetWorkspaceRequest) -> proto::GetWorkspaceResponse;

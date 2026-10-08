@@ -558,6 +558,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn issue_traffic_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueTrafficTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueTrafficTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn refresh_sandbox_token(
         &self,
         _: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,

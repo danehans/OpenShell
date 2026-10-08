@@ -445,6 +445,10 @@ message GetSandboxConfigResponse {
   string configuration_error = 16;
   // Registration fence for a new supervisor; capture once and retain on retry.
   string configuration_instance_id = 15;
+  // Operator-authorized traffic destinations for this immutable sandbox.
+  // These grants never override native request policy or enable injection on
+  // supervisors that do not implement the distinct traffic-origin contract.
+  repeated TrafficIdentityTarget traffic_identity_targets = 17;
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -474,4 +478,17 @@ message SupervisorMiddlewareService {
   // no bearer credential; supervisors must not request one. Intended only for
   // trusted-network development deployments.
   bool allow_insecure_transport = 7;
+}
+
+// Non-secret, operator-owned traffic identity target. TLS hostname verification
+// is mandatory. Empty CA bytes select platform roots; explicit CA bytes replace
+// them. Only listed transports may use the reserved origin credential carrier.
+message TrafficIdentityTarget {
+  string name = 1;
+  string https_endpoint = 2;
+  string audience = 3;
+  bytes tls_ca_cert_pem = 4;
+  repeated string transports = 5;
+  // SHA-256 over canonical authority, audience, grant scope, transports and roots.
+  string target_sha256 = 6;
 }

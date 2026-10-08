@@ -29,6 +29,7 @@ fn configure_key(state: &mut Arc<ServerState>, directory: &tempfile::TempDir) {
     std::fs::write(&key, b"test-only stable private fingerprint material").unwrap();
     Arc::get_mut(state).unwrap().config.gateway_jwt =
         Some(openshell_core::config::GatewayJwtConfig {
+            traffic_targets: Vec::new(),
             signing_key_path: key,
             public_key_path: directory.path().join("public"),
             kid_path: directory.path().join("kid"),

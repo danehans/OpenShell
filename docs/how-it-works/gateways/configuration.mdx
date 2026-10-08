@@ -312,6 +312,50 @@ The gateway rejects partial or invalid signing bundles at startup, including pri
 
 External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
 
+### Runtime-origin traffic credentials
+
+The experimental traffic-origin contract is disabled by default. An operator can
+register an exact HTTPS gateway authority under
+`[[openshell.gateway.gateway_jwt.traffic_targets]]`. The grant selects immutable
+sandbox UUIDs in one workspace; sandbox names and labels do not grant access.
+
+```toml
+[[openshell.gateway.gateway_jwt.traffic_targets]]
+name = "shared-agentgateway"
+https_endpoint = "https://gateway.example.com:8443"
+audience = "urn:openshell:traffic:shared-agentgateway"
+workspace = "default"
+sandbox_ids = ["c1bf54a4-7789-4091-b682-e183f71a3fca"]
+transports = ["http", "mcp"]
+# Optional certificate-only private trust bundle. No insecure TLS option exists.
+# tls_ca_cert_path = "/etc/openshell/traffic-ca.pem"
+```
+
+The gateway loads at most 32 targets, each granting at most 256 sandbox UUIDs.
+HTTPS DNS authority, audience, workspace, grants, transports and canonical public
+CA certificates contribute to the target fingerprint. Duplicate authorities,
+registration names, grants and transports fail startup. The complete registry
+limits encoded discovery descriptors to 512 KiB. CA files are bounded to
+1 MiB and must contain only valid certificates. Explicit roots replace platform
+roots, and TLS hostname verification remains mandatory.
+
+`GetSandboxConfig` exposes the authorized non-secret targets and incorporates
+those target fingerprints into the effective configuration revision. Supervisors
+use the separate `IssueTrafficToken` RPC with their current gateway bearer and
+frozen execution, target and configuration identities. The returned Ed25519 JWT
+has type `openshell-traffic+jwt`, purpose `traffic`, an exact traffic audience and
+60-second expiry. It includes immutable sandbox/execution and configuration
+identities, never extension caller authority. Issuance does not rotate the
+supervisor session; consumed refresh bearers cannot issue traffic tokens.
+
+This checkpoint implements discovery and issuance only. Supervisor injection,
+trusted gateway forwarding and shared-origin integration qualification remain
+pending. Registering a target does not enable forwarding or establish protection.
+Native request policy must authorize every exchange before credentials can be
+injected. Credentials stay in supervisor memory and never enter workload
+processes; traffic grants cannot override native policy. See
+[the implementation design](https://github.com/danehans/OpenShell/blob/traffic-origin-identity/crates/openshell-server/README.md).
+
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 ## OCSF JSONL Output
