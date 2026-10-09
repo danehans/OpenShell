@@ -109,7 +109,20 @@ impl ComputeRuntime {
         operation: impl Future<Output = Result<T, Status>> + Send + 'static,
     ) -> Result<(T, Box<Sandbox>), ProvisioningOperationError> {
         let claimed = self
-            .claim_provisioning_operation(starting)
+            .claim_provisioning_operation(starting, false)
+            .await
+            .map_err(ProvisioningOperationError::Monitor)?;
+        self.await_claimed_provisioning_operation(&claimed, operation)
+            .await
+    }
+
+    pub(super) async fn await_admitted_provisioning_operation<T: Send + 'static>(
+        &self,
+        starting: &Sandbox,
+        operation: impl Future<Output = Result<T, Status>> + Send + 'static,
+    ) -> Result<(T, Box<Sandbox>), ProvisioningOperationError> {
+        let claimed = self
+            .claim_provisioning_operation(starting, true)
             .await
             .map_err(ProvisioningOperationError::Monitor)?;
         self.await_claimed_provisioning_operation(&claimed, operation)
@@ -191,14 +204,26 @@ impl ComputeRuntime {
         }
     }
 
-    async fn claim_provisioning_operation(&self, starting: &Sandbox) -> Result<Sandbox, Status> {
-        let Some(attempt_id) = sandbox_provisioning_attempt_id(starting) else {
-            // Legacy rows without an attempt do not gain a synthetic deadline.
+    async fn claim_provisioning_operation(
+        &self,
+        starting: &Sandbox,
+        admission_required: bool,
+    ) -> Result<Sandbox, Status> {
+        let attempt_id = sandbox_provisioning_attempt_id(starting);
+        if attempt_id.is_none() && !admission_required {
+            // Non-launch operations retain the legacy ownership contract.
             return Ok(starting.clone());
-        };
-        if attempt_id.is_empty() {
+        }
+        if attempt_id.is_some_and(str::is_empty) {
             return Err(Status::failed_precondition("provisioning attempt is empty"));
         }
+        // A legacy recovery launch still needs a durable driver claim. Add
+        // ownership without granting a synthetic preparation or repair window.
+        let legacy_record = attempt_id.is_none().then(|| {
+            let mut record = provisioning_deadline::new_record(openshell_core::time::now_ms());
+            record.deadline = None;
+            record
+        });
         for _ in 0..super::START_PHASE_CAS_RETRY_LIMIT {
             let current = self
                 .store
@@ -210,6 +235,9 @@ impl ComputeRuntime {
                 return Err(Status::deadline_exceeded(
                     "provisioning deadline already expired",
                 ));
+            }
+            if admission_required {
+                super::admission::ensure_allowed(&current)?;
             }
             if provisioning_deadline::driver_operation_pending(&current) {
                 return Err(Status::failed_precondition(
@@ -233,7 +261,15 @@ impl ComputeRuntime {
                 .update_message_cas::<Sandbox, _>(
                     starting.object_id(),
                     sandbox_resource_version(&current),
-                    claim_record,
+                    |sandbox| {
+                        if let Some(record) = &legacy_record {
+                            sandbox
+                                .status
+                                .get_or_insert_with(Default::default)
+                                .provisioning = Some(record.clone());
+                        }
+                        claim_record(sandbox);
+                    },
                 )
                 .await
             {

@@ -3,6 +3,7 @@
 
 //! gRPC service implementation.
 
+mod admission;
 mod auth_rpc;
 pub mod mutation_replay;
 pub mod policy;
@@ -428,6 +429,31 @@ impl OpenShell for OpenShellService {
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn hold_sandbox_admission(
+        &self,
+        request: Request<openshell_core::proto::HoldSandboxAdmissionRequest>,
+    ) -> Result<Response<openshell_core::proto::HoldSandboxAdmissionResponse>, Status> {
+        admission::hold(&self.state, request).await
+    }
+    async fn release_sandbox_admission(
+        &self,
+        request: Request<openshell_core::proto::ReleaseSandboxAdmissionRequest>,
+    ) -> Result<Response<openshell_core::proto::ReleaseSandboxAdmissionResponse>, Status> {
+        admission::release(&self.state, request).await
+    }
+    async fn get_sandbox_admission(
+        &self,
+        request: Request<openshell_core::proto::GetSandboxAdmissionRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxAdmissionResponse>, Status> {
+        admission::get(&self.state, request).await
+    }
+    async fn get_sandbox_admission_receipt(
+        &self,
+        request: Request<openshell_core::proto::GetSandboxAdmissionReceiptRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxAdmissionReceiptResponse>, Status> {
+        admission::get_receipt(&self.state, request).await
     }
 
     // --- Exec ---

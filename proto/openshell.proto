@@ -206,6 +206,41 @@ service OpenShell {
     };
   }
 
+  // Runtime-owned holds deny future executions, independently of stop.
+  // Sandbox credentials cannot call these workspace-administrator APIs.
+  rpc HoldSandboxAdmission(HoldSandboxAdmissionRequest)
+      returns (HoldSandboxAdmissionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+  rpc ReleaseSandboxAdmission(ReleaseSandboxAdmissionRequest)
+      returns (ReleaseSandboxAdmissionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+  rpc GetSandboxAdmission(GetSandboxAdmissionRequest)
+      returns (GetSandboxAdmissionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "admin"
+    };
+  }
+  rpc GetSandboxAdmissionReceipt(GetSandboxAdmissionReceiptRequest)
+      returns (GetSandboxAdmissionReceiptResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "admin"
+    };
+  }
+
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
     option (openshell.options.v1.authorization) = {
@@ -1215,6 +1250,84 @@ message SandboxStatus {
   // does not change it. Empty for records without authenticated runtime identity.
   // Use as a StopSandboxExecution precondition, never as an authorization token.
   string execution_id = 17;
+  // Gateway-owned immutable hold/release history, preserved across executions.
+  // Absent on legacy records. Caller metadata cannot overwrite this field.
+  SandboxRuntimeAdmission runtime_admission = 18;
+}
+
+enum SandboxAdmissionOperation {
+  SANDBOX_ADMISSION_OPERATION_UNSPECIFIED = 0;
+  SANDBOX_ADMISSION_OPERATION_HOLD = 1;
+  SANDBOX_ADMISSION_OPERATION_RELEASE = 2;
+}
+
+enum SandboxAdmissionReason {
+  SANDBOX_ADMISSION_REASON_UNSPECIFIED = 0;
+  SANDBOX_ADMISSION_REASON_INCIDENT = 1;
+  SANDBOX_ADMISSION_REASON_POLICY = 2;
+  SANDBOX_ADMISSION_REASON_OPERATOR = 3;
+}
+
+// A historical mutation receipt, never a claim about current admission state.
+message SandboxAdmissionReceipt {
+  string sandbox_id = 1;
+  string action_id = 2;
+  string hold_action_id = 3;
+  SandboxAdmissionOperation operation = 4;
+  SandboxAdmissionReason reason = 5;
+  uint64 previous_epoch = 6;
+  uint64 epoch = 7;
+  google.protobuf.Timestamp recorded_time = 8;
+}
+
+// Gateway-owned durable state. History is bounded and never evicted for retries.
+message SandboxRuntimeAdmission {
+  uint64 epoch = 1;
+  repeated SandboxAdmissionReceipt receipts = 2;
+}
+
+message HoldSandboxAdmissionRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  // Mandatory immutable identity precondition; no name-only fallback.
+  string expected_sandbox_id = 3;
+  // Mandatory nonzero UUID, retained across retries.
+  string action_id = 4;
+  uint64 expected_epoch = 5;
+  SandboxAdmissionReason reason = 6;
+}
+message HoldSandboxAdmissionResponse {
+  SandboxAdmissionReceipt receipt = 1;
+}
+message ReleaseSandboxAdmissionRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  string expected_sandbox_id = 3;
+  string action_id = 4;
+  string hold_action_id = 5;
+  uint64 expected_epoch = 6;
+}
+message ReleaseSandboxAdmissionResponse {
+  SandboxAdmissionReceipt receipt = 1;
+}
+message GetSandboxAdmissionRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  string expected_sandbox_id = 3;
+}
+message GetSandboxAdmissionResponse {
+  string sandbox_id = 1;
+  uint64 epoch = 2;
+  repeated string active_hold_action_ids = 3;
+}
+message GetSandboxAdmissionReceiptRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  string name = 2;
+  string expected_sandbox_id = 3;
+  string action_id = 4;
+}
+message GetSandboxAdmissionReceiptResponse {
+  SandboxAdmissionReceipt receipt = 1;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.

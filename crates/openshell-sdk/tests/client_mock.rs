@@ -232,6 +232,39 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn hold_sandbox_admission(
+        &self,
+        _request: tonic::Request<proto::HoldSandboxAdmissionRequest>,
+    ) -> Result<Response<proto::HoldSandboxAdmissionResponse>, Status> {
+        Err(Status::unimplemented(
+            "runtime admission is unavailable in this fixture",
+        ))
+    }
+    async fn release_sandbox_admission(
+        &self,
+        _request: tonic::Request<proto::ReleaseSandboxAdmissionRequest>,
+    ) -> Result<Response<proto::ReleaseSandboxAdmissionResponse>, Status> {
+        Err(Status::unimplemented(
+            "runtime admission is unavailable in this fixture",
+        ))
+    }
+    async fn get_sandbox_admission(
+        &self,
+        _request: tonic::Request<proto::GetSandboxAdmissionRequest>,
+    ) -> Result<Response<proto::GetSandboxAdmissionResponse>, Status> {
+        Err(Status::unimplemented(
+            "runtime admission is unavailable in this fixture",
+        ))
+    }
+    async fn get_sandbox_admission_receipt(
+        &self,
+        _request: tonic::Request<proto::GetSandboxAdmissionReceiptRequest>,
+    ) -> Result<Response<proto::GetSandboxAdmissionReceiptResponse>, Status> {
+        Err(Status::unimplemented(
+            "runtime admission is unavailable in this fixture",
+        ))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<proto::ReportProviderReadinessRequest>,

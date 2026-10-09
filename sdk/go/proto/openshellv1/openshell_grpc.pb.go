@@ -42,6 +42,10 @@ const (
 	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
 	OpenShell_StopSandboxExecution_FullMethodName          = "/openshell.v1.OpenShell/StopSandboxExecution"
 	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
+	OpenShell_HoldSandboxAdmission_FullMethodName          = "/openshell.v1.OpenShell/HoldSandboxAdmission"
+	OpenShell_ReleaseSandboxAdmission_FullMethodName       = "/openshell.v1.OpenShell/ReleaseSandboxAdmission"
+	OpenShell_GetSandboxAdmission_FullMethodName           = "/openshell.v1.OpenShell/GetSandboxAdmission"
+	OpenShell_GetSandboxAdmissionReceipt_FullMethodName    = "/openshell.v1.OpenShell/GetSandboxAdmissionReceipt"
 	OpenShell_CreateSshSession_FullMethodName              = "/openshell.v1.OpenShell/CreateSshSession"
 	OpenShell_ExposeService_FullMethodName                 = "/openshell.v1.OpenShell/ExposeService"
 	OpenShell_GetService_FullMethodName                    = "/openshell.v1.OpenShell/GetService"
@@ -168,6 +172,12 @@ type OpenShellClient interface {
 	StopSandboxExecution(ctx context.Context, in *StopSandboxExecutionRequest, opts ...grpc.CallOption) (*StopSandboxExecutionResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(ctx context.Context, in *StartSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Runtime-owned holds deny future executions, independently of stop.
+	// Sandbox credentials cannot call these workspace-administrator APIs.
+	HoldSandboxAdmission(ctx context.Context, in *HoldSandboxAdmissionRequest, opts ...grpc.CallOption) (*HoldSandboxAdmissionResponse, error)
+	ReleaseSandboxAdmission(ctx context.Context, in *ReleaseSandboxAdmissionRequest, opts ...grpc.CallOption) (*ReleaseSandboxAdmissionResponse, error)
+	GetSandboxAdmission(ctx context.Context, in *GetSandboxAdmissionRequest, opts ...grpc.CallOption) (*GetSandboxAdmissionResponse, error)
+	GetSandboxAdmissionReceipt(ctx context.Context, in *GetSandboxAdmissionReceiptRequest, opts ...grpc.CallOption) (*GetSandboxAdmissionReceiptResponse, error)
 	// Create a short-lived SSH session for a sandbox.
 	CreateSshSession(ctx context.Context, in *CreateSshSessionRequest, opts ...grpc.CallOption) (*CreateSshSessionResponse, error)
 	// Create or update a sandbox HTTP service endpoint for local routing.
@@ -538,6 +548,46 @@ func (c *openShellClient) StartSandbox(ctx context.Context, in *StartSandboxRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
 	err := c.cc.Invoke(ctx, OpenShell_StartSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) HoldSandboxAdmission(ctx context.Context, in *HoldSandboxAdmissionRequest, opts ...grpc.CallOption) (*HoldSandboxAdmissionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HoldSandboxAdmissionResponse)
+	err := c.cc.Invoke(ctx, OpenShell_HoldSandboxAdmission_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ReleaseSandboxAdmission(ctx context.Context, in *ReleaseSandboxAdmissionRequest, opts ...grpc.CallOption) (*ReleaseSandboxAdmissionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseSandboxAdmissionResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ReleaseSandboxAdmission_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxAdmission(ctx context.Context, in *GetSandboxAdmissionRequest, opts ...grpc.CallOption) (*GetSandboxAdmissionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxAdmissionResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxAdmission_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxAdmissionReceipt(ctx context.Context, in *GetSandboxAdmissionReceiptRequest, opts ...grpc.CallOption) (*GetSandboxAdmissionReceiptResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxAdmissionReceiptResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxAdmissionReceipt_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1289,6 +1339,12 @@ type OpenShellServer interface {
 	StopSandboxExecution(context.Context, *StopSandboxExecutionRequest) (*StopSandboxExecutionResponse, error)
 	// Start a previously stopped sandbox.
 	StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error)
+	// Runtime-owned holds deny future executions, independently of stop.
+	// Sandbox credentials cannot call these workspace-administrator APIs.
+	HoldSandboxAdmission(context.Context, *HoldSandboxAdmissionRequest) (*HoldSandboxAdmissionResponse, error)
+	ReleaseSandboxAdmission(context.Context, *ReleaseSandboxAdmissionRequest) (*ReleaseSandboxAdmissionResponse, error)
+	GetSandboxAdmission(context.Context, *GetSandboxAdmissionRequest) (*GetSandboxAdmissionResponse, error)
+	GetSandboxAdmissionReceipt(context.Context, *GetSandboxAdmissionReceiptRequest) (*GetSandboxAdmissionReceiptResponse, error)
 	// Create a short-lived SSH session for a sandbox.
 	CreateSshSession(context.Context, *CreateSshSessionRequest) (*CreateSshSessionResponse, error)
 	// Create or update a sandbox HTTP service endpoint for local routing.
@@ -1531,6 +1587,18 @@ func (UnimplementedOpenShellServer) StopSandboxExecution(context.Context, *StopS
 }
 func (UnimplementedOpenShellServer) StartSandbox(context.Context, *StartSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartSandbox not implemented")
+}
+func (UnimplementedOpenShellServer) HoldSandboxAdmission(context.Context, *HoldSandboxAdmissionRequest) (*HoldSandboxAdmissionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method HoldSandboxAdmission not implemented")
+}
+func (UnimplementedOpenShellServer) ReleaseSandboxAdmission(context.Context, *ReleaseSandboxAdmissionRequest) (*ReleaseSandboxAdmissionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseSandboxAdmission not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxAdmission(context.Context, *GetSandboxAdmissionRequest) (*GetSandboxAdmissionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxAdmission not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxAdmissionReceipt(context.Context, *GetSandboxAdmissionReceiptRequest) (*GetSandboxAdmissionReceiptResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxAdmissionReceipt not implemented")
 }
 func (UnimplementedOpenShellServer) CreateSshSession(context.Context, *CreateSshSessionRequest) (*CreateSshSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSshSession not implemented")
@@ -2086,6 +2154,78 @@ func _OpenShell_StartSandbox_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).StartSandbox(ctx, req.(*StartSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_HoldSandboxAdmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HoldSandboxAdmissionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).HoldSandboxAdmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_HoldSandboxAdmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).HoldSandboxAdmission(ctx, req.(*HoldSandboxAdmissionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ReleaseSandboxAdmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseSandboxAdmissionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ReleaseSandboxAdmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ReleaseSandboxAdmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ReleaseSandboxAdmission(ctx, req.(*ReleaseSandboxAdmissionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxAdmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxAdmissionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxAdmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxAdmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxAdmission(ctx, req.(*GetSandboxAdmissionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxAdmissionReceipt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxAdmissionReceiptRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxAdmissionReceipt(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxAdmissionReceipt_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxAdmissionReceipt(ctx, req.(*GetSandboxAdmissionReceiptRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3262,6 +3402,22 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartSandbox",
 			Handler:    _OpenShell_StartSandbox_Handler,
+		},
+		{
+			MethodName: "HoldSandboxAdmission",
+			Handler:    _OpenShell_HoldSandboxAdmission_Handler,
+		},
+		{
+			MethodName: "ReleaseSandboxAdmission",
+			Handler:    _OpenShell_ReleaseSandboxAdmission_Handler,
+		},
+		{
+			MethodName: "GetSandboxAdmission",
+			Handler:    _OpenShell_GetSandboxAdmission_Handler,
+		},
+		{
+			MethodName: "GetSandboxAdmissionReceipt",
+			Handler:    _OpenShell_GetSandboxAdmissionReceipt_Handler,
 		},
 		{
 			MethodName: "CreateSshSession",

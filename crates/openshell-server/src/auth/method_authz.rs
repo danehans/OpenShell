@@ -103,6 +103,24 @@ pub fn is_peer_callable(method: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_admission_rpcs_require_workspace_admin_bearer_authority() {
+        for method in [
+            "HoldSandboxAdmission",
+            "ReleaseSandboxAdmission",
+            "GetSandboxAdmission",
+            "GetSandboxAdmissionReceipt",
+        ] {
+            let path = format!("/openshell.v1.OpenShell/{method}");
+            let entry = lookup(&path).expect("admission RPC descriptor");
+            assert_eq!(entry.auth_mode, AuthMode::Bearer);
+            assert_eq!(entry.workspace_role.as_deref(), Some("admin"));
+            assert!(!is_sandbox_callable(&path));
+            assert!(!is_peer_callable(&path));
+            assert!(!is_unauthenticated(&path));
+        }
+    }
+
     /// Every RPC path in the descriptor pool is resolvable through this
     /// delegation layer.
     #[test]

@@ -145,6 +145,47 @@ The root client also exposes subclients for providers, services, files, SSH,
 TCP forwarding, policy, configuration, templates, and workspaces. List methods
 return lazy pagers so callers choose when to fetch the next page.
 
+## Hold Runtime Admission (Experimental Fork)
+
+This fork adds `client.Admission()` for workspace administrators to prevent a
+sandbox from starting another execution. Use the matching fork SDK and gateway;
+older gateways return `Unimplemented`. All gateway replicas serving the sandbox
+must support admission holds. Do not roll back to an older gateway while holds
+exist: older servers cannot enforce the new state.
+
+Read the current state using the canonical name and immutable sandbox UUID:
+
+```go
+state, err := client.Admission().Get(ctx, "default", sandbox.Name, sandbox.ID)
+if err != nil {
+    log.Fatal(err)
+}
+receipt, err := client.Admission().Hold(
+    ctx, "default", sandbox.Name, sandbox.ID,
+    actionID, state.Epoch, v1.AdmissionIncident,
+)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("admission hold recorded at epoch %d\n", receipt.Epoch)
+```
+
+Persist the nonzero UUID `actionID` and complete request before sending it. Retry
+that same request unchanged after an uncertain outcome, or query `Receipt` with
+its action ID. A receipt describes the original mutation; use `Get` to observe
+current holds. A stale epoch or changed resource identity fails explicitly.
+
+`Release` requires a distinct persisted action UUID, the original hold UUID and
+the current epoch. It removes only that hold and never starts compute. Other
+holds continue denying launch. A hold cannot confirm while a launch is unsettled;
+legacy Ready sandboxes must complete a tracked lifecycle transition first.
+
+Admission holds do not stop an existing execution, isolate network traffic or
+prevent deletion and recreation under a different sandbox UUID. Pair them with
+separately verified containment and conditional stop when those actions are
+required. Receipt history is bounded; a full history rejects new holds without
+evicting original receipts or consuming outstanding release capacity.
+
 ## Next Steps
 
 - Review [Gateway Authentication](/how-it-works/gateways/authentication) before connecting a service to a production gateway.

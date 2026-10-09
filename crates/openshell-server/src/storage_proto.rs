@@ -138,12 +138,15 @@ mod tests {
     // stored statuses without that additive field decode with an empty ID.
     // Traffic issuance adds three public messages and one sandbox-only RPC.
     // Durable and public/durable overlap inventories remain byte-identical.
+    // Runtime admission adds four administrator RPCs, ten messages and two
+    // enums. Its receipt history extends both public and durable SandboxStatus;
+    // old payloads decode with no holds and preserve their original bytes.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "e9b6a6b07b486997a16706906111c87b66d414691ff54fcb1fd9657985909333";
+        "633e82df464f34263d4b42f83053ba4e4852f1636a3ee8d9a7fe3410d7568f16";
     const DURABLE_SCHEMA_SHA256: &str =
-        "b91b4d8fac43f95a80e81218961fbd6e4772a7a163abc9b9f2f13ff1d6f9b430";
+        "e749db8aa581ab42dc0a265d30121ca62ca6b91cd9a9552406824418d26497ac";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "44c68041924beda553db90bd384cb8430b7a93a7e2c4e87a5f6d242fa637c646";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -551,12 +554,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            104 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            83 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -564,7 +567,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            83 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -608,9 +611,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (321, 29),
+                (95, 23),
+                (83, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -666,6 +669,7 @@ mod tests {
         assert_eq!(status.phase, SandboxPhase::Ready as i32);
         assert_eq!(status.current_policy_version, 7);
         assert!(status.configuration_admission.is_none());
+        assert!(status.runtime_admission.is_none());
         assert_eq!(status.configuration_activated, None);
         assert!(status.provisioning.is_none());
         assert!(!crate::policy_store::permits_initial_static_policy_repair(

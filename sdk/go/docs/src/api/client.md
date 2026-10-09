@@ -13,6 +13,7 @@ for each resource domain and manages the underlying gRPC connection. The
 |----------|---------|-------------|
 | `Sandboxes()` | `SandboxInterface` | Sandbox lifecycle management |
 | `SandboxTemplates()` | `SandboxTemplateInterface` | Reusable sandbox template management |
+| `Admission()` | `AdmissionInterface` | Optional administrator-owned workload holds |
 | `Providers()` | `ProviderInterface` | Provider CRUD and idempotent ensure |
 | `Services()` | `ServiceInterface` | Service exposure and management |
 | `Exec()` | `ExecInterface` | Command execution (run, stream, interactive) |
@@ -27,6 +28,14 @@ for each resource domain and manages the underlying gRPC connection. The
 Sub-client hierarchy: `Providers()` has two nested accessors:
 - `client.Providers().Profiles()` returns `ProfileInterface`
 - `client.Providers().Refresh()` returns `RefreshInterface`
+
+`Admission()` is an additive concrete-client capability. `Hold`, `Release`, `Get`
+and `Receipt` require an explicit workspace, canonical sandbox name and immutable
+sandbox ID. Hold/release requests retain their action IDs and expected admission
+epochs across retries. Releases remove one named hold and never start compute.
+Use `Get` for current state; an original historical receipt does not describe
+current holds. Older gateways return `Unimplemented`; the SDK does not fall back
+to a stop or policy mutation. Admission alone does not contain existing compute.
 
 ## Creating a Client
 

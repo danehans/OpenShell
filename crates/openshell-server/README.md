@@ -6,6 +6,36 @@ SPDX-License-Identifier: Apache-2.0
 # OpenShell gateway server
 
 This crate owns gateway authentication, policy discovery and sandbox lifecycle.
+
+## Runtime admission holds
+
+The experimental `HoldSandboxAdmission`, `ReleaseSandboxAdmission`,
+`GetSandboxAdmission` and `GetSandboxAdmissionReceipt` RPCs require workspace
+administrator bearer authority. Sandbox credentials cannot administer holds.
+Every target includes the canonical workspace/name and the expected immutable
+sandbox UUID. Hold and release actions have mandatory stable UUIDs and expected
+admission epochs. Historical retries return their original receipts; changed
+arguments, stale epochs and a recreated resource are rejected.
+
+Gateway-owned `SandboxStatus.runtime_admission` retains the bounded receipt
+history across driver snapshots, lifecycle restoration and executions. It shares
+the sandbox row's resource-version CAS with lifecycle and driver-operation claims.
+Separate holds compose by denial; a release removes only its named hold and never
+starts compute. Capacity reserves a receipt slot for every outstanding release.
+Corrupt or unfamiliar history denies launch rather than treating it as empty.
+
+A new hold cannot confirm an unsettled launch or a pending driver operation.
+Caller cancellation, lease expiry and backend absence do not settle ownership.
+Legacy recovery launches acquire durable ownership without gaining a new timing
+budget; a legacy Ready resource must gain that ownership before confirming a hold.
+Admission checks cover explicit starts, automatic restarts, startup recovery,
+launch dispatch and runtime-binding publication. Stop and cleanup remain available.
+Admission does not stop existing compute, isolate networking or prevent deleting
+and recreating a different resource. Coordinated containment must qualify those
+separate boundaries before claiming complete quarantine.
+
+## Runtime-origin traffic credentials
+
 The following experimental contract adds supervisor-owned traffic origin credentials.
 
 Status: discovery, issuance and supervisor-forwarding source checkpoint;

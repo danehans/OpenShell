@@ -121,6 +121,15 @@ namespace. Legacy workloads without
 admission provenance need recreation. Do not
 automatically label control-plane resources or disable enforcement as a repair.
 
+For this fork's runtime admission holds, use the administrator Go SDK
+`Admission().Get` with the workspace, canonical name and immutable sandbox UUID.
+These holds are separate from external-resource admission labels. Do not clear
+holds or recreate a sandbox as a repair. An unsettled launch cannot confirm a
+hold; cancellation or backend absence does not prove settlement. Historical
+receipts are not current state. Verify every serving gateway is admission-capable;
+do not roll back to an older image while holds exist. See the experimental
+admission section in the Go SDK documentation.
+
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
 through its administrator-owned `--admission-config-json` option.

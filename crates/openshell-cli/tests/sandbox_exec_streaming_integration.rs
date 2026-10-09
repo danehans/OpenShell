@@ -163,6 +163,31 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+    async fn hold_sandbox_admission(
+        &self,
+        _request: Request<openshell_core::proto::HoldSandboxAdmissionRequest>,
+    ) -> Result<Response<openshell_core::proto::HoldSandboxAdmissionResponse>, Status> {
+        Err(Status::unimplemented("runtime admission is unavailable in this fixture"))
+    }
+    async fn release_sandbox_admission(
+        &self,
+        _request: Request<openshell_core::proto::ReleaseSandboxAdmissionRequest>,
+    ) -> Result<Response<openshell_core::proto::ReleaseSandboxAdmissionResponse>, Status> {
+        Err(Status::unimplemented("runtime admission is unavailable in this fixture"))
+    }
+    async fn get_sandbox_admission(
+        &self,
+        _request: Request<openshell_core::proto::GetSandboxAdmissionRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxAdmissionResponse>, Status> {
+        Err(Status::unimplemented("runtime admission is unavailable in this fixture"))
+    }
+    async fn get_sandbox_admission_receipt(
+        &self,
+        _request: Request<openshell_core::proto::GetSandboxAdmissionReceiptRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxAdmissionReceiptResponse>, Status> {
+        Err(Status::unimplemented("runtime admission is unavailable in this fixture"))
+    }
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*
