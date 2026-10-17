@@ -117,6 +117,7 @@ fn installed(
         launch_environment_installed: true,
         process_instance_id: hello.instance_id.clone(),
         reason: ProviderReadinessReason::Unspecified.into(),
+        ..Default::default()
     }
 }
 

@@ -54,6 +54,7 @@ struct ProviderCredentialStateInner {
     body_inventory_available: bool,
     known_body_keys: HashSet<String>,
     static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
+    provider_detach: ProviderDetachLocalState,
 }
 
 #[derive(Debug)]
@@ -67,6 +68,7 @@ struct CompiledStaticCredentialBinding {
     endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
     credential_identity: String,
     workload_credential_handle: String,
+    encoded_metadata_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +96,341 @@ impl fmt::Display for StaticCredentialBindingError {
 
 impl std::error::Error for StaticCredentialBindingError {}
 
+/// Native-only association captured while a static provider is installed.
+/// It is not serializable and never exposes placeholder strings or key material.
+#[derive(Clone)]
+pub struct ProviderRevocationSubject {
+    provider_id: String,
+    installation_id: String,
+    revision: u64,
+    keys: Vec<String>,
+    // Exact child-visible references retained before detachment, never values.
+    references: Vec<(String, Vec<CompiledStaticCredentialEndpointBinding>)>,
+    metadata_bytes: usize,
+}
+
+impl ProviderRevocationSubject {
+    /// Association only, not an arm or a refusal. An arbitrary missing token,
+    /// another generation or another provider must never become this witness.
+    pub fn matches_original_static_bearer(
+        &self,
+        value: &str,
+        host: &str,
+        port: u16,
+        target: &str,
+    ) -> bool {
+        let Some(reference) = value.strip_prefix("Bearer ") else {
+            return false;
+        };
+        // A query preference is not a credential witness. Markers anywhere in
+        // path/query make this proof shape unsupported, even if policy allows.
+        if crate::secrets::contains_reserved_credential_marker(target) {
+            return false;
+        }
+        let path = target.split_once('?').map_or(target, |(path, _)| path);
+        let normalized_host = host.to_ascii_lowercase();
+        let labels = normalized_host.split('.').collect::<Vec<_>>();
+        self.references.iter().any(|(original, endpoints)| {
+            original == reference
+                && endpoints.iter().any(|endpoint| {
+                    static_credential_endpoint_matches(endpoint, &labels, port, path)
+                })
+        })
+    }
+}
+
+/// Metadata from the actual installed resolver state, not a network decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderRevocationEvidence {
+    pub provider_id: String,
+    pub before_revision: u64,
+    pub revision: u64,
+    pub installation_id: String,
+    pub unavailable: bool,
+}
+
+#[derive(Default)]
+struct ProviderDetachLocalState {
+    enabled: bool,
+    subjects: Vec<Arc<ProviderRevocationSubject>>,
+    boot_id: String,
+    session_id: String,
+    arms: HashMap<String, LocalProviderDetachArm>,
+}
+#[derive(Clone)]
+struct LocalProviderDetachArm {
+    seal: crate::proto::ProviderDetachArmSealV1,
+    subject: Arc<ProviderRevocationSubject>,
+    installation_id: String,
+    install_sequence: u64,
+    reported_install_time: prost_types::Timestamp,
+    server_install_ack: Option<crate::proto::ProviderDetachArmSealV1>,
+    policy_current: Arc<dyn Fn() -> bool + Send + Sync>,
+    consumed: bool,
+    result: i32,
+    refusal: Option<crate::proto::ProviderDetachRefusalV1>,
+    reserved_bytes: usize,
+    result_acknowledged: bool,
+}
+
+/// Local outcome only. Unavailable is reported later through authenticated
+/// readiness; this enum alone cannot establish a native/controller proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderDetachWitness {
+    NotArmed,
+    Unavailable,
+    NotRefused,
+    Invalidated,
+}
+
+fn detach_time_ns(t: &prost_types::Timestamp) -> Option<i128> {
+    if !(-62_135_596_800..=253_402_300_799).contains(&t.seconds)
+        || !(0..1_000_000_000).contains(&t.nanos)
+    {
+        return None;
+    }
+    Some(i128::from(t.seconds) * 1_000_000_000 + i128::from(t.nanos))
+}
+fn detach_arm_time_valid(
+    a: &crate::proto::ProviderDetachAttemptV1,
+    now: &prost_types::Timestamp,
+) -> bool {
+    let Some(start) = a.not_before.as_ref().and_then(detach_time_ns) else {
+        return false;
+    };
+    let Some(end) = a.deadline.as_ref().and_then(detach_time_ns) else {
+        return false;
+    };
+    let Some(time) = detach_time_ns(now) else {
+        return false;
+    };
+    start < end && end - start <= 30_000_000_000 && start <= time && time < end
+}
+
+impl fmt::Debug for ProviderDetachLocalState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderDetachLocalState")
+            .field("enabled", &self.enabled)
+            .field("subject_count", &self.subjects.len())
+            .finish()
+    }
+}
+fn capture_provider_subject(
+    inner: &ProviderCredentialStateInner,
+    provider_id: &str,
+) -> Option<ProviderRevocationSubject> {
+    let id = uuid::Uuid::parse_str(provider_id).ok()?;
+    if id.is_nil() || id.to_string() != provider_id {
+        return None;
+    }
+    if !inner.current.dynamic_credentials.is_empty()
+        || !inner.body_inventory_available
+        || inner.static_credential_bindings.values().any(|b| {
+            !b.workload_credential_handle.is_empty()
+                || b.credential_identity.starts_with("refresh:")
+        })
+    {
+        return None;
+    }
+    let prefix = format!("{provider_id}:");
+    let mut keys = Vec::new();
+    for (key, binding) in &inner.static_credential_bindings {
+        if binding.credential_identity.starts_with(&prefix) {
+            if !binding.workload_credential_handle.is_empty() {
+                return None;
+            }
+            keys.push(key.clone());
+        }
+    }
+    if keys.is_empty()
+        || keys.len() > 64
+        || inner.current.revision == 0
+        || inner.current.installation_id.is_empty()
+    {
+        return None;
+    }
+    keys.sort();
+    let mut references = Vec::with_capacity(keys.len());
+    let mut metadata_bytes = provider_id.len() + inner.current.installation_id.len() + 8;
+    for key in &keys {
+        if key.is_empty()
+            || key.len() > 128
+            || !key
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+        {
+            return None;
+        }
+        let reference = inner.current.child_env.get(key)?;
+        // Accept only this installation's generated static reference. No
+        // refresh/stable handle, inherited raw value or guessed alias.
+        if reference
+            != &crate::secrets::placeholder_for_env_key_for_revision(key, inner.current.revision)
+        {
+            return None;
+        }
+        let binding = inner.static_credential_bindings.get(key)?;
+        metadata_bytes = metadata_bytes
+            .checked_add(key.len() + reference.len() + binding.encoded_metadata_len)?;
+        if metadata_bytes > 256 * 1024 {
+            return None;
+        }
+        let endpoints = &binding.endpoints;
+        if endpoints.len() > 64 {
+            return None;
+        }
+        references.push((reference.clone(), endpoints.clone()));
+    }
+    Some(ProviderRevocationSubject {
+        provider_id: provider_id.into(),
+        installation_id: inner.current.installation_id.clone(),
+        revision: inner.current.revision,
+        keys,
+        references,
+        metadata_bytes,
+    })
+}
+fn retain_current_provider_subjects(inner: &mut ProviderCredentialStateInner) {
+    if !inner.provider_detach.enabled {
+        return;
+    }
+    let ids = inner
+        .static_credential_bindings
+        .values()
+        .filter_map(|b| {
+            b.credential_identity
+                .split_once(':')
+                .map(|(id, _)| id.to_string())
+        })
+        .collect::<HashSet<_>>();
+    for id in ids {
+        let Some(subject) = capture_provider_subject(inner, &id) else {
+            continue;
+        };
+        if inner.provider_detach.subjects.iter().any(|old| {
+            old.provider_id == subject.provider_id
+                && old.revision == subject.revision
+                && old.installation_id == subject.installation_id
+        }) {
+            continue;
+        }
+        let bytes = inner
+            .provider_detach
+            .subjects
+            .iter()
+            .map(|old| old.metadata_bytes)
+            .sum::<usize>();
+        if inner.provider_detach.subjects.len() >= 32
+            || bytes.saturating_add(subject.metadata_bytes) > 256 * 1024
+        {
+            inner.provider_detach = ProviderDetachLocalState::default();
+            return;
+        }
+        inner.provider_detach.subjects.push(Arc::new(subject));
+    }
+}
+
 impl ProviderCredentialState {
+    /// Capture only a grounded static-provider identity. Refresh handles and
+    /// dynamic grants have a different association contract and are unsupported.
+    pub fn capture_static_provider_revocation(
+        &self,
+        provider_id: &str,
+    ) -> Option<ProviderRevocationSubject> {
+        let inner = self.inner.read().ok()?;
+        capture_provider_subject(&inner, provider_id)
+    }
+
+    /// Explicit trusted source/configuration switch, default OFF. This changes
+    /// observation support only; it grants neither an arm nor an invocation.
+    pub fn enable_provider_detach_attempts(&self) {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        inner.provider_detach.enabled = true;
+        retain_current_provider_subjects(&mut inner);
+    }
+    pub fn provider_detach_attempts_enabled(&self) -> bool {
+        self.inner
+            .read()
+            .is_ok_and(|inner| inner.provider_detach.enabled)
+    }
+    /// Trusted metadata captured before actual install replacement. Ambiguous
+    /// same-revision repairs, missing provenance or bounded overflow refuse.
+    pub fn retained_provider_revocation_subject(
+        &self,
+        provider_id: &str,
+        before_revision: u64,
+    ) -> Option<Arc<ProviderRevocationSubject>> {
+        let inner = self.inner.read().ok()?;
+        if !inner.provider_detach.enabled {
+            return None;
+        }
+        let mut matches = inner
+            .provider_detach
+            .subjects
+            .iter()
+            .filter(|s| s.provider_id == provider_id && s.revision == before_revision);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first.clone())
+    }
+
+    /// Check membership at the real resolver lock without resolving/copying any
+    /// secret value. Old references are fenced by the same known-key deny set
+    /// used by `resolver_for_endpoint_with_revision`. In-flight resolver Arcs are
+    /// deliberately outside this observation's claim.
+    pub fn observe_static_provider_revocation(
+        &self,
+        subject: &ProviderRevocationSubject,
+        expected_revision: u64,
+        expected_installation: &str,
+    ) -> Option<ProviderRevocationEvidence> {
+        let inner = self.inner.read().ok()?;
+        if inner.current.revision != expected_revision
+            || inner.current.installation_id != expected_installation
+            || expected_installation.is_empty()
+            || expected_installation == subject.installation_id
+            || expected_revision == 0
+            || expected_revision == subject.revision
+            || !inner.current.dynamic_credentials.is_empty()
+            || !inner.body_inventory_available
+        {
+            return None;
+        }
+        let prefix = format!("{}:", subject.provider_id);
+        let mut available = inner
+            .static_credential_bindings
+            .values()
+            .any(|binding| binding.credential_identity.starts_with(&prefix));
+        for key in &subject.keys {
+            if !inner.known_static_credential_keys.contains(key) {
+                return None;
+            }
+            if let Some(binding) = inner.static_credential_bindings.get(key) {
+                if !binding.credential_identity.starts_with(&prefix) {
+                    return None;
+                }
+                available = true;
+            } else if inner.current.child_env.contains_key(key) {
+                // A reused or unclassified environment entry is not proof of
+                // absence of this provider's native credential authority.
+                return None;
+            }
+        }
+        Some(ProviderRevocationEvidence {
+            provider_id: subject.provider_id.clone(),
+            before_revision: subject.revision,
+            revision: expected_revision,
+            installation_id: expected_installation.into(),
+            unavailable: !available,
+        })
+    }
+
     pub fn from_environment(
         revision: u64,
         env: HashMap<String, String>,
@@ -131,6 +467,7 @@ impl ProviderCredentialState {
                 known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
+                provider_detach: ProviderDetachLocalState::default(),
             })),
         }
     }
@@ -187,6 +524,7 @@ impl ProviderCredentialState {
                 known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys,
                 static_credential_identity_epochs,
+                provider_detach: ProviderDetachLocalState::default(),
             })),
         })
     }
@@ -221,6 +559,7 @@ impl ProviderCredentialState {
                 known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
+                provider_detach: ProviderDetachLocalState::default(),
             })),
         }
     }
@@ -650,6 +989,7 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
 
+        inner.provider_detach = ProviderDetachLocalState::default();
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
@@ -717,6 +1057,7 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
 
+        retain_current_provider_subjects(&mut inner);
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
@@ -784,6 +1125,7 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
         let mut snapshot = snapshot;
+        retain_current_provider_subjects(&mut inner);
         for key in &inner.suppressed_keys {
             snapshot.child_env.remove(key);
         }
@@ -921,6 +1263,7 @@ fn compile_static_credential_bindings(
     bindings
         .into_iter()
         .map(|(key, binding)| {
+            let encoded_metadata_len = prost::Message::encoded_len(&binding);
             let endpoints = binding
                 .endpoints
                 .into_iter()
@@ -932,6 +1275,7 @@ fn compile_static_credential_bindings(
                     endpoints,
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
+                    encoded_metadata_len,
                 },
             ))
         })
@@ -1040,6 +1384,441 @@ fn merge_resolvers(
             .chain(current_resolver.into_iter().map(Arc::as_ref)),
     )
     .map(Arc::new)
+}
+
+impl ProviderCredentialState {
+    /// Authenticated reporter binding only; a boot/session replacement invalidates
+    /// old records without freeing unexpired deduplication/capacity metadata.
+    pub fn bind_provider_detach_session(&self, boot: &str, session: &str) {
+        let valid =
+            |s: &str| uuid::Uuid::parse_str(s).is_ok_and(|id| !id.is_nil() && id.to_string() == s);
+        if !valid(boot) || !valid(session) {
+            return;
+        }
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        if !inner.provider_detach.enabled {
+            return;
+        }
+        if inner.provider_detach.boot_id != boot || inner.provider_detach.session_id != session {
+            for arm in inner.provider_detach.arms.values_mut() {
+                arm.consumed = true;
+                arm.result = 4;
+                arm.refusal = None;
+            }
+            inner.provider_detach.boot_id = boot.into();
+            inner.provider_detach.session_id = session.into();
+        }
+    }
+    /// Install an exact server-delivered reservation under the current bound
+    /// environment and policy generation. No network or execution occurs here.
+    /// `policy_current` must be a nonblocking/nonreentrant trusted generation check.
+    pub fn install_provider_detach_arm(
+        &self,
+        seal: &crate::proto::ProviderDetachArmSealV1,
+        observation: &crate::proto::ProviderReadinessObservation,
+        installation_id: &str,
+        next_sequence: u64,
+        now: prost_types::Timestamp,
+        policy_current: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> bool {
+        use prost::Message;
+        let Some(q) = seal.request.as_ref() else {
+            return false;
+        };
+        let Some(a) = q.attempt.as_ref() else {
+            return false;
+        };
+        let Some(before) = q.original_action.as_ref().and_then(|q| q.target.as_ref()) else {
+            return false;
+        };
+        let observation_matches = (
+            a.supervisor_session.as_str(),
+            a.attachment_epoch.as_str(),
+            a.config_revision,
+            a.provider_env_revision,
+            a.native_policy_hash.as_str(),
+        ) == (
+            observation.session_id.as_str(),
+            observation.attachment_epoch.as_str(),
+            observation.config_revision,
+            observation.provider_env_revision,
+            observation.policy_hash.as_str(),
+        );
+        if seal.hold_generation == 0
+            || seal.row_resource_version == 0
+            || seal.install_sequence != 0
+            || seal.installed_time.is_some()
+            || q.encoded_len() > 8192
+            || !detach_arm_time_valid(a, &now)
+            || next_sequence <= observation.sequence
+            || observation.sequence < a.arm_capture_sequence
+            || !observation.credentials_installed
+            || !observation.policy_active
+            || !observation.launch_environment_installed
+            || !observation_matches
+            || !(policy_current)()
+        {
+            return false;
+        }
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        if !inner.provider_detach.enabled
+            || inner.provider_detach.boot_id != a.gateway_boot_id
+            || inner.provider_detach.session_id != a.supervisor_session
+            || inner.current.revision != a.provider_env_revision
+            || inner.current.installation_id != installation_id
+        {
+            return false;
+        }
+        if let Some(old) = inner.provider_detach.arms.get(&q.attempt_id) {
+            return old.seal == *seal; // Never renew or reinstall an original record.
+        }
+        let original_env_revision = before.provider_env_revision;
+        let mut originals = inner
+            .provider_detach
+            .subjects
+            .iter()
+            .filter(|s| s.provider_id == a.provider_id && s.revision == original_env_revision);
+        let Some(subject) = originals.next().cloned() else {
+            return false;
+        };
+        if originals.next().is_some() {
+            return false;
+        }
+        // A known original provider must actually be absent in this installation.
+        if inner.static_credential_bindings.values().any(|b| {
+            b.credential_identity
+                .starts_with(&format!("{}:", a.provider_id))
+        }) || !inner.body_inventory_available
+            || !inner.current.dynamic_credentials.is_empty()
+            || subject.keys.iter().any(|k| {
+                !inner.known_static_credential_keys.contains(k)
+                    || inner.current.child_env.contains_key(k)
+            })
+        {
+            return false;
+        }
+        let Some(time) = detach_time_ns(&now) else {
+            return false;
+        };
+        inner.provider_detach.arms.retain(|_, arm| {
+            arm.seal
+                .request
+                .as_ref()
+                .and_then(|q| q.attempt.as_ref())
+                .and_then(|a| a.deadline.as_ref())
+                .and_then(detach_time_ns)
+                .is_some_and(|end| time < end)
+        });
+        if seal.encoded_len().saturating_add(64) > 8192 {
+            return false;
+        }
+        let reserved = seal.encoded_len().saturating_add(64 + 4096);
+        if inner.provider_detach.arms.values().any(|old| {
+            !old.consumed
+                && old
+                    .seal
+                    .request
+                    .as_ref()
+                    .and_then(|q| q.attempt.as_ref())
+                    .is_some_and(|prior| {
+                        prior.hold_id == a.hold_id
+                            && prior.supervisor_session == a.supervisor_session
+                    })
+        }) {
+            return false;
+        }
+        if inner.provider_detach.arms.len() >= 16
+            || inner
+                .provider_detach
+                .arms
+                .values()
+                .map(|a| a.reserved_bytes)
+                .sum::<usize>()
+                .saturating_add(reserved)
+                > 128 * 1024
+        {
+            return false;
+        }
+        inner.provider_detach.arms.insert(
+            q.attempt_id.clone(),
+            LocalProviderDetachArm {
+                seal: seal.clone(),
+                subject,
+                installation_id: installation_id.into(),
+                install_sequence: next_sequence,
+                reported_install_time: now,
+                server_install_ack: None,
+                policy_current,
+                consumed: false,
+                result: 0,
+                refusal: None,
+                reserved_bytes: reserved,
+                result_acknowledged: false,
+            },
+        );
+        true
+    }
+    /// Original server acceptance of the install report, not a generic configACK.
+    pub fn acknowledge_provider_detach_arm(
+        &self,
+        seal: &crate::proto::ProviderDetachArmSealV1,
+    ) -> bool {
+        let Some(q) = seal.request.as_ref() else {
+            return false;
+        };
+        let Some(a) = q.attempt.as_ref() else {
+            return false;
+        };
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        if !inner.provider_detach.enabled
+            || inner.provider_detach.boot_id != a.gateway_boot_id
+            || inner.provider_detach.session_id != a.supervisor_session
+        {
+            return false;
+        }
+        let Some(arm) = inner.provider_detach.arms.get_mut(&q.attempt_id) else {
+            return false;
+        };
+        let Some(time) = seal.installed_time.as_ref().and_then(detach_time_ns) else {
+            return false;
+        };
+        if arm.seal.request != seal.request
+            || arm.seal.hold_generation != seal.hold_generation
+            || arm.seal.row_resource_version != seal.row_resource_version
+            || seal.install_sequence != arm.install_sequence
+            || time < detach_time_ns(&arm.reported_install_time).unwrap_or(i128::MAX)
+            || !(arm.policy_current)()
+        {
+            return false;
+        }
+        if let Some(old) = arm.server_install_ack.as_ref() {
+            return old == seal;
+        }
+        arm.server_install_ack = Some(seal.clone());
+        true
+    }
+    /// Produce one bounded original report. Later heartbeats retain the failure
+    /// sequence and times; they do not make the event fresh again.
+    pub fn provider_detach_report(
+        &self,
+        session: &str,
+        sequence: u64,
+        now: &prost_types::Timestamp,
+    ) -> Option<crate::proto::ProviderDetachSupervisorReportV1> {
+        let mut inner = self.inner.write().ok()?;
+        if !inner.provider_detach.enabled {
+            return None;
+        }
+        let boot = inner.provider_detach.boot_id.clone();
+        let revision = inner.current.revision;
+        let installation = inner.current.installation_id.clone();
+        let time = detach_time_ns(now)?;
+        inner.provider_detach.arms.retain(|_, arm| {
+            arm.seal
+                .request
+                .as_ref()
+                .and_then(|q| q.attempt.as_ref())
+                .and_then(|a| a.deadline.as_ref())
+                .and_then(detach_time_ns)
+                .is_some_and(|end| time < end)
+        });
+        let mut selected = None;
+        for (id, arm) in &inner.provider_detach.arms {
+            let a = arm.seal.request.as_ref()?.attempt.as_ref()?;
+            if a.supervisor_session != session
+                || a.gateway_boot_id != boot
+                || a.provider_env_revision != revision
+                || arm.installation_id != installation
+                || !(arm.policy_current)()
+            {
+                continue;
+            }
+            let priority = if arm.server_install_ack.is_none() {
+                0
+            } else if arm.result != 0 && !arm.result_acknowledged {
+                1
+            } else if arm.result == 0 {
+                2
+            } else {
+                3
+            };
+            if selected.as_ref().is_none_or(|(old, _)| priority < *old) {
+                selected = Some((priority, id.clone()));
+            }
+        }
+        if let Some((_, id)) = selected {
+            let arm = inner.provider_detach.arms.get_mut(&id)?;
+            let q = arm.seal.request.as_ref()?;
+            let mut result = 0;
+            let mut refusal = None;
+            if arm.server_install_ack.is_some() && sequence > arm.install_sequence {
+                result = arm.result;
+                if let Some(f) = arm.refusal.as_mut() {
+                    if f.sequence == 0 {
+                        f.sequence = sequence;
+                    }
+                    refusal = Some(f.clone());
+                }
+            }
+            return Some(crate::proto::ProviderDetachSupervisorReportV1 {
+                supported: true,
+                gateway_boot_id: boot,
+                attempt_id: q.attempt_id.clone(),
+                request_sha256: q.request_sha256.clone(),
+                install_sequence: arm.install_sequence,
+                installed_time: Some(arm.reported_install_time),
+                result,
+                refusal,
+            });
+        }
+        Some(crate::proto::ProviderDetachSupervisorReportV1 {
+            supported: true,
+            gateway_boot_id: boot,
+            ..Default::default()
+        })
+    }
+    pub fn acknowledge_provider_detach_report(
+        &self,
+        report: &crate::proto::ProviderDetachSupervisorReportV1,
+    ) {
+        if report.result == 0 {
+            return;
+        }
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        if let Some(arm) = inner.provider_detach.arms.get_mut(&report.attempt_id)
+            && arm.result == report.result
+            && arm.refusal == report.refusal
+        {
+            arm.result_acknowledged = true;
+        }
+    }
+
+    /// Called at the actual header-materialization boundary with the SAME scoped
+    /// resolver/revision. Matching correlation spends an installed arm once;
+    /// arbitrary missing references and policy denials cannot create a witness.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the actual request and scoped resolver inputs explicit at the credential boundary"
+    )]
+    pub fn witness_provider_detach_header(
+        &self,
+        attempt_id: &str,
+        challenge: &str,
+        authorization: &str,
+        host: &str,
+        port: u16,
+        target: &str,
+        resolver: Option<&SecretResolver>,
+        captured_revision: u64,
+        now: prost_types::Timestamp,
+    ) -> ProviderDetachWitness {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        if !inner.provider_detach.enabled {
+            return ProviderDetachWitness::NotArmed;
+        }
+        let Some(mut arm) = inner.provider_detach.arms.get(attempt_id).cloned() else {
+            return ProviderDetachWitness::NotArmed;
+        };
+        let Some(q) = arm.seal.request.as_ref() else {
+            return ProviderDetachWitness::NotArmed;
+        };
+        let Some(a) = q.attempt.as_ref() else {
+            return ProviderDetachWitness::NotArmed;
+        };
+        if a.challenge != challenge || arm.consumed || arm.server_install_ack.is_none() {
+            return ProviderDetachWitness::NotArmed;
+        }
+        arm.consumed = true;
+        let valid = a.gateway_boot_id == inner.provider_detach.boot_id
+            && a.supervisor_session == inner.provider_detach.session_id
+            && detach_arm_time_valid(a, &now)
+            && inner.current.revision == captured_revision
+            && captured_revision == a.provider_env_revision
+            && inner.current.installation_id == arm.installation_id
+            && arm
+                .server_install_ack
+                .as_ref()
+                .and_then(|s| s.installed_time.as_ref())
+                .and_then(detach_time_ns)
+                .is_some_and(|installed| detach_time_ns(&now).is_some_and(|n| n >= installed))
+            && (arm.policy_current)()
+            && inner.body_inventory_available
+            && inner.current.dynamic_credentials.is_empty()
+            && !inner.static_credential_bindings.values().any(|b| {
+                b.credential_identity
+                    .starts_with(&format!("{}:", a.provider_id))
+            })
+            && arm.subject.keys.iter().all(|k| {
+                inner.known_static_credential_keys.contains(k)
+                    && !inner.current.child_env.contains_key(k)
+            });
+        let outcome = if !valid {
+            arm.result = 4;
+            ProviderDetachWitness::Invalidated
+        } else if !arm
+            .subject
+            .matches_original_static_bearer(authorization, host, port, target)
+            || authorization.len() > 8192
+        {
+            arm.result = 3;
+            ProviderDetachWitness::Invalidated
+        } else {
+            let header = format!("GET / HTTP/1.1\r\nAuthorization: {authorization}\r\n\r\n");
+            match crate::secrets::rewrite_http_header_block(header.as_bytes(), resolver) {
+                Ok(materialized) => {
+                    drop(materialized);
+                    arm.result = 2;
+                    ProviderDetachWitness::NotRefused
+                }
+                Err(error) if error.is_endpoint_mismatch() => {
+                    arm.result = 3;
+                    ProviderDetachWitness::Invalidated
+                }
+                Err(_) => {
+                    if (arm.policy_current)() {
+                        arm.result = 1;
+                        arm.refusal = Some(crate::proto::ProviderDetachRefusalV1 {
+                            action_id: a.action_id.clone(),
+                            target_sha256: a.target_sha256.clone(),
+                            attempt_id: q.attempt_id.clone(),
+                            challenge: a.challenge.clone(),
+                            supervisor_instance: a.supervisor_instance.clone(),
+                            supervisor_session: a.supervisor_session.clone(),
+                            sequence: 0,
+                            attachment_epoch: a.attachment_epoch.clone(),
+                            configuration_instance: a.configuration_instance.clone(),
+                            config_revision: a.config_revision,
+                            provider_env_revision: a.provider_env_revision,
+                            unavailable: true,
+                            attempted_time: Some(now),
+                            observed_time: Some(now),
+                        });
+                        ProviderDetachWitness::Unavailable
+                    } else {
+                        arm.result = 4;
+                        ProviderDetachWitness::Invalidated
+                    }
+                }
+            }
+        };
+        inner.provider_detach.arms.insert(attempt_id.into(), arm);
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -2763,6 +3542,760 @@ mod tests {
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:v10_GITHUB_TOKEN"),
             None
+        );
+    }
+    #[test]
+    fn provider_detach_refusal_uses_installed_membership_not_network_decisions() {
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut bound = binding("api.example.com", 443, "/**");
+        bound.credential_identity = format!("{provider}:API_KEY");
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".into(), "synthetic-test-value".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), bound)]),
+            Vec::new(),
+        )
+        .unwrap();
+        let subject = state.capture_static_provider_revocation(provider).unwrap();
+        let before = state.snapshot();
+        assert!(
+            state
+                .observe_static_provider_revocation(&subject, 1, &before.installation_id)
+                .is_none()
+        );
+        state
+            .install_bound_environment(
+                2,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let after = state.snapshot();
+        let proof = state
+            .observe_static_provider_revocation(&subject, 2, &after.installation_id)
+            .unwrap();
+        assert!(proof.unavailable);
+        assert_eq!(proof.provider_id, provider);
+        assert_eq!(proof.before_revision, 1);
+        assert!(
+            state
+                .observe_static_provider_revocation(&subject, 1, &after.installation_id)
+                .is_none()
+        );
+        assert!(
+            state
+                .observe_static_provider_revocation(&subject, 2, &before.installation_id)
+                .is_none()
+        );
+        // Actual endpoint resolution independently refuses the old reference.
+        let endpoint = state.resolver_for_endpoint("api.example.com", 443, "/");
+        if let Some(resolver) = endpoint {
+            assert!(
+                resolver
+                    .resolve_placeholder_checked(
+                        &crate::secrets::placeholder_for_env_key_for_revision("API_KEY", 1),
+                        "test"
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn provider_detach_witness_matches_only_original_installed_bearer_reference() {
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut bound = binding("api.example.com", 443, "/v1/messages");
+        bound.credential_identity = format!("{provider}:API_KEY");
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic-test-value".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), bound)]),
+            Vec::new(),
+        )
+        .unwrap();
+        let subject = state.capture_static_provider_revocation(provider).unwrap();
+        let original = state.snapshot().child_env["API_KEY"].clone();
+        assert!(subject.matches_original_static_bearer(
+            &format!("Bearer {original}"),
+            "api.example.com",
+            443,
+            "/v1/messages?beta=true"
+        ));
+        for invalid in [
+            "Bearer synthetic-test-value",
+            "Bearer openshell:resolve:env:API_KEY",
+            "Bearer openshell:resolve:env:v6_API_KEY",
+            "Bearer openshell:resolve:env:v7_OTHER_KEY",
+            "Bearer openshell:resolve:env:sother_API_KEY",
+            "Bearer  openshell:resolve:env:v7_API_KEY",
+            "Bearer openshell:resolve:env:v7_API_KEY ",
+            "Basic openshell:resolve:env:v7_API_KEY",
+        ] {
+            assert!(!subject.matches_original_static_bearer(
+                invalid,
+                "api.example.com",
+                443,
+                "/v1/messages?beta=true"
+            ));
+        }
+        for (host, port, target) in [
+            ("other.example.com", 443, "/v1/messages?beta=true"),
+            ("api.example.com", 80, "/v1/messages?beta=true"),
+            ("api.example.com", 443, "/v1/models?beta=true"),
+            (
+                "api.example.com",
+                443,
+                "/v1/messages?key=openshell:resolve:env:v7_API_KEY",
+            ),
+        ] {
+            assert!(!subject.matches_original_static_bearer(
+                &format!("Bearer {original}"),
+                host,
+                port,
+                target
+            ));
+        }
+        // Membership can be retained privately after removal; matching the
+        // reference alone still supplies neither arm authority nor a refusal.
+        state
+            .install_bound_environment(
+                8,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(subject.matches_original_static_bearer(
+            &format!("Bearer {original}"),
+            "api.example.com",
+            443,
+            "/v1/messages?beta=true"
+        ));
+    }
+
+    #[test]
+    fn provider_detach_retains_original_subject_across_actual_install_only_when_enabled() {
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut bound = binding("api.example.com", 443, "/v1/messages");
+        bound.credential_identity = format!("{provider}:API_KEY");
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic-value".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), bound)]),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!state.provider_detach_attempts_enabled());
+        assert!(
+            state
+                .retained_provider_revocation_subject(provider, 7)
+                .is_none()
+        );
+        state.enable_provider_detach_attempts();
+        state
+            .install_bound_environment(
+                8,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let original = state
+            .retained_provider_revocation_subject(provider, 7)
+            .unwrap();
+        assert!(original.matches_original_static_bearer(
+            "Bearer openshell:resolve:env:v7_API_KEY",
+            "api.example.com",
+            443,
+            "/v1/messages?beta=true"
+        ));
+        assert!(
+            state
+                .retained_provider_revocation_subject(provider, 8)
+                .is_none()
+        );
+        let after = state.snapshot();
+        assert!(
+            state
+                .observe_static_provider_revocation(&original, 8, &after.installation_id)
+                .unwrap()
+                .unavailable
+        );
+        state.install_environment(9, HashMap::new(), HashMap::new(), HashMap::new());
+        assert!(!state.provider_detach_attempts_enabled());
+        assert!(
+            state
+                .retained_provider_revocation_subject(provider, 7)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_detach_subject_capacity_refuses_without_selecting_an_evicted_original() {
+        let mut env = HashMap::new();
+        let mut bindings = HashMap::new();
+        for i in 0..33 {
+            let key = format!("KEY_{i}");
+            let mut bound = binding("api.example.com", 443, "/**");
+            bound.credential_identity = format!("{i:08x}-aaaa-4aaa-8aaa-aaaaaaaaaaaa:{key}");
+            env.insert(key.clone(), "synthetic-value".into());
+            bindings.insert(key, bound);
+        }
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            env,
+            HashMap::new(),
+            HashMap::new(),
+            bindings,
+            Vec::new(),
+        )
+        .unwrap();
+        state.enable_provider_detach_attempts();
+        assert!(!state.provider_detach_attempts_enabled());
+        assert!(
+            state
+                .inner
+                .read()
+                .unwrap()
+                .provider_detach
+                .subjects
+                .is_empty()
+        );
+    }
+
+    // Core unit fixture represents an already authenticated server seal.
+    // Full wire/hash/original-hold validation is tested at the server boundary.
+    fn local_detach_arm_fixture() -> (
+        ProviderCredentialState,
+        crate::proto::ProviderDetachArmSealV1,
+        crate::proto::ProviderReadinessObservation,
+        prost_types::Timestamp,
+    ) {
+        use crate::proto::*;
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut bound = binding("api.example.com", 443, "/v1/messages");
+        bound.credential_identity = format!("{provider}:API_KEY");
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".into(), "synthetic-value".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), bound)]),
+            Vec::new(),
+        )
+        .unwrap();
+        state.enable_provider_detach_attempts();
+        state
+            .install_bound_environment(
+                8,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let now = prost_types::Timestamp {
+            seconds: 1_792_180_001,
+            nanos: 0,
+        };
+        let a = ProviderDetachAttemptV1 {
+            schema_version: 1,
+            dispatcher_decision_id: "66666666-6666-4666-8666-666666666666".into(),
+            action_id: "78b7f3e7-7413-5338-a795-f35973214544".into(),
+            intent_sha256: "a".repeat(64),
+            target_sha256: "b".repeat(64),
+            native_receipt_id: "11111111-1111-4111-8111-111111111111".into(),
+            hold_id: "22222222-2222-4222-8222-222222222222".into(),
+            authority: "gateway-a".into(),
+            gateway_boot_id: "88888888-8888-4888-8888-888888888888".into(),
+            workspace: "default".into(),
+            sandbox_id: "sandbox-id".into(),
+            execution_id: format!("exec-v1:{}", "a".repeat(64)),
+            provider_id: provider.into(),
+            attachment_epoch: "33333333-3333-4333-8333-333333333333".into(),
+            configuration_instance: "config-after".into(),
+            config_revision: 9,
+            provider_env_revision: 8,
+            native_policy_hash: "e".repeat(64),
+            native_policy_version: 4,
+            supervisor_instance: "44444444-4444-4444-8444-444444444444".into(),
+            supervisor_session: "55555555-5555-4555-8555-555555555555".into(),
+            arm_capture_sequence: 10,
+            challenge: "a".repeat(64),
+            not_before: Some(prost_types::Timestamp {
+                seconds: now.seconds - 1,
+                nanos: 0,
+            }),
+            deadline: Some(prost_types::Timestamp {
+                seconds: now.seconds + 19,
+                nanos: 0,
+            }),
+        };
+        let obs = ProviderReadinessObservation {
+            session_id: a.supervisor_session.clone(),
+            sequence: 10,
+            attachment_epoch: a.attachment_epoch.clone(),
+            provider_env_revision: 8,
+            config_revision: 9,
+            policy_hash: a.native_policy_hash.clone(),
+            credentials_installed: true,
+            policy_active: true,
+            launch_environment_installed: true,
+            process_instance_id: "99999999-9999-4999-8999-999999999999".into(),
+            ..Default::default()
+        };
+        state.bind_provider_detach_session(&a.gateway_boot_id, &a.supervisor_session);
+        let target = ProviderDetachTargetV1 {
+            provider_env_revision: 7,
+            provider_id: provider.into(),
+            ..Default::default()
+        };
+        let request = ProviderDetachArmRequestV1 {
+            original_action: Some(ProviderDetachActionV1 {
+                target: Some(target),
+                ..Default::default()
+            }),
+            original_receipt: None,
+            attempt: Some(a),
+            attempt_id: "5891bfb6-f198-5af2-ad78-cccd52e62f10".into(),
+            request_sha256: "b".repeat(64),
+        };
+        let seal = ProviderDetachArmSealV1 {
+            request: Some(request),
+            hold_generation: 1,
+            row_resource_version: 1,
+            install_sequence: 0,
+            installed_time: None,
+        };
+        (state, seal, obs, now)
+    }
+    #[test]
+    fn provider_detach_arm_requires_actual_install_ack_and_consumes_exact_header_once() {
+        let (state, seal, obs, now) = local_detach_arm_fixture();
+        let q = seal.request.as_ref().unwrap();
+        let a = q.attempt.as_ref().unwrap();
+        let installed = state.snapshot().installation_id.clone();
+        assert!(state.install_provider_detach_arm(
+            &seal,
+            &obs,
+            &installed,
+            11,
+            now,
+            Arc::new(|| true)
+        ));
+        assert_eq!(
+            state.witness_provider_detach_header(
+                &q.attempt_id,
+                &a.challenge,
+                "Bearer openshell:resolve:env:v7_API_KEY",
+                "api.example.com",
+                443,
+                "/v1/messages?beta=true",
+                None,
+                8,
+                now
+            ),
+            ProviderDetachWitness::NotArmed
+        );
+        let report = state
+            .provider_detach_report(&obs.session_id, 11, &now)
+            .unwrap();
+        assert_eq!(report.install_sequence, 11);
+        assert_eq!(report.result, 0);
+        let mut acknowledged = seal.clone();
+        acknowledged.install_sequence = 11;
+        acknowledged.installed_time = Some(now);
+        assert!(state.acknowledge_provider_detach_arm(&acknowledged));
+        assert_eq!(
+            state.witness_provider_detach_header(
+                &q.attempt_id,
+                &a.challenge,
+                "Bearer openshell:resolve:env:v7_API_KEY",
+                "api.example.com",
+                443,
+                "/v1/messages?beta=true",
+                None,
+                8,
+                now
+            ),
+            ProviderDetachWitness::Unavailable
+        );
+        assert_eq!(
+            state.witness_provider_detach_header(
+                &q.attempt_id,
+                &a.challenge,
+                "Bearer openshell:resolve:env:v7_API_KEY",
+                "api.example.com",
+                443,
+                "/v1/messages?beta=true",
+                None,
+                8,
+                now
+            ),
+            ProviderDetachWitness::NotArmed
+        );
+        let proof = state
+            .provider_detach_report(&obs.session_id, 12, &now)
+            .unwrap();
+        assert_eq!(proof.result, 1);
+        assert_eq!(proof.refusal.as_ref().unwrap().sequence, 12);
+        let later = prost_types::Timestamp {
+            seconds: now.seconds + 1,
+            nanos: 0,
+        };
+        let retry = state
+            .provider_detach_report(&obs.session_id, 13, &later)
+            .unwrap();
+        assert_eq!(proof, retry);
+        assert!(state.install_provider_detach_arm(
+            &seal,
+            &obs,
+            &installed,
+            14,
+            later,
+            Arc::new(|| true)
+        ));
+        assert_eq!(
+            state.witness_provider_detach_header(
+                &q.attempt_id,
+                &a.challenge,
+                "Bearer openshell:resolve:env:v7_API_KEY",
+                "api.example.com",
+                443,
+                "/v1/messages?beta=true",
+                None,
+                8,
+                later
+            ),
+            ProviderDetachWitness::NotArmed
+        );
+    }
+    #[test]
+    fn provider_detach_arm_wrong_subject_spends_without_proof_and_deadline_never_renews() {
+        let (state, seal, obs, now) = local_detach_arm_fixture();
+        let q = seal.request.as_ref().unwrap();
+        let a = q.attempt.as_ref().unwrap();
+        let installed = state.snapshot().installation_id.clone();
+        assert!(state.install_provider_detach_arm(
+            &seal,
+            &obs,
+            &installed,
+            11,
+            now,
+            Arc::new(|| true)
+        ));
+        let mut ack = seal.clone();
+        ack.install_sequence = 11;
+        ack.installed_time = Some(now);
+        assert!(state.acknowledge_provider_detach_arm(&ack));
+        assert_eq!(
+            state.witness_provider_detach_header(
+                &q.attempt_id,
+                &a.challenge,
+                "Bearer openshell:resolve:env:v7_UNRELATED",
+                "api.example.com",
+                443,
+                "/v1/messages?beta=true",
+                None,
+                8,
+                now
+            ),
+            ProviderDetachWitness::Invalidated
+        );
+        let report = state
+            .provider_detach_report(&obs.session_id, 12, &now)
+            .unwrap();
+        assert_eq!(report.result, 3);
+        assert!(report.refusal.is_none());
+        let expiry = a.deadline.unwrap();
+        assert!(
+            state
+                .provider_detach_report(&obs.session_id, 13, &expiry)
+                .unwrap()
+                .attempt_id
+                .is_empty()
+        );
+        assert!(!state.install_provider_detach_arm(
+            &seal,
+            &obs,
+            &installed,
+            14,
+            expiry,
+            Arc::new(|| true)
+        ));
+    }
+
+    #[test]
+    fn provider_detach_arm_two_consumers_only_one_original_refusal() {
+        let (state, seal, obs, now) = local_detach_arm_fixture();
+        let q = seal.request.as_ref().unwrap();
+        let a = q.attempt.as_ref().unwrap();
+        assert!(state.install_provider_detach_arm(
+            &seal,
+            &obs,
+            &state.snapshot().installation_id,
+            11,
+            now,
+            Arc::new(|| true)
+        ));
+        let mut ack = seal.clone();
+        ack.install_sequence = 11;
+        ack.installed_time = Some(now);
+        assert!(state.acknowledge_provider_detach_arm(&ack));
+        let mut threads = Vec::new();
+        for _ in 0..32 {
+            let state = state.clone();
+            let id = q.attempt_id.clone();
+            let challenge = a.challenge.clone();
+            threads.push(std::thread::spawn(move || {
+                state.witness_provider_detach_header(
+                    &id,
+                    &challenge,
+                    "Bearer openshell:resolve:env:v7_API_KEY",
+                    "api.example.com",
+                    443,
+                    "/v1/messages?beta=true",
+                    None,
+                    8,
+                    now,
+                )
+            }));
+        }
+        let outcomes = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == ProviderDetachWitness::Unavailable)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == ProviderDetachWitness::NotArmed)
+                .count(),
+            31
+        );
+    }
+    #[test]
+    fn provider_detach_arm_policy_and_installation_replacement_withhold_original_proof() {
+        for replace in [false, true] {
+            let (state, seal, obs, now) = local_detach_arm_fixture();
+            let q = seal.request.as_ref().unwrap();
+            let a = q.attempt.as_ref().unwrap();
+            let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let check = Arc::clone(&active);
+            assert!(state.install_provider_detach_arm(
+                &seal,
+                &obs,
+                &state.snapshot().installation_id,
+                11,
+                now,
+                Arc::new(move || check.load(std::sync::atomic::Ordering::SeqCst))
+            ));
+            let mut ack = seal.clone();
+            ack.install_sequence = 11;
+            ack.installed_time = Some(now);
+            assert!(state.acknowledge_provider_detach_arm(&ack));
+            if replace {
+                state
+                    .install_bound_environment(
+                        8,
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        Vec::new(),
+                    )
+                    .unwrap();
+            } else {
+                active.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            assert_eq!(
+                state.witness_provider_detach_header(
+                    &q.attempt_id,
+                    &a.challenge,
+                    "Bearer openshell:resolve:env:v7_API_KEY",
+                    "api.example.com",
+                    443,
+                    "/v1/messages?beta=true",
+                    None,
+                    8,
+                    now
+                ),
+                ProviderDetachWitness::Invalidated
+            );
+            assert!(
+                state
+                    .provider_detach_report(&obs.session_id, 12, &now)
+                    .unwrap()
+                    .refusal
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn provider_detach_arm_unexpired_consumed_records_count_toward_capacity() {
+        let (state, base, obs, now) = local_detach_arm_fixture();
+        let installed = state.snapshot().installation_id.clone();
+        let mut originals = Vec::new();
+        for i in 0..16 {
+            let mut seal = base.clone();
+            let q = seal.request.as_mut().unwrap();
+            q.attempt_id = uuid::Uuid::new_v4().to_string();
+            q.request_sha256 = format!("{i:064x}");
+            q.attempt.as_mut().unwrap().dispatcher_decision_id = uuid::Uuid::new_v4().to_string();
+            assert!(state.install_provider_detach_arm(
+                &seal,
+                &obs,
+                &installed,
+                11,
+                now,
+                Arc::new(|| true)
+            ));
+            let mut ack = seal.clone();
+            ack.install_sequence = 11;
+            ack.installed_time = Some(now);
+            assert!(state.acknowledge_provider_detach_arm(&ack));
+            let q = seal.request.as_ref().unwrap();
+            assert_eq!(
+                state.witness_provider_detach_header(
+                    &q.attempt_id,
+                    &q.attempt.as_ref().unwrap().challenge,
+                    "Bearer unrelated",
+                    "api.example.com",
+                    443,
+                    "/v1/messages",
+                    None,
+                    8,
+                    now
+                ),
+                ProviderDetachWitness::Invalidated
+            );
+            originals.push(seal);
+        }
+        let mut extra = base.clone();
+        extra.request.as_mut().unwrap().attempt_id = uuid::Uuid::new_v4().to_string();
+        assert!(!state.install_provider_detach_arm(
+            &extra,
+            &obs,
+            &installed,
+            11,
+            now,
+            Arc::new(|| true)
+        ));
+        for original in originals {
+            assert!(state.install_provider_detach_arm(
+                &original,
+                &obs,
+                &installed,
+                12,
+                now,
+                Arc::new(|| true)
+            ));
+        }
+        assert_eq!(state.inner.read().unwrap().provider_detach.arms.len(), 16);
+        state.bind_provider_detach_session("99999999-9999-4999-8999-999999999999", &obs.session_id);
+        assert_eq!(state.inner.read().unwrap().provider_detach.arms.len(), 16);
+        assert!(!state.install_provider_detach_arm(
+            &base,
+            &obs,
+            &installed,
+            12,
+            now,
+            Arc::new(|| true)
+        ));
+    }
+
+    #[test]
+    fn provider_detach_refusal_missing_association_is_unsupported() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(
+            state
+                .capture_static_provider_revocation("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                .is_none()
+        );
+        assert!(
+            state
+                .capture_static_provider_revocation("not-a-provider-uuid")
+                .is_none()
+        );
+        assert!(
+            state
+                .capture_static_provider_revocation("00000000-0000-0000-0000-000000000000")
+                .is_none()
+        );
+    }
+    #[test]
+    fn provider_detach_refusal_rejects_reused_key_and_attached_provider() {
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut bound = binding("api.example.com", 443, "/**");
+        bound.credential_identity = format!("{provider}:API_KEY");
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".into(), "synthetic".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".into(), bound.clone())]),
+            Vec::new(),
+        )
+        .unwrap();
+        let subject = state.capture_static_provider_revocation(provider).unwrap();
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([("API_KEY".into(), "synthetic-new".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), bound.clone())]),
+                Vec::new(),
+            )
+            .unwrap();
+        let current = state.snapshot();
+        assert!(
+            !state
+                .observe_static_provider_revocation(&subject, 2, &current.installation_id)
+                .unwrap()
+                .unavailable
+        );
+        bound.credential_identity = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb:API_KEY".into();
+        state
+            .install_bound_environment(
+                3,
+                HashMap::from([("API_KEY".into(), "other-provider".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), bound)]),
+                Vec::new(),
+            )
+            .unwrap();
+        let current = state.snapshot();
+        assert!(
+            state
+                .observe_static_provider_revocation(&subject, 3, &current.installation_id)
+                .is_none()
         );
     }
 }

@@ -465,6 +465,7 @@ mod tests {
                 launch_environment_installed: true,
                 process_instance_id: Uuid::new_v4().to_string(),
                 reason: ProviderReadinessReason::Unspecified.into(),
+                ..Default::default()
             }),
             ..Default::default()
         }

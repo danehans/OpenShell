@@ -334,6 +334,9 @@ type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>
 pub struct SupervisorSessionRegistry {
     /// `sandbox_id` -> live session handle.
     sessions: Mutex<HashMap<String, LiveSession>>,
+    // Always take sessions before this lock; no await/DB/network under either.
+    // Records outlive removed sessions until their immutable original deadline.
+    provider_detach_attempts: Mutex<crate::grpc::provider_detach::ProviderDetachAttempts>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
     /// Read guards cover owner publication through final cleanup, even after
@@ -604,7 +607,84 @@ impl SupervisorSessionRegistry {
                 "provider readiness requires the current sandbox instance",
             ));
         }
-        evidence.accept(observation)
+        let mut candidate = evidence.clone();
+        candidate.accept(observation)?;
+        let mut attempts = self
+            .provider_detach_attempts
+            .lock()
+            .map_err(|_| Status::unavailable("provider attempt state unavailable"))?;
+        attempts.accept_report(
+            sandbox_id,
+            &candidate,
+            &openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                .map_err(|_| Status::internal("attempt clock unavailable"))?,
+        )?;
+        *evidence = candidate;
+        Ok(())
+    }
+
+    /// One bounded native metadata transition under the current authenticated
+    /// session boundary. Closure cannot retain either registry lock.
+    pub(crate) fn with_provider_detach_attempts<R>(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        active_instance_id: &str,
+        operation: impl FnOnce(
+            &ProviderReadinessEvidence,
+            &mut crate::grpc::provider_detach::ProviderDetachAttempts,
+        ) -> Result<R, Status>,
+    ) -> Result<R, Status> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("supervisor session state unavailable"))?;
+        let evidence = sessions
+            .get(sandbox_id)
+            .filter(|s| s.session_id == session_id && s.endpoint_status_initialized)
+            .and_then(|s| s.provider_readiness.as_ref())
+            .filter(|e| e.belongs_to_instance(active_instance_id))
+            .ok_or_else(|| {
+                Status::permission_denied("attempt requires current initialized supervisor session")
+            })?;
+        let mut attempts = self
+            .provider_detach_attempts
+            .lock()
+            .map_err(|_| Status::unavailable("provider attempt state unavailable"))?;
+        operation(evidence, &mut attempts)
+    }
+
+    pub(crate) fn provider_detach_report_reply(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        active_instance_id: &str,
+    ) -> Result<
+        (
+            String,
+            Option<openshell_core::proto::ProviderDetachArmSealV1>,
+            Option<openshell_core::proto::ProviderDetachArmSealV1>,
+        ),
+        Status,
+    > {
+        self.with_provider_detach_attempts(
+            sandbox_id,
+            session_id,
+            active_instance_id,
+            |evidence, attempts| {
+                let now =
+                    openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                        .map_err(|_| Status::internal("attempt clock unavailable"))?;
+                let pending = attempts.accept_report(sandbox_id, evidence, &now)?;
+                let installed = evidence
+                    .provider_detach_snapshot()
+                    .and_then(|(_, obs, _)| obs.provider_detach)
+                    .and_then(|m| {
+                        attempts.installed_for(sandbox_id, session_id, &m.attempt_id, &now)
+                    });
+                Ok((attempts.boot_id.clone(), pending, installed))
+            },
+        )
     }
 
     /// Snapshot installation evidence from the current initialized session.
@@ -4557,5 +4637,393 @@ mod tests {
         let channels = cache.channels.lock().unwrap();
         assert!(!channels.contains_key("http://10.0.0.1:8080"));
         assert!(channels.contains_key("http://10.0.0.2:8080"));
+    }
+    fn attempt_registry_fixture() -> (
+        SupervisorSessionRegistry,
+        openshell_core::proto::ProviderDetachArmRequestV1,
+        ProviderReadinessObservation,
+    ) {
+        use openshell_core::proto::*;
+        let registry = SupervisorSessionRegistry::new();
+        let boot = registry
+            .provider_detach_attempts
+            .lock()
+            .unwrap()
+            .boot_id
+            .clone();
+        let now =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap();
+        let q = crate::grpc::provider_detach::registry_arm_fixture(&boot, now);
+        let a = q.attempt.as_ref().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register(
+            a.sandbox_id.clone(),
+            a.supervisor_session.clone(),
+            tx,
+            make_shutdown(),
+        );
+        assert!(
+            registry.initialize_endpoint_status_authority(&a.sandbox_id, &a.supervisor_session)
+        );
+        let hello = SupervisorHello {
+            sandbox_id: a.sandbox_id.clone(),
+            instance_id: a.supervisor_instance.clone(),
+            supports_provider_readiness: true,
+            ..Default::default()
+        };
+        registry
+            .initialize_provider_readiness(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                ProviderReadinessEvidence::from_hello(&hello).unwrap(),
+            )
+            .unwrap();
+        let obs = ProviderReadinessObservation {
+            session_id: a.supervisor_session.clone(),
+            sequence: 10,
+            attachment_epoch: a.attachment_epoch.clone(),
+            provider_env_revision: a.provider_env_revision,
+            config_revision: a.config_revision,
+            policy_hash: a.native_policy_hash.clone(),
+            credentials_installed: true,
+            policy_active: true,
+            launch_environment_installed: true,
+            process_instance_id: "99999999-9999-4999-8999-999999999999".into(),
+            provider_detach: Some(ProviderDetachSupervisorReportV1 {
+                supported: true,
+                gateway_boot_id: boot,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        registry
+            .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+            .unwrap();
+        (registry, q, obs)
+    }
+    fn attempt_now() -> prost_types::Timestamp {
+        openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap()
+    }
+    #[test]
+    fn provider_detach_registry_requires_causal_delivery_install_and_keeps_original_terminal() {
+        let (registry, q, mut obs) = attempt_registry_fixture();
+        let a = q.attempt.as_ref().unwrap();
+        let initial = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+            )
+            .unwrap();
+        assert_eq!(initial.state, 1);
+        // A guessed install sequence without exact prior delivery is refused.
+        obs.sequence = 11;
+        obs.provider_detach = Some(openshell_core::proto::ProviderDetachSupervisorReportV1 {
+            supported: true,
+            gateway_boot_id: a.gateway_boot_id.clone(),
+            attempt_id: q.attempt_id.clone(),
+            request_sha256: q.request_sha256.clone(),
+            install_sequence: 11,
+            installed_time: Some(attempt_now()),
+            ..Default::default()
+        });
+        assert!(
+            registry
+                .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+                .is_err()
+        );
+        // Acceptance refusal left the original report10 and reservation intact.
+        let (_, pending, installed) = registry
+            .provider_detach_report_reply(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+            )
+            .unwrap();
+        assert!(installed.is_none());
+        assert_eq!(pending.unwrap().request.as_ref(), Some(&q));
+        obs.provider_detach.as_mut().unwrap().installed_time = Some(attempt_now());
+        registry
+            .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+            .unwrap();
+        let (_, pending, installed) = registry
+            .provider_detach_report_reply(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+            )
+            .unwrap();
+        assert!(pending.is_none());
+        let installed = installed.unwrap();
+        assert_eq!(installed.install_sequence, 11);
+        obs.sequence = 12;
+        obs.provider_detach.as_mut().unwrap().result = 3;
+        registry
+            .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+            .unwrap();
+        let terminal = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.query(&q, &attempt_now()),
+            )
+            .unwrap();
+        assert_eq!(terminal.state, 4);
+        assert_eq!(terminal.result, 3);
+        assert!(terminal.proof.is_none());
+        let duplicate = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+            )
+            .unwrap();
+        assert_eq!(duplicate, terminal);
+        let mut changed = q.clone();
+        changed
+            .original_receipt
+            .as_mut()
+            .unwrap()
+            .configuration_instance = "other".into();
+        assert!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&changed, 1, 9, &attempt_now())
+                )
+                .is_err()
+        );
+        let expiry = a.deadline.unwrap();
+        let expired = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.query(&q, &expiry),
+            )
+            .unwrap();
+        assert_eq!(expired.state, 5);
+        assert!(expired.seal.is_none());
+        assert!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&q, 1, 9, &expiry)
+                )
+                .is_err()
+        );
+        registry.remove(&a.sandbox_id);
+        assert!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.query(&q, &attempt_now())
+                )
+                .is_err()
+        );
+        // Removal cannot free an unexpired terminal/tombstone slot.
+        assert_eq!(
+            registry
+                .provider_detach_attempts
+                .lock()
+                .unwrap()
+                .query(&q, &attempt_now())
+                .unwrap(),
+            terminal
+        );
+    }
+    fn fresh_attempt_from_original(
+        q: &openshell_core::proto::ProviderDetachArmRequestV1,
+        capture: u64,
+    ) -> openshell_core::proto::ProviderDetachArmRequestV1 {
+        let mut q = q.clone();
+        let a = q.attempt.as_mut().unwrap();
+        a.dispatcher_decision_id = Uuid::new_v4().to_string();
+        a.arm_capture_sequence = capture;
+        q.request_sha256 = crate::grpc::provider_detach::attempt_digest(a).unwrap();
+        q.attempt_id =
+            crate::grpc::provider_detach::action_id_for_digest(&q.request_sha256).unwrap();
+        q
+    }
+    #[test]
+    fn provider_detach_registry_counts_unexpired_terminal_records_and_preserves_duplicates() {
+        let (registry, base, mut obs) = attempt_registry_fixture();
+        let identity = base.attempt.as_ref().unwrap();
+        let mut originals = Vec::new();
+        for _ in 0..16 {
+            let q = fresh_attempt_from_original(&base, obs.sequence);
+            registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+                )
+                .unwrap();
+            let (_, pending, _) = registry
+                .provider_detach_report_reply(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                )
+                .unwrap();
+            assert_eq!(pending.unwrap().request.as_ref(), Some(&q));
+            obs.sequence += 1;
+            let installed = attempt_now();
+            obs.provider_detach = Some(openshell_core::proto::ProviderDetachSupervisorReportV1 {
+                supported: true,
+                gateway_boot_id: identity.gateway_boot_id.clone(),
+                attempt_id: q.attempt_id.clone(),
+                request_sha256: q.request_sha256.clone(),
+                install_sequence: obs.sequence,
+                installed_time: Some(installed),
+                ..Default::default()
+            });
+            registry
+                .accept_provider_readiness(
+                    &identity.sandbox_id,
+                    &identity.supervisor_instance,
+                    obs.clone(),
+                )
+                .unwrap();
+            obs.sequence += 1;
+            obs.provider_detach.as_mut().unwrap().result = 3;
+            registry
+                .accept_provider_readiness(
+                    &identity.sandbox_id,
+                    &identity.supervisor_instance,
+                    obs.clone(),
+                )
+                .unwrap();
+            originals.push(q);
+        }
+        let seventeenth = fresh_attempt_from_original(&base, obs.sequence);
+        assert_eq!(
+            registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(&seventeenth, 1, 9, &attempt_now())
+                )
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        for q in &originals {
+            let old = registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.query(q, &attempt_now()),
+                )
+                .unwrap();
+            assert_eq!(old.state, 4);
+            let duplicate = registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(q, 1, 9, &attempt_now()),
+                )
+                .unwrap();
+            assert_eq!(duplicate, old);
+        }
+        let expiry = identity.deadline.unwrap();
+        let mut fresh = fresh_attempt_from_original(&base, obs.sequence);
+        let a = fresh.attempt.as_mut().unwrap();
+        a.not_before = Some(expiry);
+        a.deadline = Some(prost_types::Timestamp {
+            seconds: expiry.seconds + 20,
+            nanos: expiry.nanos,
+        });
+        fresh.request_sha256 = crate::grpc::provider_detach::attempt_digest(a).unwrap();
+        fresh.attempt_id =
+            crate::grpc::provider_detach::action_id_for_digest(&fresh.request_sha256).unwrap();
+        assert_eq!(
+            registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(&fresh, 1, 9, &expiry)
+                )
+                .unwrap()
+                .state,
+            1
+        );
+    }
+    #[test]
+    fn provider_detach_registry_duplicate_race_has_one_original_and_old_boot_cannot_rearm() {
+        let (registry, q, _) = attempt_registry_fixture();
+        let registry = Arc::new(registry);
+        let q = Arc::new(q);
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let registry = Arc::clone(&registry);
+            let q = Arc::clone(&q);
+            workers.push(std::thread::spawn(move || {
+                let a = q.attempt.as_ref().unwrap();
+                registry
+                    .with_provider_detach_attempts(
+                        &a.sandbox_id,
+                        &a.supervisor_session,
+                        &a.supervisor_instance,
+                        |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+                    )
+                    .unwrap()
+            }));
+        }
+        let original = workers.remove(0).join().unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), original);
+        }
+        let a = q.attempt.as_ref().unwrap();
+        let competing = fresh_attempt_from_original(&q, 10);
+        assert_eq!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&competing, 1, 9, &attempt_now())
+                )
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let (restarted, _, _) = attempt_registry_fixture();
+        assert!(
+            restarted
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&q, 1, 9, &attempt_now())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            restarted
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.query(&q, &attempt_now())
+                )
+                .unwrap()
+                .state,
+            6
+        );
     }
 }

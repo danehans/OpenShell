@@ -117,7 +117,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
-        "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+        "31cce19ec2849b3dbf125576557cf765001ef430c1966b68f8ed0ccb461738cc";
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
@@ -141,12 +141,17 @@ mod tests {
     // Runtime admission adds four administrator RPCs, ten messages and two
     // enums. Its receipt history extends both public and durable SandboxStatus;
     // old payloads decode with no holds and preserve their original bytes.
+    // Exact-provider detach adds three RPCs/twenty-seven public messages, two
+    // optional attempt enums, and two
+    // private durable records. Seven new public messages are hold/outcome
+    // dependencies. Separate literal predecessor checks below retain every
+    // prior API/storage declaration rather than accepting a regenerated golden.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "633e82df464f34263d4b42f83053ba4e4852f1636a3ee8d9a7fe3410d7568f16";
+        "9c4ecaa93fb90b5f87bf2216799aeca196022c4c01b7361f209c7553396d6eb9";
     const DURABLE_SCHEMA_SHA256: &str =
-        "e749db8aa581ab42dc0a265d30121ca62ca6b91cd9a9552406824418d26497ac";
+        "efa52e12c00b94ea12555c9209e872239ee8810db079e2fd5338e31c5d2c6f84";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "44c68041924beda553db90bd384cb8430b7a93a7e2c4e87a5f6d242fa637c646";
+        "ddb14951f902561641e198d9baffb5dfd4013770e4e57dd16840f4c07ab8bab7";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -168,7 +173,7 @@ mod tests {
     // Field 1 is ignored while the remaining durable status fields retain their tags.
     const PRE_CANONICAL_SANDBOX_REFERENCE_STATUS: &str =
         "0a0b6c65676163792d6e616d6512056167656e7430023807";
-    const STORAGE_MESSAGE_NAMES: [&str; 9] = [
+    const STORAGE_MESSAGE_NAMES: [&str; 11] = [
         "DraftChunkPayload",
         "PolicyRevisionPayload",
         "StoredConfigUpdateOperation",
@@ -176,6 +181,8 @@ mod tests {
         "StoredPolicyRevision",
         "StoredProviderCredentialRefreshState",
         "StoredProviderCredentialRefreshStateV2",
+        "StoredProviderDetachActionV1",
+        "StoredProviderDetachHoldV1",
         "StoredProviderProfile",
         "StoredRefreshMaterialDeletion",
     ];
@@ -187,6 +194,11 @@ mod tests {
         "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    const PROVIDER_DETACH_RPC_SIGNATURES: [&str; 3] = [
+        "openshell.v1.OpenShell/ConditionalDetachSandboxProvider|.openshell.v1.ConditionalDetachSandboxProviderRequest|.openshell.v1.ConditionalDetachSandboxProviderResponse|false|false",
+        "openshell.v1.OpenShell/ArmProviderDetachAttempt|.openshell.v1.ArmProviderDetachAttemptRequest|.openshell.v1.ArmProviderDetachAttemptResponse|false|false",
+        "openshell.v1.OpenShell/GetConditionalProviderDetachState|.openshell.v1.GetConditionalProviderDetachStateRequest|.openshell.v1.GetConditionalProviderDetachStateResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -201,6 +213,8 @@ mod tests {
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
+        ".openshell.storage.v1.StoredProviderDetachActionV1",
+        ".openshell.storage.v1.StoredProviderDetachHoldV1",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -428,6 +442,232 @@ mod tests {
     }
 
     #[test]
+    fn provider_detach_additions_preserve_complete_predecessor_schemas() {
+        let mut public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        // Precisely validate/remove ONLY the additive attempt fields before
+        // measuring the complete literal predecessor. Never rewrite its hash.
+        for file in &mut public.file {
+            if file.package.as_deref() != Some("openshell.v1") {
+                continue;
+            }
+            for message in &mut file.message_type {
+                let additions: &[(i32, &str, &str)] = match message.name.as_deref() {
+                    Some("ProviderReadinessObservation") => &[(
+                        12,
+                        "provider_detach",
+                        ".openshell.v1.ProviderDetachSupervisorReportV1",
+                    )],
+                    Some("ReportProviderReadinessResponse") => &[
+                        (104, "provider_detach_gateway_boot_id", ""),
+                        (
+                            105,
+                            "provider_detach_pending",
+                            ".openshell.v1.ProviderDetachArmSealV1",
+                        ),
+                        (
+                            106,
+                            "provider_detach_installed",
+                            ".openshell.v1.ProviderDetachArmSealV1",
+                        ),
+                    ],
+                    _ => &[],
+                };
+                for (number, name, kind) in additions {
+                    let field = message
+                        .field
+                        .iter()
+                        .find(|f| f.number == Some(*number))
+                        .expect("reviewed additive field");
+                    assert_eq!(field.name.as_deref(), Some(*name));
+                    assert_eq!(field.type_name.as_deref().unwrap_or_default(), *kind);
+                    assert_eq!(field.label, Some(1));
+                    assert_eq!(field.r#type, Some(if kind.is_empty() { 9 } else { 11 }));
+                }
+                message.field.retain(|f| {
+                    !additions
+                        .iter()
+                        .any(|(number, _, _)| f.number == Some(*number))
+                });
+            }
+        }
+        let storage = FileDescriptorSet::decode(STORAGE_FILE_DESCRIPTOR_SET).unwrap();
+        let mut index = SchemaIndex::default();
+        index_descriptor(&mut index, &storage);
+        index_descriptor(&mut index, &public);
+        let mut roots = BTreeSet::new();
+        let mut methods = Vec::new();
+        for file in &public.file {
+            for service in &file.service {
+                let package = file.package.as_deref().unwrap_or_default();
+                let service_name = service.name.as_deref().unwrap();
+                if !matches!(
+                    (package, service_name),
+                    ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
+                ) {
+                    continue;
+                }
+                for method in &service.method {
+                    let input = method.input_type.as_deref().unwrap();
+                    let output = method.output_type.as_deref().unwrap();
+                    let signature = format!(
+                        "{package}.{service_name}/{}|{}|{}|{}|{}",
+                        method.name.as_deref().unwrap(),
+                        input,
+                        output,
+                        method.client_streaming.unwrap_or(false),
+                        method.server_streaming.unwrap_or(false)
+                    );
+                    if PROVIDER_DETACH_RPC_SIGNATURES.contains(&signature.as_str()) {
+                        continue;
+                    }
+                    roots.insert(input.to_string());
+                    roots.insert(output.to_string());
+                    methods.push(signature);
+                }
+            }
+        }
+        methods.sort();
+        let old_public = schema_closure(&index, roots);
+        assert_eq!(
+            (old_public.messages.len(), old_public.enums.len()),
+            (321, 29)
+        );
+        let schema_hash = schema_fingerprint(&index, &old_public);
+        let inventory = format!(
+            "{:x}",
+            Sha256::digest(format!("{}\n{schema_hash}", methods.join("\n")).as_bytes())
+        );
+        assert_eq!(
+            inventory,
+            "633e82df464f34263d4b42f83053ba4e4852f1636a3ee8d9a7fe3410d7568f16"
+        );
+        let old_durable = schema_closure(
+            &index,
+            DURABLE_ROOTS
+                .iter()
+                .filter(|name| !name.contains("StoredProviderDetach"))
+                .map(|name| name.to_string()),
+        );
+        assert_eq!(
+            (old_durable.messages.len(), old_durable.enums.len()),
+            (95, 23)
+        );
+        assert_eq!(
+            schema_fingerprint(&index, &old_durable),
+            "e749db8aa581ab42dc0a265d30121ca62ca6b91cd9a9552406824418d26497ac"
+        );
+        let file = storage
+            .file
+            .iter()
+            .find(|f| f.package.as_deref() == Some("openshell.storage.v1"))
+            .unwrap();
+        let mut declarations: Vec<_> = file
+            .message_type
+            .iter()
+            .filter(|m| {
+                !m.name
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("StoredProviderDetach")
+            })
+            .collect();
+        declarations.sort_by_key(|m| m.name.as_deref().unwrap());
+        let mut previous = String::new();
+        for message in declarations {
+            append_message_schema(&mut previous, "", message);
+        }
+        assert_eq!(
+            format!("{:x}", Sha256::digest(previous.as_bytes())),
+            "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17"
+        );
+    }
+
+    #[test]
+    fn provider_detach_pre_extension_payloads_keep_legacy_meaning_and_no_implicit_authority() {
+        // Literal old DetachSandboxProviderRequest: sandbox=agent, provider=model,
+        // expected RV=17. New exact operation is a distinct RPC, no downgrade.
+        let old = openshell_core::proto::DetachSandboxProviderRequest::decode(
+            &[
+                10, 5, b'a', b'g', b'e', b'n', b't', 18, 5, b'm', b'o', b'd', b'e', b'l', 24, 17,
+            ][..],
+        )
+        .unwrap();
+        assert_eq!(old.sandbox, "agent");
+        assert_eq!(old.provider, "model");
+        assert_eq!(old.expected_resource_version, 17);
+        assert!(old.request_id.is_empty());
+        assert!(old.workspace_scope.is_none());
+        let old_observation =
+            openshell_core::proto::ProviderReadinessObservation::decode(&[16, 10][..]).unwrap();
+        assert_eq!(old_observation.sequence, 10);
+        assert!(old_observation.provider_detach.is_none());
+        let old_ack =
+            openshell_core::proto::ReportProviderReadinessResponse::decode(&[8, 7][..]).unwrap();
+        assert_eq!(old_ack.accepted_sequence, 7);
+        assert!(old_ack.provider_detach_gateway_boot_id.is_empty());
+        assert!(
+            old_ack.provider_detach_pending.is_none()
+                && old_ack.provider_detach_installed.is_none()
+        );
+        // Partial new-version records from before full intent provenance remain
+        // decodable but cannot acquire a valid generation or original authority.
+        let hold = StoredProviderDetachHoldV1::decode(&[8, 1][..]).unwrap();
+        assert!(hold.original_action.is_none());
+        assert!(hold.original_receipt.is_none());
+        assert_eq!(hold.generation, 0);
+        assert!(hold.hold_id.is_empty());
+        let action = openshell_core::proto::ProviderDetachActionV1::decode(&[8, 1][..]).unwrap();
+        assert!(action.original_intent.is_none());
+        assert!(crate::grpc::validate_provider_detach_original_action(&action).is_err());
+        let unknown = StoredProviderDetachActionV1::decode(&[][..]).unwrap();
+        assert!(unknown.outcome.is_none()); // Missing is unknown, never applied.
+    }
+
+    #[test]
+    fn provider_detach_hold_and_action_bindings_have_explicit_stable_tags() {
+        let storage = FileDescriptorSet::decode(STORAGE_FILE_DESCRIPTOR_SET).unwrap();
+        let mut index = SchemaIndex::default();
+        index_descriptor(&mut index, &storage);
+        let hold = index.messages[".openshell.storage.v1.StoredProviderDetachHoldV1"];
+        for (name, number, kind) in [
+            ("hold_id", 9, None),
+            ("generation", 10, None),
+            (
+                "original_action",
+                11,
+                Some(".openshell.v1.ProviderDetachActionV1"),
+            ),
+            ("native_receipt_id", 12, None),
+            (
+                "original_receipt",
+                13,
+                Some(".openshell.v1.ProviderDetachReceiptV1"),
+            ),
+        ] {
+            let field = hold
+                .field
+                .iter()
+                .find(|f| f.name.as_deref() == Some(name))
+                .unwrap();
+            assert_eq!(field.number, Some(number));
+            if let Some(kind) = kind {
+                assert_eq!(field.type_name.as_deref(), Some(kind));
+            }
+        }
+        let action = index.messages[".openshell.v1.ProviderDetachActionV1"];
+        let original = action
+            .field
+            .iter()
+            .find(|f| f.name.as_deref() == Some("original_intent"))
+            .unwrap();
+        assert_eq!(original.number, Some(8));
+        assert_eq!(
+            original.type_name.as_deref(),
+            Some(".openshell.v1.ProviderDetachOriginalIntentV1")
+        );
+    }
+
+    #[test]
     fn storage_v1_schema_is_frozen() {
         let (names, schema) = storage_schema();
         assert_eq!(names, STORAGE_MESSAGE_NAMES);
@@ -546,7 +786,10 @@ mod tests {
                 "provider readiness RPC is missing or changed: {signature}"
             );
         }
-        for signature in PEER_OWNER_RPC_SIGNATURES {
+        for signature in PEER_OWNER_RPC_SIGNATURES
+            .into_iter()
+            .chain(PROVIDER_DETACH_RPC_SIGNATURES)
+        {
             assert!(
                 methods.iter().any(|method| method == signature),
                 "peer owner RPC is missing or changed: {signature}"
@@ -554,12 +797,16 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            108 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PROVIDER_DETACH_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            83 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PROVIDER_DETACH_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -567,7 +814,9 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            83 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + PROVIDER_DETACH_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -611,9 +860,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (321, 29),
-                (95, 23),
-                (83, 23),
+                (348, 31),
+                (104, 23),
+                (90, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

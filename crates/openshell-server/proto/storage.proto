@@ -228,3 +228,41 @@ message StoredDraftChunk {
   openshell.sandbox.v1.SandboxPolicy current_effective_policy = 24;
   openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 25;
 }
+
+// Native exact-provider-detach hold, independent of response/outcome retention.
+// Presence is ACTIVE in v1; unknown/missing lifecycle metadata never releases it.
+// This version has no public release/update/delete or expiry transition. Future
+// explicitly authorized recovery must compare the immutable hold identity,
+// generation and native object resource_version with fresh current state in one
+// transaction. Never replace this record by sandbox/provider name or release an
+// unknown original effect. Preserve this object type across schema migrations.
+message StoredProviderDetachHoldV1 {
+  uint32 schema_version = 1;
+  string sandbox_id = 2;
+  string workspace = 3;
+  string provider = 4;
+  string provider_id = 5;
+  string action_id = 6;
+  string target_sha256 = 7;
+  google.protobuf.Timestamp created_time = 8;
+  // Unique native object ID, never reused; generation starts at one. A future
+  // transition must retain historical provenance rather than overwrite it.
+  string hold_id = 9;
+  uint64 generation = 10;
+  // Full bounded original action/target/intent metadata survives for the entire
+  // hold lifetime, independently of outcome and Controller journal retention.
+  openshell.v1.ProviderDetachActionV1 original_action = 11;
+  string native_receipt_id = 12;
+  // Historical effect metadata is pinned with the action, never rewritten into
+  // a current observation or pruned while this hold remains.
+  openshell.v1.ProviderDetachReceiptV1 original_receipt = 13;
+}
+
+// Atomic native outcome, separate from the independently retained active hold.
+// No record means UNKNOWN, never permission to dispatch the mutation again.
+message StoredProviderDetachActionV1 {
+  uint32 schema_version = 1;
+  openshell.v1.ProviderDetachActionV1 original_action = 2;
+  openshell.v1.ProviderDetachOutcomeV1 outcome = 3;
+  google.protobuf.Timestamp recorded_time = 4;
+}

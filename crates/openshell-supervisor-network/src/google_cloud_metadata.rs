@@ -402,6 +402,32 @@ mod tests {
         };
         use tracing_subscriber::prelude::*;
 
+        const CHILD: &str = "OPENSHELL_TEST_METADATA_OCSF18_CHILD";
+        const TEST: &str =
+            "google_cloud_metadata::tests::metadata_events_include_response_for_ocsf18";
+        // Tracing callsite interest is process-wide. Other tests' temporary
+        // subscribers can disable capture in this thread, especially with the
+        // unified tracing/log feature. Keep all six cases and their assertions
+        // in the same executable, isolated as the policy DNS event tests are.
+        if std::env::var(CHILD).as_deref() != Ok(TEST) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, TEST)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.lines().any(|line| line == "running 1 test")
+                    && stdout.lines().any(|line| {
+                        line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    }),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let schema = load_class_schema("http_activity");
         for (method, path, headers, expected_code, expected_activity_id) in [
             ("GET", PATH_TOKEN, flavor_headers(), 200, 3),

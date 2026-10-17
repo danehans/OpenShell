@@ -194,7 +194,687 @@ async fn pool_journal_settings(pool: &SqlitePool) -> PersistenceResult<(String, 
     Ok((journal_mode, synchronous))
 }
 
+/// Check every sandbox write under the same write transaction as the mutation.
+/// A stale full-object writer must not restore a held provider attachment.
+/// Callers box this bounded check so its transaction-local state does not enlarge
+/// every existing lifecycle writer's future.
+async fn check_provider_detach_holds(
+    connection: &mut SqliteConnection,
+    id: &str,
+    name: &str,
+    workspace: &str,
+    payload: &[u8],
+) -> PersistenceResult<()> {
+    use crate::storage_proto::StoredProviderDetachHoldV1;
+    use prost::Message;
+    // CAS writes address the existing row by ID, not the caller's workspace.
+    // Bind that authoritative identity inside this same write transaction before
+    // any caller-scoped hold lookup can report an empty set.
+    let actual: Option<(String, String)> =
+        sqlx::query_as("SELECT name,workspace FROM objects WHERE object_type='sandbox' AND id=?")
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM objects WHERE object_type='sandbox' AND workspace=? AND name=?",
+    )
+    .bind(workspace)
+    .bind(name)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|e| map_db_error(&e))?;
+    let mut ids = vec![id.to_string()];
+    if let Some((existing_id,)) = existing
+        && existing_id != id
+    {
+        ids.push(existing_id);
+    }
+    let mut holds = Vec::new();
+    for sandbox_id in ids {
+        let prefix = format!("{sandbox_id}:");
+        let rows: Vec<(String, String, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT id,name,payload,resource_version FROM objects WHERE object_type=? AND substr(name,1,?)=? LIMIT 33")
+            .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE)
+            .bind(i64::try_from(prefix.len()).unwrap_or(i64::MAX)).bind(prefix)
+            .fetch_all(&mut *connection).await.map_err(|e| map_db_error(&e))?;
+        if rows.len() > 32 {
+            return Err(PersistenceError::Config("provider hold capacity".into()));
+        }
+        for (hold_id, hold_name, bytes, resource_version) in rows {
+            let hold = StoredProviderDetachHoldV1::decode(bytes.as_slice())
+                .map_err(|_| PersistenceError::Decode("invalid provider hold".into()))?;
+            let action = hold.original_action.as_ref().ok_or_else(|| {
+                PersistenceError::Config("provider hold original action absent".into())
+            })?;
+            let target = action.target.as_ref().ok_or_else(|| {
+                PersistenceError::Config("provider hold original target absent".into())
+            })?;
+            let receipt = hold.original_receipt.as_ref().ok_or_else(|| {
+                PersistenceError::Config("provider hold original receipt absent".into())
+            })?;
+            crate::grpc::validate_provider_detach_original_action(action).map_err(|_| {
+                PersistenceError::Config("provider hold original intent invalid".into())
+            })?;
+            if hold.schema_version != 1
+                || receipt.hold_id != hold.hold_id
+                || receipt.native_receipt_id != hold.native_receipt_id
+                || receipt.action_id != action.action_id
+                || receipt.intent_sha256 != action.intent_sha256
+                || receipt.target_sha256 != action.target_sha256
+                || receipt.target != action.target
+                || receipt.before_attachment_epoch != target.attachment_epoch
+                || receipt.after_attachment_epoch.is_empty()
+                || receipt.after_attachment_epoch == receipt.before_attachment_epoch
+                || hold.hold_id.is_empty()
+                || hold.hold_id != hold_id
+                || hold.generation == 0
+                || resource_version <= 0
+                || hold.native_receipt_id.is_empty()
+                || action.schema_version != 1
+                || action.action_id != hold.action_id
+                || action.target_sha256 != hold.target_sha256
+                || action.profile_id.is_empty()
+                || action.event_id.is_empty()
+                || action.intent_sha256.len() != 64
+                || !action
+                    .intent_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || target.sandbox_id != hold.sandbox_id
+                || target.workspace != hold.workspace
+                || target.provider != hold.provider
+                || target.provider_id != hold.provider_id
+                || target.sandbox != name
+                || crate::grpc::provider_detach_target_digest(target)
+                    .ok()
+                    .as_deref()
+                    != Some(hold.target_sha256.as_str())
+                || hold.sandbox_id != sandbox_id
+                || hold.workspace != workspace
+                || hold.provider.is_empty()
+                || hold.provider_id.is_empty()
+                || hold.action_id.is_empty()
+                || hold.target_sha256.len() != 64
+                || !hold
+                    .target_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || hold_name != format!("{}:{}", hold.sandbox_id, hold.provider)
+            {
+                return Err(PersistenceError::Config(
+                    "invalid provider hold binding".into(),
+                ));
+            }
+            holds.push(hold);
+        }
+    }
+    if holds.is_empty() {
+        return Ok(());
+    }
+    if let Some((actual_name, actual_workspace)) = actual
+        && (actual_name != name || actual_workspace != workspace)
+    {
+        return Err(PersistenceError::Config(
+            "sandbox row identity mismatch".into(),
+        ));
+    }
+    let sandbox = Sandbox::decode(payload)
+        .map_err(|_| PersistenceError::Decode("held sandbox payload invalid".into()))?;
+    let meta = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| PersistenceError::Config("held sandbox metadata absent".into()))?;
+    for hold in holds {
+        if meta.id != hold.sandbox_id
+            || meta.name != name
+            || meta.workspace != workspace
+            || id != hold.sandbox_id
+        {
+            return Err(PersistenceError::Config(
+                "held sandbox identity changed".into(),
+            ));
+        }
+        if sandbox
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.providers.iter().any(|p| p == &hold.provider))
+        {
+            return Err(PersistenceError::Config("provider attachment held".into()));
+        }
+    }
+    Ok(())
+}
+
+// Includes raw payload identity because legacy put does not increment RV. The
+// bounded, conservative fence spans every DB-backed config dependency; external
+// catalog sources are unsupported at the RPC boundary. Hashes never leave the
+// native plan and raw payloads are neither retained nor logged.
+async fn provider_detach_fence_on(
+    connection: &mut SqliteConnection,
+) -> PersistenceResult<super::ProviderDetachFence> {
+    use futures::TryStreamExt;
+    use sha2::{Digest, Sha256};
+    let mut rows = sqlx::query("SELECT object_type,id,name,scope,version,status,CASE WHEN length(payload)<=16777216 THEN payload ELSE NULL END AS payload,workspace,labels,resource_version,created_at_ms,updated_at_ms FROM objects WHERE object_type IN ('sandbox','provider','sandbox_policy','gateway_settings','sandbox_settings','provider_profile') ORDER BY object_type,id LIMIT 4097")
+        .fetch(&mut *connection);
+    let mut count = 0usize;
+    let mut hash = Sha256::new();
+    hash.update(b"openshell.provider-detach.internal-db-fence/v1\n");
+    let mut total = 0usize;
+    while let Some(row) = rows.try_next().await.map_err(|e| map_db_error(&e))? {
+        count += 1;
+        if count > 4096 {
+            return Err(PersistenceError::Config(
+                "provider detach dependency capacity".into(),
+            ));
+        }
+        for field in [
+            "object_type",
+            "id",
+            "name",
+            "scope",
+            "status",
+            "workspace",
+            "labels",
+        ] {
+            let value: Option<String> = row.try_get(field).map_err(|e| map_db_error(&e))?;
+            hash.update([u8::from(value.is_some())]);
+            let bytes = value.as_deref().unwrap_or("").as_bytes();
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        for field in [
+            "version",
+            "resource_version",
+            "created_at_ms",
+            "updated_at_ms",
+        ] {
+            let value: Option<i64> = row.try_get(field).map_err(|e| map_db_error(&e))?;
+            hash.update([u8::from(value.is_some())]);
+            hash.update(value.unwrap_or(0).to_be_bytes());
+        }
+        let bytes: Option<Vec<u8>> = row.try_get("payload").map_err(|e| map_db_error(&e))?;
+        let bytes = bytes.ok_or_else(|| {
+            PersistenceError::Config("provider detach dependency capacity".into())
+        })?;
+        total = total.checked_add(bytes.len()).ok_or_else(|| {
+            PersistenceError::Config("provider detach dependency capacity".into())
+        })?;
+        if total > 16 * 1024 * 1024 {
+            return Err(PersistenceError::Config(
+                "provider detach dependency capacity".into(),
+            ));
+        }
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(&bytes);
+    }
+    Ok(super::ProviderDetachFence(hash.finalize().into()))
+}
+
+async fn recover_provider_detach_on(
+    connection: &mut SqliteConnection,
+    action: &openshell_core::proto::ProviderDetachActionV1,
+) -> PersistenceResult<Option<openshell_core::proto::ProviderDetachOutcomeV1>> {
+    use crate::storage_proto::StoredProviderDetachActionV1;
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT payload FROM objects WHERE object_type=? AND id=?")
+            .bind(super::PROVIDER_DETACH_ACTION_OBJECT_TYPE)
+            .bind(&action.action_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+    let Some((bytes,)) = row else {
+        // Active holds pin original effect metadata beyond outcome retention.
+        // This is historical readback of the EXACT original action, never a
+        // lookup of a replacement Sandbox/provider or authorization to retry.
+        let target = action
+            .target
+            .as_ref()
+            .ok_or_else(|| PersistenceError::Config("provider detach target absent".into()))?;
+        let hold:Option<(String,Vec<u8>,i64)>=sqlx::query_as("SELECT id,payload,resource_version FROM objects WHERE object_type=? AND workspace=? AND name=?")
+            .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(&target.workspace).bind(format!("{}:{}",target.sandbox_id,target.provider))
+            .fetch_optional(&mut *connection).await.map_err(|e| map_db_error(&e))?;
+        let Some((id, payload, rv)) = hold else {
+            return Ok(None);
+        };
+        let hold = crate::storage_proto::StoredProviderDetachHoldV1::decode(payload.as_slice())
+            .map_err(|_| {
+                PersistenceError::Decode("provider detach retained hold invalid".into())
+            })?;
+        if hold.original_action.as_ref() != Some(action) {
+            return Ok(None);
+        }
+        let receipt = hold.original_receipt.ok_or_else(|| {
+            PersistenceError::Decode("provider detach retained receipt absent".into())
+        })?;
+        let canonical_uuid =
+            |v: &str| uuid::Uuid::parse_str(v).is_ok_and(|u| !u.is_nil() && u.to_string() == v);
+        let original_epoch = target.attachment_epoch.as_str();
+        if hold.schema_version != 1
+            || hold.generation == 0
+            || rv <= 0
+            || hold.hold_id != id
+            || !canonical_uuid(&id)
+            || hold.action_id != action.action_id
+            || hold.target_sha256 != action.target_sha256
+            || hold.sandbox_id != target.sandbox_id
+            || hold.workspace != target.workspace
+            || hold.provider != target.provider
+            || hold.provider_id != target.provider_id
+            || receipt.hold_id != id
+            || receipt.native_receipt_id != hold.native_receipt_id
+            || !canonical_uuid(&receipt.native_receipt_id)
+            || receipt.action_id != action.action_id
+            || receipt.intent_sha256 != action.intent_sha256
+            || receipt.target_sha256 != action.target_sha256
+            || receipt.target != action.target
+            || receipt.before_attachment_epoch != original_epoch
+            || receipt.after_attachment_epoch == target.attachment_epoch
+            || !canonical_uuid(&receipt.after_attachment_epoch)
+        {
+            return Err(PersistenceError::Decode(
+                "provider detach retained hold binding invalid".into(),
+            ));
+        }
+        return Ok(Some(openshell_core::proto::ProviderDetachOutcomeV1 {
+            state: "applied".into(),
+            receipt: Some(receipt),
+        }));
+    };
+
+    let stored = StoredProviderDetachActionV1::decode(bytes.as_slice())
+        .map_err(|_| PersistenceError::Decode("provider detach outcome invalid".into()))?;
+    if stored.schema_version != 1 || stored.original_action.as_ref() != Some(action) {
+        return Err(PersistenceError::Config(
+            "provider detach original action conflict".into(),
+        ));
+    }
+    let outcome = stored
+        .outcome
+        .ok_or_else(|| PersistenceError::Decode("provider detach outcome absent".into()))?;
+    if (outcome.state == "applied"
+        && outcome.receipt.as_ref().is_some_and(|r| {
+            r.action_id == action.action_id
+                && r.intent_sha256 == action.intent_sha256
+                && r.target_sha256 == action.target_sha256
+                && r.target == action.target
+                && !r.hold_id.is_empty()
+                && !r.native_receipt_id.is_empty()
+        }))
+        || (outcome.state == "rejected_no_effect" && outcome.receipt.is_none())
+    {
+        Ok(Some(outcome))
+    } else {
+        Err(PersistenceError::Decode(
+            "provider detach outcome binding invalid".into(),
+        ))
+    }
+}
+
 impl SqliteStore {
+    pub(crate) async fn reject_provider_detach(
+        &self,
+        action: &openshell_core::proto::ProviderDetachActionV1,
+    ) -> PersistenceResult<openshell_core::proto::ProviderDetachOutcomeV1> {
+        use tracing::instrument::WithSubscriber;
+        async {
+            crate::grpc::validate_provider_detach_original_action(action).map_err(|_| PersistenceError::Config("provider detach action invalid".into()))?;
+            let mut tx=self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e|map_db_error(&e))?;
+            if let Some(original)=recover_provider_detach_on(&mut tx,action).await? {return Ok(original)}
+            let outcome=openshell_core::proto::ProviderDetachOutcomeV1{state:"rejected_no_effect".into(),receipt:None};
+            let now=current_time_ms();
+            let stored=crate::storage_proto::StoredProviderDetachActionV1{schema_version:1,original_action:Some(action.clone()),outcome:Some(outcome.clone()),recorded_time:openshell_core::time::timestamp_from_millis(now).ok()};
+            sqlx::query("INSERT INTO objects(object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?)")
+                .bind(super::PROVIDER_DETACH_ACTION_OBJECT_TYPE).bind(&action.action_id).bind(&action.action_id)
+                .bind(&action.target.as_ref().ok_or_else(||PersistenceError::Config("provider detach target absent".into()))?.workspace)
+                .bind(stored.encode_to_vec()).bind(now).bind(now).execute(&mut *tx).await.map_err(|e|map_db_error(&e))?;
+            tx.commit().await.map_err(|e|map_db_error(&e))?;
+            Ok(outcome)
+        }.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
+    }
+
+    pub(crate) async fn provider_detach_fence(
+        &self,
+    ) -> PersistenceResult<super::ProviderDetachFence> {
+        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        provider_detach_fence_on(&mut connection).await
+    }
+
+    pub(crate) async fn recover_provider_detach(
+        &self,
+        action: &openshell_core::proto::ProviderDetachActionV1,
+    ) -> PersistenceResult<Option<openshell_core::proto::ProviderDetachOutcomeV1>> {
+        crate::grpc::validate_provider_detach_original_action(action)
+            .map_err(|_| PersistenceError::Config("provider detach action invalid".into()))?;
+        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        recover_provider_detach_on(&mut connection, action).await
+    }
+
+    /// One commit contains membership removal, persistent hold and original
+    /// historical outcome. A lost commit ACK is read back, never replayed by RPC.
+    /// This is not a standalone authorization boundary: no RPC calls it until
+    /// lifecycle ownership, grant and complete effective-config checks are wired.
+    pub(crate) async fn commit_provider_detach(
+        &self,
+        plan: &super::ProviderDetachCommit,
+    ) -> PersistenceResult<openshell_core::proto::ProviderDetachOutcomeV1> {
+        // Keep outer Store/RPC spans intact. SQLx transaction worker spans
+        // otherwise retain registry IDs across dispatchers, reproduced by the
+        // existing compute parent-span regression; isolate internal SQL spans.
+        use tracing::instrument::WithSubscriber;
+        async {
+        use crate::storage_proto::{StoredProviderDetachActionV1, StoredProviderDetachHoldV1};
+        use openshell_core::proto::{ProviderDetachOutcomeV1, SandboxPhase};
+        use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
+        let action = &plan.action;
+        crate::grpc::validate_provider_detach_original_action(action)
+            .map_err(|_| PersistenceError::Config("provider detach action invalid".into()))?;
+        let target = action
+            .target
+            .as_ref()
+            .ok_or_else(|| PersistenceError::Config("provider detach target absent".into()))?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        if let Some(original) = recover_provider_detach_on(&mut tx, action).await? {
+            return Ok(original);
+        }
+        let receipt = &plan.receipt;
+        let uuid_valid =
+            |v: &str| uuid::Uuid::parse_str(v).is_ok_and(|id| !id.is_nil() && id.to_string() == v);
+        let original_epoch = target.attachment_epoch.as_str();
+    if receipt.action_id != action.action_id
+            || receipt.intent_sha256 != action.intent_sha256
+            || receipt.target_sha256 != action.target_sha256
+            || receipt.target != action.target
+            || receipt.before_attachment_epoch != original_epoch
+            || receipt.after_attachment_epoch == target.attachment_epoch
+            || !uuid_valid(&receipt.after_attachment_epoch)
+            || !uuid_valid(&receipt.hold_id)
+            || !uuid_valid(&receipt.native_receipt_id)
+            || receipt.config_revision == 0
+            || receipt.provider_env_revision == 0
+            || receipt.configuration_instance.is_empty()
+            || receipt.native_policy_version == 0
+            || receipt.native_policy_hash.len() != 64
+            || !receipt
+                .native_policy_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || receipt
+                .recorded_time
+                .as_ref()
+                .is_none_or(|t| t.seconds <= 0 || !(0..1_000_000_000).contains(&t.nanos))
+        {
+            return Err(PersistenceError::Config(
+                "provider detach receipt invalid".into(),
+            ));
+        }
+        let current: Option<(Vec<u8>, i64)> = sqlx::query_as("SELECT payload,resource_version FROM objects WHERE object_type='sandbox' AND id=? AND workspace=? AND name=?")
+            .bind(&target.sandbox_id).bind(&target.workspace).bind(&target.sandbox)
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let provider: Option<(String,i64)> = sqlx::query_as("SELECT id,resource_version FROM objects WHERE object_type='provider' AND workspace=? AND name=?")
+            .bind(&target.workspace).bind(&target.provider).fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let existing_provider_hold_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM objects WHERE object_type=? AND workspace=? AND name=?",
+        )
+        .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE)
+        .bind(&target.workspace)
+        .bind(format!("{}:{}", target.sandbox_id, target.provider))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        let hold_prefix = format!("{}:",target.sandbox_id);
+        let prefix_len = i64::try_from(hold_prefix.len()).map_err(|_| PersistenceError::Config("provider hold prefix unsupported".into()))?;
+        let hold_count:i64=sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type=? AND workspace=? AND substr(name,1,?)=?")
+            .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(&target.workspace).bind(prefix_len).bind(&hold_prefix)
+            .fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let mut candidate = current.as_ref().and_then(|(b, rv)| {
+            Sandbox::decode(b.as_slice()).ok().and_then(|mut sandbox| {
+                sandbox.set_resource_version(u64::try_from(*rv).ok()?);
+                Some(sandbox)
+            })
+        });
+        let matches = provider_detach_fence_on(&mut tx).await? == plan.fence
+            && existing_provider_hold_count == 0
+            && hold_count < 32
+            && provider.as_ref().is_some_and(|(id, rv)| {
+                id == &target.provider_id
+                    && u64::try_from(*rv).ok() == Some(target.provider_resource_version)
+            })
+            && candidate.as_ref().is_some_and(|s| {
+                s.object_id() == target.sandbox_id
+                    && s.object_name() == target.sandbox
+                    && s.object_workspace() == target.workspace
+                    && s.get_resource_version() == target.sandbox_resource_version
+                    && s.phase() == SandboxPhase::Ready as i32
+                    && crate::auth::sandbox_session::sandbox_execution_id(s)
+                        .ok()
+                        .as_deref()
+                        == Some(target.execution_id.as_str())
+                    && s.spec.as_ref().is_some_and(|spec| {
+                        spec.provider_attachment_epoch == target.attachment_epoch
+                            && spec
+                                .providers
+                                .iter()
+                                .filter(|p| *p == &target.provider)
+                                .count()
+                                == 1
+                    })
+            });
+        let outcome = if matches {
+            let sandbox = candidate
+                .as_mut()
+                .ok_or_else(|| PersistenceError::Config("provider detach sandbox absent".into()))?;
+            let spec = sandbox
+                .spec
+                .as_mut()
+                .ok_or_else(|| PersistenceError::Config("provider detach spec absent".into()))?;
+            spec.providers.retain(|name| name != &target.provider);
+            spec.provider_attachment_epoch
+                .clone_from(&receipt.after_attachment_epoch);
+            crate::compute::provisioning_deadline::attachments_changed(sandbox, current_time_ms());
+            let payload = sandbox.encode_to_vec();
+            Box::pin(check_provider_detach_holds(
+                &mut tx,
+                &target.sandbox_id,
+                &target.sandbox,
+                &target.workspace,
+                &payload,
+            ))
+            .await?;
+            let changed = sqlx::query("UPDATE objects SET payload=?,resource_version=resource_version+1,updated_at_ms=? WHERE object_type='sandbox' AND id=? AND resource_version=?")
+                .bind(payload).bind(current_time_ms()).bind(&target.sandbox_id).bind(i64::try_from(target.sandbox_resource_version).map_err(|_| PersistenceError::Config("sandbox RV unsupported".into()))?)
+                .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            if changed.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: None,
+                });
+            }
+            let hold = StoredProviderDetachHoldV1 {
+                schema_version: 1,
+                sandbox_id: target.sandbox_id.clone(),
+                workspace: target.workspace.clone(),
+                provider: target.provider.clone(),
+                provider_id: target.provider_id.clone(),
+                action_id: action.action_id.clone(),
+                target_sha256: action.target_sha256.clone(),
+                created_time: receipt.recorded_time,
+                hold_id: receipt.hold_id.clone(),
+                generation: 1,
+                original_action: Some(action.clone()),
+                native_receipt_id: receipt.native_receipt_id.clone(),
+                original_receipt: Some(receipt.clone()),
+            };
+            let now = current_time_ms();
+            sqlx::query("INSERT INTO objects (object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?)")
+                .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(&hold.hold_id).bind(format!("{}:{}",target.sandbox_id,target.provider)).bind(&target.workspace).bind(hold.encode_to_vec()).bind(now).bind(now)
+                .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            ProviderDetachOutcomeV1 {
+                state: "applied".into(),
+                receipt: Some(receipt.clone()),
+            }
+        } else {
+            ProviderDetachOutcomeV1 {
+                state: "rejected_no_effect".into(),
+                receipt: None,
+            }
+        };
+        let stored = StoredProviderDetachActionV1 {
+            schema_version: 1,
+            original_action: Some(action.clone()),
+            outcome: Some(outcome.clone()),
+            recorded_time: receipt.recorded_time,
+        };
+        let now = current_time_ms();
+        sqlx::query("INSERT INTO objects (object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?)")
+            .bind(super::PROVIDER_DETACH_ACTION_OBJECT_TYPE).bind(&action.action_id).bind(&action.action_id).bind(&target.workspace).bind(stored.encode_to_vec()).bind(now).bind(now)
+            .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(outcome)
+        }.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
+    }
+
+    // Internal v1 creation preserves one immutable current hold. Exact replay
+    // keeps its original row/version; a conflicting name OR ID never overwrites
+    // provenance. Future authorized transitions need a separate reviewed CAS API.
+    async fn put_provider_detach_hold(
+        &self,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+    ) -> PersistenceResult<()> {
+        // Keep outer Store/RPC spans intact. SQLx transaction worker spans
+        // otherwise retain registry IDs across dispatchers, reproduced by the
+        // existing compute parent-span regression; isolate internal SQL spans.
+        use tracing::instrument::WithSubscriber;
+        async {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let rows: Vec<(String, String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id,name,workspace,payload FROM objects WHERE object_type=? AND (id=? OR (workspace=? AND name=?))")
+            .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(id).bind(workspace).bind(name)
+            .fetch_all(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        if rows.is_empty() {
+            let now = current_time_ms();
+            sqlx::query("INSERT INTO objects (object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?)")
+                .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(id).bind(name).bind(workspace)
+                .bind(payload).bind(now).bind(now).execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        } else if rows.len() != 1
+            || rows[0]
+                != (
+                    id.to_string(),
+                    name.to_string(),
+                    workspace.to_string(),
+                    payload.to_vec(),
+                )
+        {
+            return Err(PersistenceError::Config(
+                "provider hold immutable generation conflict".into(),
+            ));
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(())
+        }.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_held_sandbox(
+        &self,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: Option<&str>,
+        payload: &[u8],
+        labels: Option<&str>,
+        condition: WriteCondition,
+        increment: bool,
+    ) -> PersistenceResult<WriteResult> {
+        // Keep outer Store/RPC spans intact. SQLx transaction worker spans
+        // otherwise retain registry IDs across dispatchers, reproduced by the
+        // existing compute parent-span regression; isolate internal SQL spans.
+        use tracing::instrument::WithSubscriber;
+        async {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Box::pin(check_provider_detach_holds(&mut tx, id, name, workspace, payload)).await?;
+        let now_ms = current_time_ms();
+        let lookup_by_id = matches!(condition, WriteCondition::MatchResourceVersion(_));
+        match condition {
+            WriteCondition::MatchResourceVersion(expected) => {
+                let expected = i64::try_from(expected).map_err(|_| PersistenceError::Conflict {
+                    current_resource_version: None,
+                })?;
+                let changed = sqlx::query("UPDATE objects SET payload=?,labels=?,updated_at_ms=?,resource_version=resource_version+1 WHERE object_type='sandbox' AND id=? AND resource_version=?")
+                    .bind(payload).bind(labels.unwrap_or("{}")).bind(now_ms).bind(id).bind(expected)
+                    .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+                if changed.rows_affected() != 1 {
+                    let current: Option<(i64, Vec<u8>, String, String)> = sqlx::query_as(
+                        "SELECT resource_version,payload,name,workspace FROM objects WHERE object_type='sandbox' AND id=?",
+                    )
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    // Preserve the pre-existing CAS contract: a concurrent write
+                    // simulated by an UPDATE trigger must survive this conflict,
+                    // otherwise its marker/RV rolls back and retries never make
+                    // progress. Recheck the actual resulting payload before
+                    // committing; a trigger cannot restore an active hold.
+                    if let Some((_, bytes, current_name, current_workspace)) = &current {
+                        Box::pin(check_provider_detach_holds(
+                            &mut tx,
+                            id,
+                            current_name,
+                            current_workspace,
+                            bytes,
+                        ))
+                        .await?;
+                    }
+                    let version = current.and_then(|(v, _, _, _)| u64::try_from(v).ok());
+                    tx.commit().await.map_err(|e| map_db_error(&e))?;
+                    return Err(PersistenceError::Conflict {
+                        current_resource_version: version,
+                    });
+                }
+            }
+            WriteCondition::MustCreate => {
+                sqlx::query("INSERT INTO objects(object_type,id,name,workspace,scope,payload,created_at_ms,updated_at_ms,labels,resource_version) VALUES('sandbox',?,?,?,?,?,?,?,?,1)")
+                    .bind(id).bind(name).bind(workspace).bind(scope).bind(payload).bind(now_ms).bind(now_ms).bind(labels.unwrap_or("{}"))
+                    .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            }
+            WriteCondition::Unconditional => {
+                sqlx::query("INSERT INTO objects(object_type,id,name,workspace,scope,payload,created_at_ms,updated_at_ms,labels,resource_version) VALUES('sandbox',?,?,?,?,?,?,?,?,1) ON CONFLICT(object_type,workspace,name) WHERE name IS NOT NULL DO UPDATE SET scope=COALESCE(excluded.scope,objects.scope),payload=excluded.payload,updated_at_ms=excluded.updated_at_ms,labels=excluded.labels,resource_version=objects.resource_version+?")
+                    .bind(id).bind(name).bind(workspace).bind(scope).bind(payload).bind(now_ms).bind(now_ms).bind(labels.unwrap_or("{}")).bind(i64::from(increment))
+                    .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            }
+        }
+        let result: (i64, i64, i64) = if lookup_by_id {
+            sqlx::query_as("SELECT resource_version,created_at_ms,updated_at_ms FROM objects WHERE object_type='sandbox' AND id=?")
+                .bind(id).fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?
+        } else {
+            sqlx::query_as("SELECT resource_version,created_at_ms,updated_at_ms FROM objects WHERE object_type='sandbox' AND workspace=? AND name=?")
+                .bind(workspace).bind(name).fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?
+        };
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(WriteResult {
+            resource_version: u64::try_from(result.0)
+                .map_err(|_| PersistenceError::Decode("invalid sandbox version".into()))?,
+            created_at_ms: result.1,
+            updated_at_ms: result.2,
+        })
+        }.with_subscriber(tracing::subscriber::NoSubscriber::default()).await
+    }
+
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {
@@ -344,6 +1024,23 @@ impl SqliteStore {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Box::pin(self.put_provider_detach_hold(id, name, workspace, payload)).await;
+        }
+        if object_type == "sandbox" {
+            Box::pin(self.put_held_sandbox(
+                id,
+                name,
+                workspace,
+                None,
+                payload,
+                labels,
+                WriteCondition::Unconditional,
+                false,
+            ))
+            .await?;
+            return Ok(());
+        }
         let now_ms = current_time_ms();
 
         sqlx::query(
@@ -384,6 +1081,24 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
+        if object_type == "sandbox" {
+            return Box::pin(self.put_held_sandbox(
+                id,
+                name,
+                workspace,
+                None,
+                payload,
+                labels,
+                WriteCondition::MustCreate,
+                true,
+            ))
+            .await;
+        }
         insert_new_object(
             &self.relaxed_pool,
             object_type,
@@ -407,6 +1122,17 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
+        if object_type == "sandbox" {
+            return Box::pin(
+                self.put_held_sandbox(id, name, workspace, None, payload, labels, condition, true),
+            )
+            .await;
+        }
         let now_ms = current_time_ms();
 
         match condition {
@@ -512,6 +1238,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -550,6 +1281,25 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
+        if object_type == "sandbox" {
+            Box::pin(self.put_held_sandbox(
+                id,
+                name,
+                workspace,
+                Some(scope),
+                payload,
+                labels,
+                WriteCondition::Unconditional,
+                true,
+            ))
+            .await?;
+            return Ok(());
+        }
         let now_ms = current_time_ms();
 
         sqlx::query(
@@ -589,6 +1339,24 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
+        if object_type == "sandbox" {
+            return Box::pin(self.put_held_sandbox(
+                id,
+                name,
+                workspace,
+                Some(scope),
+                payload,
+                labels,
+                WriteCondition::MustCreate,
+                true,
+            ))
+            .await;
+        }
         let now_ms = current_time_ms();
 
         sqlx::query(
@@ -627,12 +1395,24 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
         labels: Option<&str>,
         max_count: u64,
     ) -> PersistenceResult<Option<WriteResult>> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let now_ms = current_time_ms();
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| map_db_error(&e))?;
+
+        if object_type == "sandbox" {
+            Box::pin(check_provider_detach_holds(
+                &mut tx, id, name, workspace, payload,
+            ))
+            .await?;
+        }
 
         let row: (i64,) = sqlx::query_as(
             r#"
@@ -722,6 +1502,11 @@ WHERE "object_type" = ?1 AND "workspace" = ?2 AND "name" = ?3
     }
 
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -737,6 +1522,11 @@ WHERE "object_type" = ?1 AND "id" = ?2
     }
 
     pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let mut deleted = 0_u64;
         for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
             let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM objects WHERE object_type = ");
@@ -781,6 +1571,11 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -796,6 +1591,11 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
     }
 
     pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -816,6 +1616,11 @@ WHERE "object_type" = ?1 AND "scope" = ?2
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<bool> {
+        if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider hold requires immutable native creation".into(),
+            ));
+        }
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"
@@ -1306,6 +2111,18 @@ WHERE "object_type" = 'sandbox' AND "id" = ?1
         let current_version = current_version.max(1).cast_unsigned();
         let mut sandbox =
             project_policy_revision_onto_sandbox(write, &sandbox_payload, current_version)?;
+        let meta = sandbox
+            .metadata
+            .as_ref()
+            .ok_or_else(|| PersistenceError::Config("sandbox metadata absent".into()))?;
+        Box::pin(check_provider_detach_holds(
+            &mut tx,
+            &write.sandbox_id,
+            &meta.name,
+            &write.workspace,
+            &sandbox.encode_to_vec(),
+        ))
+        .await?;
 
         let result = sqlx::query(
             r#"

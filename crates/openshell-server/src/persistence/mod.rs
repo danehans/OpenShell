@@ -25,6 +25,23 @@ pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
 /// Object type string for draft policy chunk records.
 pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 
+/// Native holds are not response records and never expire with response retention.
+pub const PROVIDER_DETACH_HOLD_OBJECT_TYPE: &str = "provider_detach_hold_v1";
+pub const PROVIDER_DETACH_ACTION_OBJECT_TYPE: &str = "provider_detach_action_v1";
+
+/// Internal transaction fence; never a grant, public hash or retained workload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderDetachFence(pub(super) [u8; 32]);
+
+/// Prepared metadata from the existing effective-config loader. The native RPC
+/// must acquire lifecycle ownership and bracket both projections with one fence.
+/// This plan alone confers no authority and cannot be submitted over the wire.
+pub struct ProviderDetachCommit {
+    pub action: openshell_core::proto::ProviderDetachActionV1,
+    pub fence: ProviderDetachFence,
+    pub receipt: openshell_core::proto::ProviderDetachReceiptV1,
+}
+
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
 /// Maximum number of object ids sent in one set-based delete statement.
@@ -276,6 +293,51 @@ macro_rules! store_dispatch_traced {
 }
 
 impl Store {
+    pub(crate) async fn reject_provider_detach(
+        &self,
+        action: &openshell_core::proto::ProviderDetachActionV1,
+    ) -> PersistenceResult<openshell_core::proto::ProviderDetachOutcomeV1> {
+        match self {
+            Self::Sqlite(store) => store.reject_provider_detach(action).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn provider_detach_fence(&self) -> PersistenceResult<ProviderDetachFence> {
+        match self {
+            Self::Sqlite(store) => store.provider_detach_fence().await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn commit_provider_detach(
+        &self,
+        plan: &ProviderDetachCommit,
+    ) -> PersistenceResult<openshell_core::proto::ProviderDetachOutcomeV1> {
+        match self {
+            Self::Sqlite(store) => store.commit_provider_detach(plan).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn recover_provider_detach(
+        &self,
+        action: &openshell_core::proto::ProviderDetachActionV1,
+    ) -> PersistenceResult<Option<openshell_core::proto::ProviderDetachOutcomeV1>> {
+        match self {
+            Self::Sqlite(store) => store.recover_provider_detach(action).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
     /// Returns `true` for single-replica backends (`SQLite`) where no lease
     /// coordination is needed, `false` for multi-replica backends (`Postgres`).
     pub fn is_single_replica(&self) -> bool {

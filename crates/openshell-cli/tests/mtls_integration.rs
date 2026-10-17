@@ -32,6 +32,42 @@ struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn conditional_detach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ConditionalDetachSandboxProviderRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "optional provider detach capability",
+        ))
+    }
+
+    async fn arm_provider_detach_attempt(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ArmProviderDetachAttemptRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::ArmProviderDetachAttemptResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "optional provider detach capability",
+        ))
+    }
+
+    async fn get_conditional_provider_detach_state(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetConditionalProviderDetachStateRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "optional provider detach capability",
+        ))
+    }
+
     async fn hold_sandbox_admission(
         &self,
         _request: tonic::Request<openshell_core::proto::HoldSandboxAdmissionRequest>,

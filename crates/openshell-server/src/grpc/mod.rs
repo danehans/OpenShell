@@ -8,6 +8,16 @@ mod auth_rpc;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
+pub mod provider_detach;
+#[cfg(test)]
+pub use provider_detach::{
+    action_id_for_digest as provider_detach_action_id_for_digest,
+    original_intent_digest as provider_detach_original_intent_digest,
+};
+pub use provider_detach::{
+    target_digest as provider_detach_target_digest,
+    validate_original_action as validate_provider_detach_original_action,
+};
 pub mod provider_readiness;
 mod sandbox;
 pub use sandbox::mint_persisted_authentication;
@@ -380,6 +390,29 @@ impl OpenShell for OpenShellService {
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn conditional_detach_sandbox_provider(
+        &self,
+        request: Request<openshell_core::proto::ConditionalDetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>, Status>
+    {
+        provider_detach::conditional_detach(&self.state, request).await
+    }
+
+    async fn arm_provider_detach_attempt(
+        &self,
+        request: Request<openshell_core::proto::ArmProviderDetachAttemptRequest>,
+    ) -> Result<Response<openshell_core::proto::ArmProviderDetachAttemptResponse>, Status> {
+        provider_detach::arm_attempt(&self.state, request).await
+    }
+
+    async fn get_conditional_provider_detach_state(
+        &self,
+        request: Request<openshell_core::proto::GetConditionalProviderDetachStateRequest>,
+    ) -> Result<Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>, Status>
+    {
+        provider_detach::read_state(&self.state, request).await
     }
 
     async fn detach_sandbox_provider(

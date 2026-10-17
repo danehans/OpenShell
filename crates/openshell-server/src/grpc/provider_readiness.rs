@@ -47,6 +47,21 @@ impl ProviderReadinessEvidence {
         !active_instance_id.is_empty() && self.network_instance_id == active_instance_id
     }
 
+    pub(crate) fn provider_detach_snapshot(
+        &self,
+    ) -> Option<(String, ProviderReadinessObservation, prost_types::Timestamp)> {
+        if !self.supported
+            || self.last_seen.elapsed() > Duration::from_secs(u64::from(OBSERVATION_TTL_SECONDS))
+        {
+            return None;
+        }
+        Some((
+            self.network_instance_id.clone(),
+            self.observation.clone()?,
+            self.observed_time?,
+        ))
+    }
+
     /// Capture capability and instance identity from the authenticated hello.
     pub(crate) fn from_hello(hello: &SupervisorHello) -> Result<Self, Status> {
         if hello.supports_provider_readiness {
@@ -73,6 +88,26 @@ impl ProviderReadinessEvidence {
             return Err(Status::failed_precondition(
                 "supervisor did not advertise provider readiness support",
             ));
+        }
+        if let Some(meta) = observation.provider_detach.as_ref() {
+            if prost::Message::encoded_len(meta) > 4096 || !(0..=4).contains(&meta.result) {
+                return Err(Status::invalid_argument(
+                    "provider attempt report exceeds closed bounds",
+                ));
+            }
+            if !meta.supported
+                && *meta != openshell_core::proto::ProviderDetachSupervisorReportV1::default()
+            {
+                return Err(Status::invalid_argument(
+                    "unsupported attempt report carries metadata",
+                ));
+            }
+            if !meta.gateway_boot_id.is_empty() {
+                canonical_uuid(&meta.gateway_boot_id)?;
+            }
+            if !meta.attempt_id.is_empty() {
+                canonical_uuid(&meta.attempt_id)?;
+            }
         }
         if observation.sequence == 0 {
             return Err(Status::invalid_argument("report sequence is required"));
@@ -662,13 +697,23 @@ async fn handle_report_provider_readiness_inner(
         .as_ref()
         .map_or("", |status| status.main_process_instance_id.as_str());
     let accepted_sequence = observation.sequence;
+    let provider_detach_session = observation.session_id.clone();
     state.supervisor_sessions.accept_provider_readiness(
         &sandbox_id,
         active_instance_id,
         observation,
     )?;
+    let (provider_detach_gateway_boot_id, provider_detach_pending, provider_detach_installed) =
+        state.supervisor_sessions.provider_detach_report_reply(
+            &sandbox_id,
+            &provider_detach_session,
+            active_instance_id,
+        )?;
     Ok(Response::new(ReportProviderReadinessResponse {
         accepted_sequence,
+        provider_detach_gateway_boot_id,
+        provider_detach_pending,
+        provider_detach_installed,
         report_interval: Some(
             openshell_core::time::duration_from_std(Duration::from_secs(u64::from(
                 REPORT_INTERVAL_SECONDS,

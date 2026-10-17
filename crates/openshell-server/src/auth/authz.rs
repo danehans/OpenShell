@@ -142,10 +142,112 @@ impl AuthzPolicy {
     }
 }
 
+/// Additional grant check for the optional exact-provider-detach surface.
+/// Authentication/descriptor/workspace authorization still run independently.
+/// This deliberately refuses broad ordinary-worker credentials, even when they
+/// could administer other sandbox methods. The issuer-attested resource digest
+/// excludes mutable RV/configuration; it is not the full action target digest.
+#[allow(clippy::result_large_err)]
+pub fn check_provider_detach_grant(
+    identity: &Identity,
+    scope_enforcement: bool,
+    write: bool,
+    resource_sha256: &str,
+) -> Result<(), Status> {
+    let digest_valid = resource_sha256.len() == 64
+        && resource_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !scope_enforcement || !digest_valid || identity.subject.is_empty() {
+        return Err(Status::permission_denied(
+            "provider detach grant unavailable",
+        ));
+    }
+    let target_scope = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method_scope = if write {
+        "sandbox:provider-detach"
+    } else {
+        "sandbox:provider-detach:read"
+    };
+    let allowed = [
+        "sandbox:provider-detach",
+        "sandbox:provider-detach:read",
+        "openid",
+        "profile",
+        "email",
+    ];
+    if !identity.scopes.iter().any(|s| s == method_scope)
+        || !identity.scopes.iter().any(|s| s == &target_scope)
+        || identity
+            .scopes
+            .iter()
+            .any(|s| s != &target_scope && !allowed.contains(&s.as_str()))
+    {
+        return Err(Status::permission_denied("provider detach grant mismatch"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::identity::IdentityProvider;
+
+    #[test]
+    fn provider_detach_grant_is_method_and_exact_target_scoped() {
+        let digest = "a".repeat(64);
+        let target = format!("sandbox:provider-detach:target:{digest}");
+        let identity = identity_with_roles_and_scopes(
+            &["openshell-user"],
+            &[
+                "sandbox:provider-detach",
+                "sandbox:provider-detach:read",
+                &target,
+                "openid",
+            ],
+        );
+        assert!(check_provider_detach_grant(&identity, true, true, &digest).is_ok());
+        assert!(check_provider_detach_grant(&identity, true, false, &digest).is_ok());
+        assert!(check_provider_detach_grant(&identity, false, true, &digest).is_err());
+        assert!(check_provider_detach_grant(&identity, true, true, &"b".repeat(64)).is_err());
+        for invalid in ["", "A", &"A".repeat(64), &"a".repeat(63)] {
+            assert!(check_provider_detach_grant(&identity, true, true, invalid).is_err());
+        }
+        let read_only =
+            identity_with_roles_and_scopes(&[], &["sandbox:provider-detach:read", &target]);
+        assert!(check_provider_detach_grant(&read_only, true, false, &digest).is_ok());
+        assert!(check_provider_detach_grant(&read_only, true, true, &digest).is_err());
+    }
+
+    #[test]
+    fn provider_detach_rejects_broad_or_unbound_grants() {
+        let digest = "a".repeat(64);
+        let target = format!("sandbox:provider-detach:target:{digest}");
+        for extra in [
+            "openshell:all",
+            "sandbox:write",
+            "sandbox:read",
+            "provider:write",
+            "sandbox:provider-detach:target:other",
+        ] {
+            let identity =
+                identity_with_roles_and_scopes(&[], &["sandbox:provider-detach", &target, extra]);
+            assert!(check_provider_detach_grant(&identity, true, true, &digest).is_err());
+        }
+        for scopes in [
+            vec!["openshell:all"],
+            vec!["sandbox:provider-detach"],
+            vec![target.as_str()],
+            vec![],
+        ] {
+            let identity = identity_with_roles_and_scopes(&[], &scopes);
+            assert!(check_provider_detach_grant(&identity, true, true, &digest).is_err());
+        }
+        let mut identity =
+            identity_with_roles_and_scopes(&[], &["sandbox:provider-detach", &target]);
+        identity.subject.clear();
+        assert!(check_provider_detach_grant(&identity, true, true, &digest).is_err());
+    }
 
     fn default_policy() -> AuthzPolicy {
         AuthzPolicy {

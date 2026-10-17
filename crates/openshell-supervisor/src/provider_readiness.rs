@@ -202,6 +202,46 @@ impl Tracker {
         });
     }
 
+    /// Observe the installed static-provider resolver independently of any
+    /// traffic decision. This does not invent action/attempt association: the
+    /// authenticated caller must separately bind the captured subject and fresh
+    /// sequence to its original native action. Missing association stays absent.
+    #[cfg(test)]
+    pub(crate) fn provider_revocation_observation(
+        &self,
+        credentials: &ProviderCredentialState,
+        subject: &openshell_core::provider_credentials::ProviderRevocationSubject,
+        expected_epoch: &str,
+        expected_revision: u64,
+    ) -> Option<(
+        ProviderReadinessObservation,
+        openshell_core::provider_credentials::ProviderRevocationEvidence,
+    )> {
+        if expected_epoch.is_empty() || expected_revision == 0 {
+            return None;
+        }
+        let before = self.observation(credentials);
+        if before.attachment_epoch != expected_epoch
+            || before.provider_env_revision != expected_revision
+            || !before.credentials_installed
+            || !before.policy_active
+            || !before.launch_environment_installed
+        {
+            return None;
+        }
+        let installation = self.state.borrow().installation_id.clone();
+        let proof = credentials.observe_static_provider_revocation(
+            subject,
+            expected_revision,
+            &installation,
+        )?;
+        let after = self.observation(credentials);
+        if before != after {
+            return None;
+        }
+        Some((after, proof))
+    }
+
     /// Read current evidence, rechecking credential expiry and policy generation.
     pub(crate) fn observation(
         &self,
@@ -312,6 +352,7 @@ impl Tracker {
         let mut updates = tracker.state.subscribe();
         let mut active_session = None;
         let mut sequence = 0_u64;
+        let mut pending_report: Option<ProviderReadinessObservation> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -334,6 +375,7 @@ impl Tracker {
             let session = sessions.borrow_and_update().clone();
             if session != active_session {
                 sequence = 0;
+                pending_report = None;
                 active_session = session.clone();
             }
             let Some(session) = session else {
@@ -353,25 +395,109 @@ impl Tracker {
                 Ok(Ok(installed)) => tracker.process_installed(installed, &credentials),
                 _ => tracker.process_failed(),
             }
-            let Some(next_sequence) = sequence.checked_add(1) else {
-                return;
+            let Ok(now) =
+                openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+            else {
+                continue;
             };
-            sequence = next_sequence;
-            let mut observation = tracker.observation(&credentials);
-            observation.session_id.clone_from(&session);
-            observation.sequence = sequence;
+            // Lost proof-report replies retry the exact original report; a new
+            // heartbeat cannot silently reassign the event's originating seq.
+            if pending_report.as_ref().is_some_and(|old| {
+                old.provider_detach
+                    .as_ref()
+                    .is_some_and(|m| !m.attempt_id.is_empty())
+            }) {
+                let fresh = tracker.observation(&credentials);
+                let old = pending_report.as_ref().unwrap();
+                let current_meta = credentials.provider_detach_report(&session, old.sequence, &now);
+                let original_id = old.provider_detach.as_ref().map(|m| m.attempt_id.as_str());
+                let same_attempt =
+                    current_meta.as_ref().map(|m| m.attempt_id.as_str()) == original_id;
+                if !same_attempt
+                    || old.attachment_epoch != fresh.attachment_epoch
+                    || old.config_revision != fresh.config_revision
+                    || old.provider_env_revision != fresh.provider_env_revision
+                    || old.policy_hash != fresh.policy_hash
+                    || !fresh.credentials_installed
+                    || !fresh.policy_active
+                    || !fresh.launch_environment_installed
+                {
+                    pending_report = None;
+                }
+            }
+            let observation = if let Some(old) = pending_report.as_ref() {
+                old.clone()
+            } else {
+                let Some(next_sequence) = sequence.checked_add(1) else {
+                    return;
+                };
+                sequence = next_sequence;
+                let mut next = tracker.observation(&credentials);
+                next.session_id.clone_from(&session);
+                next.sequence = sequence;
+                next.provider_detach = credentials.provider_detach_report(&session, sequence, &now);
+                pending_report = Some(next.clone());
+                next
+            };
+            let sent = observation.clone();
             let report = tokio::time::timeout(Duration::from_secs(5), client.report(observation));
             let response = tokio::select! {
-                changed = sessions.changed() => { if changed.is_err() { return; } interval.reset_immediately(); continue; }
-                response = report => response,
+                changed=sessions.changed()=>{if changed.is_err(){return;}interval.reset_immediately();continue;}
+                response=report=>response,
             };
-            if let Ok(Ok(response)) = response
-                && !report_acknowledged(&response, sequence)
+            if let Ok(Ok(response)) = response {
+                if !report_acknowledged(&response, sent.sequence) {
+                    if sent
+                        .provider_detach
+                        .as_ref()
+                        .is_none_or(|m| m.attempt_id.is_empty())
+                    {
+                        pending_report = None;
+                    }
+                    tracing::warn!("Provider readiness report was not acknowledged");
+                    continue;
+                }
+                pending_report = None;
+                credentials.bind_provider_detach_session(
+                    &response.provider_detach_gateway_boot_id,
+                    &session,
+                );
+                if let Some(installed) = response.provider_detach_installed.as_ref() {
+                    credentials.acknowledge_provider_detach_arm(installed);
+                }
+                if let Some(meta) = sent.provider_detach.as_ref() {
+                    credentials.acknowledge_provider_detach_report(meta);
+                }
+                if let Some(seal) = response.provider_detach_pending.as_ref() {
+                    let state = tracker.state.borrow().clone();
+                    if let Some(policy) = state.policy.as_ref() {
+                        let guard = policy.generation.clone();
+                        let checker: Arc<dyn Fn() -> bool + Send + Sync> =
+                            Arc::new(move || !guard.is_stale());
+                        let next = sent.sequence.checked_add(1).unwrap_or(0);
+                        let Ok(installed_now) = openshell_core::time::timestamp_from_system_time(
+                            std::time::SystemTime::now(),
+                        ) else {
+                            continue;
+                        };
+                        if credentials.install_provider_detach_arm(
+                            seal,
+                            &sent,
+                            &state.installation_id,
+                            next,
+                            installed_now,
+                            checker,
+                        ) {
+                            interval.reset_immediately();
+                        }
+                    }
+                }
+            } else if sent
+                .provider_detach
+                .as_ref()
+                .is_none_or(|m| m.attempt_id.is_empty())
             {
-                // A gateway rejection does not invalidate the boundary's
-                // installation. Retry on the normal cadence or a real state
-                // change without creating a self-triggered failure/retry loop.
-                tracing::warn!("Provider readiness report was not acknowledged");
+                pending_report = None;
             }
         }
     }
@@ -478,6 +604,7 @@ mod tests {
                 observation_ttl: Some(
                     openshell_core::time::duration_from_std(Duration::from_secs(15)).unwrap(),
                 ),
+                ..Default::default()
             })
         }
     }
@@ -833,5 +960,340 @@ mod tests {
                 .observation(&credentials)
                 .launch_environment_installed
         );
+    }
+    #[test]
+    fn detached_provider_observation_requires_installed_policy_and_live_boundary() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let credentials = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".into(), "synthetic-only".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".into(),
+                StaticCredentialBinding {
+                    credential_identity: format!("{provider}:API_KEY"),
+                    workload_credential_handle: String::new(),
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.test".into(),
+                        port: 443,
+                        path: "/**".into(),
+                    }],
+                },
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        let subject = credentials
+            .capture_static_provider_revocation(provider)
+            .unwrap();
+        credentials
+            .install_bound_environment(
+                6,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+        let tracker = Tracker::new();
+        assert!(
+            tracker
+                .provider_revocation_observation(&credentials, &subject, "epoch", 6)
+                .is_none()
+        );
+        tracker.credentials_installed(identity(), &credentials, None);
+        assert!(
+            tracker
+                .provider_revocation_observation(&credentials, &subject, "epoch", 6)
+                .is_none()
+        );
+        let policy = openshell_policy::restrictive_default_policy();
+        let engine = openshell_supervisor_network::opa::OpaEngine::from_proto(&policy).unwrap();
+        tracker.policy_activated(&identity(), 12, engine.generation_guard(0).unwrap());
+        assert!(
+            tracker
+                .provider_revocation_observation(&credentials, &subject, "epoch", 6)
+                .is_none()
+        );
+        tracker.process_installed(installation(&credentials), &credentials);
+        let (observation, evidence) = tracker
+            .provider_revocation_observation(&credentials, &subject, "epoch", 6)
+            .unwrap();
+        assert!(evidence.unavailable);
+        assert_eq!(evidence.provider_id, provider);
+        assert!(
+            observation.credentials_installed
+                && observation.policy_active
+                && observation.launch_environment_installed
+        );
+        // No fresh request/action/session association is manufactured by this helper.
+        assert!(observation.session_id.is_empty());
+        assert_eq!(observation.sequence, 0);
+        assert!(
+            tracker
+                .provider_revocation_observation(&credentials, &subject, "other-epoch", 6)
+                .is_none()
+        );
+        assert!(
+            tracker
+                .provider_revocation_observation(&credentials, &subject, "epoch", 5)
+                .is_none()
+        );
+        engine
+            .enter_fail_closed("synthetic policy invalidation")
+            .unwrap();
+        assert!(
+            tracker
+                .provider_revocation_observation(&credentials, &subject, "epoch", 6)
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn provider_detach_reporter_lost_metadata_replies_keep_exact_install_and_proof_sequences()
+    {
+        use openshell_core::proto::*;
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let credentials = ProviderCredentialState::from_bound_environment(
+            5,
+            HashMap::from([("API_TOKEN".into(), "synthetic-only".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_TOKEN".into(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.test".into(),
+                        port: 8080,
+                        path: "/v1/**".into(),
+                    }],
+                    credential_identity: format!("{provider}:API_TOKEN"),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            vec![],
+        )
+        .unwrap();
+        credentials.enable_provider_detach_attempts();
+        credentials
+            .install_bound_environment(
+                6,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+            )
+            .unwrap();
+        let identity = EnvironmentIdentity {
+            attachment_epoch: "33333333-3333-4333-8333-333333333333".into(),
+            revision: 6,
+            policy_hash: "e".repeat(64),
+        };
+        let tracker = Tracker::new();
+        tracker.credentials_installed(identity.clone(), &credentials, None);
+        let policy = openshell_policy::restrictive_default_policy();
+        let engine = openshell_supervisor_network::opa::OpaEngine::from_proto(&policy).unwrap();
+        tracker.policy_activated(&identity, 9, engine.generation_guard(0).unwrap());
+        let installed = installation(&credentials);
+        let session = "55555555-5555-4555-8555-555555555555";
+        let boot = "88888888-8888-4888-8888-888888888888";
+        let (sessions, receiver) = watch::channel(Some(session.into()));
+        let (boundary_tx, mut boundary_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (report_tx, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tracker.clone();
+        let worker_credentials = credentials.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .run_reporter(
+                    worker_credentials,
+                    receiver,
+                    Arc::new(DelayedBoundary(boundary_tx)),
+                    DelayedReporter(report_tx),
+                )
+                .await;
+        });
+        let (first, response) = next_installation_report(
+            &mut boundary_rx,
+            &mut report_rx,
+            &installed,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(first.sequence, 1);
+        let now =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap();
+        let attempt_id = "5891bfb6-f198-5af2-ad78-cccd52e62f10";
+        let challenge = "a".repeat(64);
+        let a = ProviderDetachAttemptV1 {
+            schema_version: 1,
+            action_id: "original-action".into(),
+            target_sha256: "b".repeat(64),
+            gateway_boot_id: boot.into(),
+            supervisor_session: session.into(),
+            supervisor_instance: "44444444-4444-4444-8444-444444444444".into(),
+            provider_id: provider.into(),
+            attachment_epoch: identity.attachment_epoch.clone(),
+            configuration_instance: "config-after".into(),
+            provider_env_revision: 6,
+            config_revision: 9,
+            native_policy_hash: identity.policy_hash.clone(),
+            native_policy_version: 4,
+            arm_capture_sequence: 1,
+            challenge: challenge.clone(),
+            not_before: Some(prost_types::Timestamp {
+                seconds: now.seconds - 1,
+                nanos: now.nanos,
+            }),
+            deadline: Some(prost_types::Timestamp {
+                seconds: now.seconds + 20,
+                nanos: now.nanos,
+            }),
+            ..Default::default()
+        };
+        let q = ProviderDetachArmRequestV1 {
+            original_action: Some(ProviderDetachActionV1 {
+                target: Some(ProviderDetachTargetV1 {
+                    provider_env_revision: 5,
+                    provider_id: provider.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            attempt: Some(a),
+            attempt_id: attempt_id.into(),
+            request_sha256: "b".repeat(64),
+            ..Default::default()
+        };
+        let seal = ProviderDetachArmSealV1 {
+            request: Some(q),
+            hold_generation: 1,
+            row_resource_version: 1,
+            install_sequence: 0,
+            installed_time: None,
+        };
+        let ack = |seq| ReportProviderReadinessResponse {
+            accepted_sequence: seq,
+            observation_ttl: Some(prost_types::Duration {
+                seconds: 15,
+                nanos: 0,
+            }),
+            provider_detach_gateway_boot_id: boot.into(),
+            ..Default::default()
+        };
+        let mut delivered = ack(1);
+        delivered.provider_detach_pending = Some(seal.clone());
+        response.send(delivered).unwrap();
+        let (install, lost) = next_installation_report(
+            &mut boundary_rx,
+            &mut report_rx,
+            &installed,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(install.sequence, 2);
+        assert_eq!(
+            install.provider_detach.as_ref().unwrap().install_sequence,
+            2
+        );
+        drop(lost);
+        tracker.state.send_modify(|_| {});
+        let (install_retry, response) = next_installation_report(
+            &mut boundary_rx,
+            &mut report_rx,
+            &installed,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(install_retry, install);
+        let mut installed_seal = seal;
+        installed_seal.install_sequence = 2;
+        installed_seal.installed_time = Some(
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap(),
+        );
+        let mut accepted = ack(2);
+        accepted.provider_detach_installed = Some(installed_seal);
+        response.send(accepted).unwrap();
+        // The next actual boundary synchronization happens after processing
+        // the previous native ACK; no scheduler timing assumption is needed.
+        tracker.state.send_modify(|_| {});
+        let waiting = tokio::time::timeout(Duration::from_secs(1), boundary_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let now =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap();
+        assert_eq!(
+            credentials.witness_provider_detach_header(
+                attempt_id,
+                &challenge,
+                "Bearer openshell:resolve:env:v5_API_TOKEN",
+                "api.example.test",
+                8080,
+                "/v1/messages?beta=true",
+                None,
+                6,
+                now
+            ),
+            openshell_core::provider_credentials::ProviderDetachWitness::Unavailable
+        );
+        waiting.send(installed.clone()).unwrap();
+        let (proof, lost) = tokio::time::timeout(Duration::from_secs(1), report_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.sequence, 3);
+        assert_eq!(
+            proof
+                .provider_detach
+                .as_ref()
+                .unwrap()
+                .refusal
+                .as_ref()
+                .unwrap()
+                .sequence,
+            3
+        );
+        drop(lost);
+        tracker.state.send_modify(|_| {});
+        let (proof_retry, response) = next_installation_report(
+            &mut boundary_rx,
+            &mut report_rx,
+            &installed,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(proof_retry, proof);
+        response.send(ack(3)).unwrap();
+        sessions.send_replace(Some("77777777-7777-4777-8777-777777777777".into()));
+        let (reconnected, response) = next_installation_report(
+            &mut boundary_rx,
+            &mut report_rx,
+            &installed,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(reconnected.sequence, 1);
+        assert!(
+            reconnected
+                .provider_detach
+                .as_ref()
+                .unwrap()
+                .attempt_id
+                .is_empty()
+        );
+        assert!(
+            reconnected
+                .provider_detach
+                .as_ref()
+                .unwrap()
+                .refusal
+                .is_none()
+        );
+        response.send(ack(1)).unwrap();
+        task.abort();
+        let _ = task.await;
     }
 }

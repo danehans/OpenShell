@@ -92,6 +92,123 @@ fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
     ctx.request_default_port
 }
 
+// Correlation only: the protected Core arm and authenticated readiness report
+// supply authority. Never Debug/log these retained request-local values.
+#[derive(Clone)]
+struct ProviderDetachCorrelation {
+    attempt_id: String,
+    challenge: String,
+    original_shape_valid: bool,
+}
+
+fn strip_provider_detach_headers(
+    request: &mut crate::l7::provider::L7Request,
+) -> Option<ProviderDetachCorrelation> {
+    let raw = &request.raw_header;
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let mut output = Vec::with_capacity(raw.len());
+    let mut attempt = None;
+    let mut challenge = None;
+    let mut valid = end <= 32768;
+    let mut original_shape_valid = end <= 32768;
+    let mut authorization_count = 0;
+    for (index, line) in raw[..end - 2].split(|b| *b == b'\n').enumerate() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if index == 0 {
+            if std::str::from_utf8(line).map_or(true, |line| {
+                secrets::contains_reserved_credential_marker(line)
+            }) {
+                original_shape_valid = false;
+            }
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+            continue;
+        }
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+            continue;
+        };
+        let name = &line[..colon];
+        let prefix = b"x-openshell-provider-detach-";
+        if name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            let value = line[colon + 1..].trim_ascii();
+            if name.eq_ignore_ascii_case(b"x-openshell-provider-detach-attempt") {
+                if attempt.is_some() {
+                    valid = false;
+                }
+                attempt = std::str::from_utf8(value).ok().map(str::to_string);
+            } else if name.eq_ignore_ascii_case(b"x-openshell-provider-detach-challenge") {
+                if challenge.is_some() {
+                    valid = false;
+                }
+                challenge = std::str::from_utf8(value).ok().map(str::to_string);
+            } else {
+                valid = false;
+            }
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"authorization") {
+            authorization_count += 1;
+        } else if std::str::from_utf8(&line[colon + 1..]).map_or(true, |value| {
+            secrets::contains_reserved_credential_marker(value)
+        }) {
+            original_shape_valid = false;
+        }
+        output.extend_from_slice(line);
+        output.extend_from_slice(b"\r\n");
+    }
+    original_shape_valid &= authorization_count == 1;
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(&raw[end..]);
+    request.raw_header = output;
+    let attempt_id = attempt?;
+    let challenge = challenge?;
+    if !valid
+        || attempt_id.len() != 36
+        || challenge.len() != 64
+        || !challenge
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !uuid::Uuid::parse_str(&attempt_id)
+            .is_ok_and(|id| !id.is_nil() && id.to_string() == attempt_id)
+    {
+        return None;
+    }
+    Some(ProviderDetachCorrelation {
+        attempt_id,
+        challenge,
+        original_shape_valid,
+    })
+}
+fn original_authorization_for_detach(request: &crate::l7::provider::L7Request) -> Option<&str> {
+    let end = request
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")?
+        + 4;
+    if end > 32768 {
+        return None;
+    }
+    let header = std::str::from_utf8(&request.raw_header[..end]).ok()?;
+    let mut auth = None;
+    for line in header.split("\r\n").skip(1).filter(|line| !line.is_empty()) {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("authorization") {
+            if auth.is_some() {
+                return None;
+            }
+            auth = Some(value.trim_matches([' ', '\t']));
+        } else if secrets::contains_reserved_credential_marker(value) {
+            return None;
+        }
+    }
+    auth
+}
+
 fn scoped_context_for_request(
     ctx: &L7EvalContext,
     request: &crate::l7::provider::L7Request,
@@ -544,6 +661,7 @@ async fn relay_http_request_with_credential_rejection<C, U>(
     options: crate::l7::rest::RelayRequestOptions<'_>,
     ctx: &L7EvalContext,
     response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
+    provider_detach_correlation: Option<&ProviderDetachCorrelation>,
 ) -> Result<Option<RelayOutcome>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -557,10 +675,15 @@ where
         ctx,
         response_middleware,
         None,
+        provider_detach_correlation,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep original request correlation separate from response middleware and endpoint observation"
+)]
 async fn relay_http_request_with_credential_rejection_observed<C, U>(
     request: &crate::l7::provider::L7Request,
     client: &mut C,
@@ -569,11 +692,23 @@ async fn relay_http_request_with_credential_rejection_observed<C, U>(
     ctx: &L7EvalContext,
     response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
     observer: Option<&EndpointObserver>,
+    provider_detach_correlation: Option<&ProviderDetachCorrelation>,
 ) -> Result<Option<RelayOutcome>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    // Middleware may have added reserved fields; never forward them or use
+    // later-added fields to mint correlation for this original request.
+    let mut sanitized = crate::l7::provider::L7Request {
+        action: request.action.clone(),
+        target: request.target.clone(),
+        query_params: request.query_params.clone(),
+        raw_header: request.raw_header.clone(),
+        body_length: request.body_length,
+    };
+    strip_provider_detach_headers(&mut sanitized);
+    let request = &sanitized;
     let credential = if let Some(binding) = ctx.traffic_binding.as_ref() {
         if ctx.request_default_port != Some(443)
             || options.credential_signing.is_sigv4()
@@ -598,6 +733,46 @@ where
     } else {
         None
     };
+    // Existing traffic admission is prior to the provider witness. A revoked,
+    // unsupported or malformed traffic credential must not mint detach proof.
+    if let Some(traffic) = credential.as_ref() {
+        drop(traffic.header(&request.raw_header)?);
+    }
+    if let Some(correlation) = provider_detach_correlation
+        && options
+            .generation_guard
+            .is_some_and(|guard| !guard.is_stale())
+        && !options.credential_signing.is_sigv4()
+        && !crate::l7::rest::request_is_websocket_upgrade(&request.raw_header)
+        && let (Some(credentials), Some(revision)) = (
+            ctx.provider_credentials.as_ref(),
+            ctx.provider_credential_revision,
+        )
+        && let Ok(now) =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+    {
+        let authorization = if correlation.original_shape_valid {
+            original_authorization_for_detach(request).unwrap_or("")
+        } else {
+            ""
+        };
+        let outcome = credentials.witness_provider_detach_header(
+            &correlation.attempt_id,
+            &correlation.challenge,
+            authorization,
+            &ctx.host,
+            ctx.port,
+            &request.target,
+            ctx.secret_resolver.as_deref(),
+            revision,
+            now,
+        );
+        if outcome == openshell_core::provider_credentials::ProviderDetachWitness::Unavailable {
+            let _ = upstream.shutdown().await;
+            write_bad_gateway_response(client).await?;
+            return Ok(None);
+        }
+    }
     let options = crate::l7::rest::RelayRequestOptions {
         traffic_credential: credential.as_ref(),
         ..options
@@ -1008,6 +1183,7 @@ where
                 return Ok(());
             }
         };
+        let provider_detach_correlation = strip_provider_detach_headers(&mut req);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -1383,6 +1559,7 @@ where
                     Some(engine.generation_guard()),
                 )),
                 observer.as_ref(),
+                provider_detach_correlation.as_ref(),
             )
             .await;
             let outcome_result = match outcome_result {
@@ -1893,7 +2070,7 @@ where
         }
 
         // Parse one HTTP request from client
-        let req = match provider.parse_request(client).await {
+        let mut req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
             Err(e) => {
@@ -1912,6 +2089,7 @@ where
                 return Ok(()); // Close connection on parse error
             }
         };
+        let provider_detach_correlation = strip_provider_detach_headers(&mut req);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -2168,6 +2346,7 @@ where
                     engine.middleware_runner(),
                     Some(engine.generation_guard()),
                 )),
+                provider_detach_correlation.as_ref(),
             )
             .await;
             let outcome_result = match outcome_result {
@@ -2376,7 +2555,8 @@ where
             }
         };
 
-        let req = parsed.request;
+        let mut req = parsed.request;
+        let provider_detach_correlation = strip_provider_detach_headers(&mut req);
         let jsonrpc_info = parsed.info;
         let observer = EndpointObserver::begin_captured(
             ctx.endpoint_observation_tx.as_ref(),
@@ -2600,6 +2780,7 @@ where
                     Some(engine.generation_guard()),
                 )),
                 observer.as_ref(),
+                provider_detach_correlation.as_ref(),
             )
             .await?
             else {
@@ -2683,6 +2864,7 @@ where
             }
         };
 
+        let provider_detach_correlation = strip_provider_detach_headers(&mut req);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -2889,6 +3071,7 @@ where
                     engine.middleware_runner(),
                     Some(engine.generation_guard()),
                 )),
+                provider_detach_correlation.as_ref(),
             )
             .await?
             else {
@@ -3398,7 +3581,7 @@ where
         }
 
         // Read next request from client.
-        let req = match provider.parse_request(client).await {
+        let mut req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => break, // Client closed connection.
             Err(e) => {
@@ -3411,6 +3594,7 @@ where
                 return Ok(());
             }
         };
+        let provider_detach_correlation = strip_provider_detach_headers(&mut req);
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -3558,6 +3742,7 @@ where
             },
             ctx,
             response_middleware,
+            provider_detach_correlation.as_ref(),
         )
         .await?
         else {
@@ -3630,6 +3815,7 @@ mod tests {
                 ..Default::default()
             },
             &L7EvalContext::default(),
+            None,
             None,
         )
         .await
@@ -3720,6 +3906,7 @@ mod tests {
             &L7EvalContext::default(),
             None,
             Some(&observer),
+            None,
         )
         .await;
         if disconnect_client {
@@ -4076,6 +4263,7 @@ mod tests {
                 ..options
             },
             &ctx,
+            None,
             None,
         )
         .await
@@ -12138,5 +12326,570 @@ network_policies:
             .expect("relay should complete")
             .unwrap()
             .unwrap();
+    }
+    fn provider_detach_relay_in_subprocess(test_name: &str) -> bool {
+        const CHILD: &str = "OPENSHELL_TEST_PROVIDER_DETACH_RELAY_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test_name) {
+            return false;
+        }
+        // Real relay paths emit OCSF. Its tracing callsite interest is process-wide;
+        // running them beside another test's temporary subscriber can disable that
+        // capture. Preserve every assertion in an isolated copy of this executable,
+        // as the existing policy DNS event tests do.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn provider_detach_relay_fixture(
+        detached: bool,
+        armed: bool,
+        middleware_deny: bool,
+    ) -> (
+        L7EndpointConfig,
+        TunnelPolicyEngine,
+        L7EvalContext,
+        ProviderCredentialState,
+        String,
+        String,
+    ) {
+        provider_detach_relay_fixture_at_port(detached, armed, middleware_deny, 8080)
+    }
+    fn provider_detach_relay_fixture_at_port(
+        detached: bool,
+        armed: bool,
+        middleware_deny: bool,
+        port: u16,
+    ) -> (
+        L7EndpointConfig,
+        TunnelPolicyEngine,
+        L7EvalContext,
+        ProviderCredentialState,
+        String,
+        String,
+    ) {
+        use openshell_core::proto::*;
+        let middleware = if middleware_deny {
+            "network_middlewares:\n  unavailable:\n    middleware: example/unavailable\n    on_error: fail_closed\n    endpoints:\n      include: [api.example.test]\n"
+        } else {
+            ""
+        };
+        let data = format!(
+            "{middleware}network_policies:\n  rest_api:\n    name: rest_api\n    endpoints:\n      - host: api.example.test\n        port: {port}\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow:\n              method: POST\n              path: /v1/**\n    binaries:\n      - {{path: /opt/agent/claude/bin/claude}}\n"
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        install_builtin_middleware(&engine);
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port,
+            binary_path: PathBuf::from("/opt/agent/claude/bin/claude"),
+            binary_sha256: "synthetic-offline-binary".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint.unwrap()).unwrap();
+        let guard = engine.generation_guard(generation).unwrap();
+        let provider = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            TestHashMap::from([("API_TOKEN".into(), "synthetic-native-token".into())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".into(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.test".into(),
+                        port: u32::from(port),
+                        path: "/v1/**".into(),
+                    }],
+                    credential_identity: format!("{provider}:API_TOKEN"),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            vec![],
+        )
+        .unwrap();
+        state.enable_provider_detach_attempts();
+        if detached {
+            state
+                .install_bound_environment(
+                    8,
+                    TestHashMap::new(),
+                    TestHashMap::new(),
+                    TestHashMap::new(),
+                    TestHashMap::new(),
+                    vec![],
+                )
+                .unwrap();
+        }
+        let attempt_id = "5891bfb6-f198-5af2-ad78-cccd52e62f10".to_string();
+        let challenge = "a".repeat(64);
+        let boot = "88888888-8888-4888-8888-888888888888";
+        let session = "55555555-5555-4555-8555-555555555555";
+        state.bind_provider_detach_session(boot, session);
+        if armed {
+            assert!(detached);
+            let now =
+                openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                    .unwrap();
+            let a = ProviderDetachAttemptV1 {
+                schema_version: 1,
+                action_id: "original-action".into(),
+                target_sha256: "b".repeat(64),
+                gateway_boot_id: boot.into(),
+                supervisor_session: session.into(),
+                supervisor_instance: "44444444-4444-4444-8444-444444444444".into(),
+                provider_id: provider.into(),
+                attachment_epoch: "33333333-3333-4333-8333-333333333333".into(),
+                configuration_instance: "config-after".into(),
+                provider_env_revision: 8,
+                config_revision: 9,
+                native_policy_hash: "e".repeat(64),
+                native_policy_version: 4,
+                arm_capture_sequence: 10,
+                challenge: challenge.clone(),
+                not_before: Some(prost_types::Timestamp {
+                    seconds: now.seconds - 1,
+                    nanos: now.nanos,
+                }),
+                deadline: Some(prost_types::Timestamp {
+                    seconds: now.seconds + 20,
+                    nanos: now.nanos,
+                }),
+                ..Default::default()
+            };
+            // This fixture injects a trusted native seal at the Core boundary.
+            // Server tests separately validate its complete wire/original ledger.
+            let q = ProviderDetachArmRequestV1 {
+                original_action: Some(ProviderDetachActionV1 {
+                    target: Some(ProviderDetachTargetV1 {
+                        provider_id: provider.into(),
+                        provider_env_revision: 7,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                attempt: Some(a.clone()),
+                attempt_id: attempt_id.clone(),
+                request_sha256: "b".repeat(64),
+                ..Default::default()
+            };
+            let seal = ProviderDetachArmSealV1 {
+                request: Some(q),
+                hold_generation: 1,
+                row_resource_version: 9,
+                install_sequence: 0,
+                installed_time: None,
+            };
+            let observation = ProviderReadinessObservation {
+                session_id: session.into(),
+                sequence: 10,
+                attachment_epoch: a.attachment_epoch.clone(),
+                config_revision: 9,
+                provider_env_revision: 8,
+                policy_hash: a.native_policy_hash.clone(),
+                credentials_installed: true,
+                policy_active: true,
+                launch_environment_installed: true,
+                ..Default::default()
+            };
+            let captured = guard.clone();
+            assert!(state.install_provider_detach_arm(
+                &seal,
+                &observation,
+                &state.snapshot().installation_id,
+                11,
+                now,
+                Arc::new(move || !captured.is_stale())
+            ));
+            let mut installed = seal;
+            installed.install_sequence = 11;
+            installed.installed_time = Some(
+                openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                    .unwrap(),
+            );
+            assert!(state.acknowledge_provider_detach_arm(&installed));
+        }
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port,
+            request_default_port: Some(port),
+            policy_name: "rest_api".into(),
+            binary_path: "/opt/agent/claude/bin/claude".into(),
+            provider_credentials: Some(state.clone()),
+            ..Default::default()
+        };
+        (
+            config,
+            engine.clone_engine_for_tunnel(generation).unwrap(),
+            ctx,
+            state,
+            attempt_id,
+            challenge,
+        )
+    }
+    async fn run_provider_detach_relay_case(
+        armed: bool,
+        authorization: &str,
+        path: &str,
+        middleware_deny: bool,
+    ) -> (
+        String,
+        Vec<u8>,
+        Option<openshell_core::proto::ProviderDetachSupervisorReportV1>,
+    ) {
+        let (config, engine, ctx, state, attempt_id, challenge) =
+            provider_detach_relay_fixture(true, armed, middleware_deny);
+        // Same request-shape facts as P1, synthetic body only. No real CLI,
+        // provider, model, retained prompt or response streaming is executed.
+        let mut body = r#"{"stream":true,"model":"synthetic","padding":""}"#.to_string();
+        let pad = 12288 - body.len();
+        body = body.replace("padding\":\"", &format!("padding\":\"{}", "x".repeat(pad)));
+        assert_eq!(body.len(), 12288);
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: {authorization}\r\nX-OpenShell-Provider-Detach-Attempt: {attempt_id}\r\nX-OpenShell-Provider-Detach-Challenge: {challenge}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (mut app, mut client) = tokio::io::duplex(65536);
+        let (mut upstream, mut server) = tokio::io::duplex(65536);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx).await
+        });
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut forwarded = Vec::new();
+        server.read_to_end(&mut forwarded).await.unwrap();
+        let now =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap();
+        let report = state.provider_detach_report("55555555-5555-4555-8555-555555555555", 12, &now);
+        (response, forwarded, report)
+    }
+    #[tokio::test]
+    async fn provider_detach_relay_exact_static_reference_refuses_p1_shape_before_any_application_write()
+     {
+        if provider_detach_relay_in_subprocess(
+            "l7::relay::tests::provider_detach_relay_exact_static_reference_refuses_p1_shape_before_any_application_write",
+        ) {
+            return;
+        }
+        let (response, forwarded, report) = run_provider_detach_relay_case(
+            true,
+            "Bearer openshell:resolve:env:v7_API_TOKEN",
+            "/v1/messages?beta=true",
+            false,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 502"));
+        assert!(forwarded.is_empty());
+        let report = report.unwrap();
+        assert_eq!(report.result, 1);
+        let proof = report.refusal.unwrap();
+        assert!(proof.unavailable);
+        assert_eq!(proof.sequence, 12);
+    }
+    #[tokio::test]
+    async fn provider_detach_relay_without_arm_and_wrong_original_reference_never_produce_proof() {
+        if provider_detach_relay_in_subprocess(
+            "l7::relay::tests::provider_detach_relay_without_arm_and_wrong_original_reference_never_produce_proof",
+        ) {
+            return;
+        }
+        let (_, forwarded, report) = run_provider_detach_relay_case(
+            false,
+            "Bearer openshell:resolve:env:v7_API_TOKEN",
+            "/v1/messages?beta=true",
+            false,
+        )
+        .await;
+        assert!(forwarded.is_empty());
+        assert!(report.unwrap().refusal.is_none());
+        let (_, forwarded, report) = run_provider_detach_relay_case(
+            true,
+            "Bearer openshell:resolve:env:v7_OTHER_KEY",
+            "/v1/messages?beta=true",
+            false,
+        )
+        .await;
+        assert!(forwarded.is_empty());
+        let report = report.unwrap();
+        assert_eq!(report.result, 3);
+        assert!(report.refusal.is_none());
+    }
+    #[tokio::test]
+    async fn provider_detach_relay_preserves_policy_and_middleware_denial_without_witness() {
+        if provider_detach_relay_in_subprocess(
+            "l7::relay::tests::provider_detach_relay_preserves_policy_and_middleware_denial_without_witness",
+        ) {
+            return;
+        }
+        for (path, middleware) in [("/outside", false), ("/v1/messages?beta=true", true)] {
+            let (response, forwarded, report) = run_provider_detach_relay_case(
+                true,
+                "Bearer openshell:resolve:env:v7_API_TOKEN",
+                path,
+                middleware,
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 403"));
+            assert!(forwarded.is_empty());
+            let report = report.unwrap();
+            assert_eq!(report.result, 0);
+            assert!(report.refusal.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn provider_detach_relay_available_reference_forwards_normally_with_reserved_headers_removed()
+     {
+        if provider_detach_relay_in_subprocess(
+            "l7::relay::tests::provider_detach_relay_available_reference_forwards_normally_with_reserved_headers_removed",
+        ) {
+            return;
+        }
+        let (config, engine, ctx, state, attempt_id, challenge) =
+            provider_detach_relay_fixture(false, false, false);
+        let (mut app, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut server) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx).await
+        });
+        let server_task = tokio::spawn(async move {
+            let mut raw = Vec::new();
+            let mut byte = [0u8; 1];
+            while !raw.ends_with(b"\r\n\r\n") {
+                server.read_exact(&mut byte).await.unwrap();
+                raw.push(byte[0]);
+                assert!(raw.len() < 8192);
+            }
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            raw
+        });
+        let request = format!(
+            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer openshell:resolve:env:v7_API_TOKEN\r\nX-OpenShell-Provider-Detach-Attempt: {attempt_id}\r\nX-OpenShell-Provider-Detach-Challenge: {challenge}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let forwarded = server_task.await.unwrap();
+        let header = String::from_utf8(forwarded).unwrap();
+        assert!(
+            !header
+                .to_ascii_lowercase()
+                .contains("x-openshell-provider-detach-")
+        );
+        assert!(header.contains("Authorization: Bearer synthetic-native-token"));
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(
+            state
+                .provider_detach_report(
+                    "55555555-5555-4555-8555-555555555555",
+                    12,
+                    &openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                        .unwrap()
+                )
+                .unwrap()
+                .refusal
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn provider_detach_relay_ambiguous_headers_and_unrelated_query_marker_never_produce_proof()
+     {
+        if provider_detach_relay_in_subprocess(
+            "l7::relay::tests::provider_detach_relay_ambiguous_headers_and_unrelated_query_marker_never_produce_proof",
+        ) {
+            return;
+        }
+        for (authorization, path) in [
+            (
+                "Bearer openshell:resolve:env:v7_API_TOKEN\r\nAuthorization: Bearer openshell:resolve:env:v7_API_TOKEN",
+                "/v1/messages?beta=true",
+            ),
+            (
+                "Bearer openshell:resolve:env:v7_API_TOKEN\r\nX-Other: openshell:resolve:env:v7_OTHER_KEY",
+                "/v1/messages?beta=true",
+            ),
+            (
+                "Bearer openshell:resolve:env:v7_API_TOKEN",
+                "/v1/messages?key=openshell:resolve:env:v7_OTHER_KEY",
+            ),
+        ] {
+            let (_, forwarded, report) =
+                run_provider_detach_relay_case(true, authorization, path, false).await;
+            assert!(forwarded.is_empty());
+            assert!(report.unwrap().refusal.is_none());
+        }
+    }
+    #[test]
+    fn provider_detach_relay_strips_all_reserved_fields_even_when_correlation_is_invalid() {
+        let mut req=crate::l7::provider::L7Request{action:"POST".into(),target:"/v1/messages?beta=true".into(),query_params:TestHashMap::new(),body_length:crate::l7::provider::BodyLength::ContentLength(2),raw_header:b"POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.example.test\r\nx-OpenShell-Provider-Detach-Attempt: duplicate\r\nX-OpenShell-Provider-Detach-Attempt: duplicate\r\nX-OpenShell-Provider-Detach-Unknown: ignored\r\nX-Normal: preserved\r\nContent-Length: 2\r\n\r\n{}".to_vec()};
+        assert!(strip_provider_detach_headers(&mut req).is_none());
+        let text = std::str::from_utf8(&req.raw_header).unwrap();
+        assert!(
+            !text
+                .to_ascii_lowercase()
+                .contains("x-openshell-provider-detach-")
+        );
+        assert!(text.contains("X-Normal: preserved\r\n"));
+        assert!(text.ends_with("\r\n\r\n{}"));
+    }
+    struct ProviderDetachNoTrafficIssue(String);
+    #[async_trait::async_trait]
+    impl crate::traffic_identity::TrafficTokenSource for ProviderDetachNoTrafficIssue {
+        fn execution_id(&self) -> &str {
+            &self.0
+        }
+        async fn issue(
+            &self,
+            _: openshell_core::proto::IssueTrafficTokenRequest,
+        ) -> Result<
+            openshell_core::proto::IssueTrafficTokenResponse,
+            crate::traffic_identity::TrafficIdentityError,
+        > {
+            panic!("revoked binding must refuse before token issuance")
+        }
+    }
+    fn provider_detach_traffic_snapshot() -> openshell_core::grpc_client::SettingsPollResult {
+        openshell_core::grpc_client::SettingsPollResult {
+            configuration_instance_id: "instance-one".into(),
+            configuration_admitted: true,
+            configuration_error: String::new(),
+            policy: None,
+            version: 1,
+            policy_hash: "a".repeat(64),
+            config_revision: 7,
+            policy_source: openshell_core::proto::PolicySource::Sandbox,
+            settings: std::collections::HashMap::default(),
+            global_policy_version: 0,
+            provider_env_revision: 3,
+            provider_attachment_epoch: "attachment-one".into(),
+            supervisor_middleware_services: vec![],
+            traffic_identity_targets: vec![openshell_core::proto::TrafficIdentityTarget {
+                name: "shared-gateway".into(),
+                https_endpoint: "https://api.example.test/".into(),
+                audience: "urn:openshell:traffic:shared-gateway".into(),
+                tls_ca_cert_pem: vec![],
+                transports: vec!["http".into(), "mcp".into()],
+                target_sha256: "b".repeat(64),
+            }],
+            workspace: "default".into(),
+            policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode::default(),
+            extension_authentication_enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_detach_relay_revoked_traffic_binding_cannot_mint_proof() {
+        if provider_detach_relay_in_subprocess(
+            "l7::relay::tests::provider_detach_relay_revoked_traffic_binding_cannot_mint_proof",
+        ) {
+            return;
+        }
+        for armed in [false, true] {
+            let (config, engine, mut ctx, state, id, challenge) =
+                provider_detach_relay_fixture_at_port(true, armed, false, 443);
+            let traffic = crate::traffic_identity::TrafficIdentityState::default();
+            let source = Arc::new(ProviderDetachNoTrafficIssue(
+                openshell_core::traffic_identity::execution_id("sandbox-one", "generation-one", 1),
+            ));
+            traffic.configure_source(source).unwrap();
+            traffic
+                .activate(
+                    traffic
+                        .prepare(
+                            &provider_detach_traffic_snapshot(),
+                            engine.current_generation(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+            ctx.traffic_binding = Some(
+                traffic
+                    .bind("api.example.test", 443, engine.current_generation(), true)
+                    .unwrap()
+                    .unwrap(),
+            );
+            traffic.revoke();
+            let request = format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer openshell:resolve:env:v7_API_TOKEN\r\nX-OpenShell-Provider-Detach-Attempt: {id}\r\nX-OpenShell-Provider-Detach-Challenge: {challenge}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut upstream, mut server) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx).await
+            });
+            app.write_all(request.as_bytes()).await.unwrap();
+            app.shutdown().await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.read_to_string(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("traffic identity binding is stale")
+            );
+            let mut forwarded = Vec::new();
+            server.read_to_end(&mut forwarded).await.unwrap();
+            assert!(forwarded.is_empty());
+            assert!(response.is_empty());
+            let now =
+                openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                    .unwrap();
+            let report = state
+                .provider_detach_report("55555555-5555-4555-8555-555555555555", 12, &now)
+                .unwrap();
+            assert_eq!(report.result, 0);
+            assert!(report.refusal.is_none());
+        }
     }
 }
