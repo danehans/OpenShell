@@ -9,6 +9,7 @@ pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
 pub mod provider_detach;
+pub mod provider_detach_invocation;
 #[cfg(test)]
 pub use provider_detach::{
     action_id_for_digest as provider_detach_action_id_for_digest,
@@ -405,6 +406,28 @@ impl OpenShell for OpenShellService {
         request: Request<openshell_core::proto::ArmProviderDetachAttemptRequest>,
     ) -> Result<Response<openshell_core::proto::ArmProviderDetachAttemptResponse>, Status> {
         provider_detach::arm_attempt(&self.state, request).await
+    }
+
+    async fn reserve_provider_detach_witness(
+        &self,
+        request: Request<openshell_core::proto::ReserveProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReserveProviderDetachWitnessResponse>, Status> {
+        provider_detach_invocation::reserve(&self.state, request).await
+    }
+
+    async fn invoke_provider_detach_witness(
+        &self,
+        request: Request<openshell_core::proto::InvokeProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::InvokeProviderDetachWitnessResponse>, Status> {
+        provider_detach_invocation::invoke(&self.state, request).await
+    }
+
+    async fn get_provider_detach_witness_invocation(
+        &self,
+        request: Request<openshell_core::proto::GetProviderDetachWitnessInvocationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderDetachWitnessInvocationResponse>, Status>
+    {
+        provider_detach_invocation::query(&self.state, request).await
     }
 
     async fn get_conditional_provider_detach_state(
@@ -1037,6 +1060,7 @@ pub mod test_support {
         let mut req = Request::new(inner);
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: "dev-user".to_string(),
                 display_name: None,
                 roles: vec!["openshell-admin".to_string(), "openshell-user".to_string()],

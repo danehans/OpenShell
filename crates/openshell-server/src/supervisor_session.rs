@@ -304,6 +304,8 @@ struct LiveSession {
     /// Installation evidence belongs to this connection and is never restored
     /// from persistence or inherited by a replacement supervisor session.
     provider_readiness: Option<ProviderReadinessEvidence>,
+    witness_capability: Option<openshell_core::proto::ProviderDetachWitnessControlV1>,
+    witness_originals: HashMap<String, openshell_core::proto::ProviderDetachWitnessControlV1>,
     #[allow(dead_code)]
     connected_at: Instant,
     /// This session's share of `openshell_server_supervisor_sessions`, released when the entry
@@ -434,6 +436,8 @@ impl SupervisorSessionRegistry {
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
                 provider_readiness: None,
+                witness_capability: None,
+                witness_originals: HashMap::new(),
                 connected_at: Instant::now(),
                 _gauge_slot: GaugeSlot::supervisor_session(),
             },
@@ -621,6 +625,289 @@ impl SupervisorSessionRegistry {
         )?;
         *evidence = candidate;
         Ok(())
+    }
+
+    fn witness_session<'a>(
+        sessions: &'a HashMap<String, LiveSession>,
+        sandbox_id: &str,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> Result<&'a LiveSession, Status> {
+        let attempt = q
+            .installed_arm
+            .as_ref()
+            .and_then(|s| s.request.as_ref())
+            .and_then(|r| r.attempt.as_ref())
+            .ok_or_else(|| Status::invalid_argument("witness attempt absent"))?;
+        let session = sessions
+            .get(sandbox_id)
+            .filter(|s| {
+                s.endpoint_status_initialized
+                    && s.session_id == attempt.supervisor_session
+                    && s.provider_readiness
+                        .as_ref()
+                        .is_some_and(|e| e.belongs_to_instance(&attempt.supervisor_instance))
+            })
+            .ok_or_else(|| Status::failed_precondition("witness current session unavailable"))?;
+        let cap = session
+            .witness_capability
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("witness transport unsupported"))?;
+        if cap.source_incarnation != q.source_incarnation
+            || cap.boundary_incarnation != q.boundary_incarnation
+            || cap.profile_sha256 != q.profile_sha256
+            || cap.execution_id != attempt.execution_id
+            || cap.state != "capability"
+        {
+            return Err(Status::failed_precondition("witness capability changed"));
+        }
+        Ok(session)
+    }
+
+    pub(crate) fn check_provider_witness_capability(
+        &self,
+        sandbox_id: &str,
+        _attempt: &openshell_core::proto::ProviderDetachAttemptV1,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> Result<(), Status> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("witness session unavailable"))?;
+        Self::witness_session(&sessions, sandbox_id, q).map(|_| ())
+    }
+
+    /// Clone only immutable metadata from the current initialized authenticated
+    /// connection. No send, adoption, renewal or durable write occurs here.
+    pub(crate) fn provider_witness_metadata(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        expected_profile: &str,
+    ) -> Result<
+        (
+            String,
+            openshell_core::proto::ProviderDetachWitnessControlV1,
+        ),
+        Status,
+    > {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("witness session unavailable"))?;
+        let session = sessions
+            .get(sandbox_id)
+            .filter(|s| s.endpoint_status_initialized)
+            .ok_or_else(|| Status::failed_precondition("witness current session unavailable"))?;
+        let cap = session
+            .witness_capability
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("witness transport unsupported"))?;
+        let uuid = |v: &str| Uuid::parse_str(v).is_ok_and(|id| !id.is_nil() && id.to_string() == v);
+        if !uuid(&session.session_id)
+            || !uuid(&cap.source_incarnation)
+            || !uuid(&cap.boundary_incarnation)
+            || cap.execution_id != execution_id
+            || cap.profile_sha256 != expected_profile
+            || expected_profile.len() != 64
+            || !expected_profile
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || cap.state != "capability"
+            || !cap.original_key.is_empty()
+            || !cap.request_sha256.is_empty()
+        {
+            return Err(Status::failed_precondition("witness capability changed"));
+        }
+        Ok((session.session_id.clone(), cap.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn witness_metadata_fixture(
+        &self,
+        sandbox: &str,
+        session: &str,
+        cap: Option<openshell_core::proto::ProviderDetachWitnessControlV1>,
+        initialized: bool,
+    ) -> mpsc::Receiver<GatewayMessage> {
+        let (tx, rx) = mpsc::channel(4);
+        let (shutdown, _) = oneshot::channel();
+        self.register(sandbox.into(), session.into(), tx, shutdown);
+        let mut sessions = self.sessions.lock().unwrap();
+        let entry = sessions.get_mut(sandbox).unwrap();
+        entry.endpoint_status_initialized = initialized;
+        entry.provider_readiness = Some(
+            ProviderReadinessEvidence::from_hello(&SupervisorHello {
+                sandbox_id: sandbox.into(),
+                instance_id: session.into(),
+                supports_provider_readiness: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        entry.witness_capability = cap;
+        rx
+    }
+    #[cfg(test)]
+    pub(crate) fn poison_witness_metadata_fixture(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.sessions.lock().unwrap();
+            panic!("synthetic registry poison")
+        }));
+    }
+
+    /// No replay queue: mark the original before the single non-awaiting send.
+    /// Failure retains this original as unknown until this session disappears;
+    /// the permanent `SQLite` claim remains authoritative across disappearance.
+    pub(crate) fn send_provider_witness_once(
+        &self,
+        sandbox_id: &str,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> Result<(), Status> {
+        let key = crate::grpc::provider_detach_invocation::original_key(q)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("witness session unavailable"))?;
+        Self::witness_session(&sessions, sandbox_id, q)?;
+        let session = sessions.get_mut(sandbox_id).unwrap();
+        if session.witness_originals.len() >= 16 || session.witness_originals.contains_key(&key) {
+            return Err(Status::resource_exhausted(
+                "witness original unavailable; read only",
+            ));
+        }
+        session.witness_originals.insert(
+            key.clone(),
+            openshell_core::proto::ProviderDetachWitnessControlV1 {
+                original_key: key,
+                request_sha256: q.request_sha256.clone(),
+                source_incarnation: q.source_incarnation.clone(),
+                boundary_incarnation: q.boundary_incarnation.clone(),
+                profile_sha256: q.profile_sha256.clone(),
+                state: "unknown".into(),
+                execution_id: q
+                    .installed_arm
+                    .as_ref()
+                    .and_then(|s| s.request.as_ref())
+                    .and_then(|a| a.attempt.as_ref())
+                    .unwrap()
+                    .execution_id
+                    .clone(),
+            },
+        );
+        session
+            .tx
+            .try_send(GatewayMessage {
+                payload: Some(gateway_message::Payload::ProviderDetachWitness(q.clone())),
+            })
+            .map_err(|_| Status::unavailable("witness original dispatch unknown"))
+    }
+
+    fn record_provider_witness(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        control: openshell_core::proto::ProviderDetachWitnessControlV1,
+    ) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|s| s.session_id == session_id && s.endpoint_status_initialized)
+        else {
+            return false;
+        };
+        let uuid = |s: &str| Uuid::parse_str(s).is_ok_and(|u| !u.is_nil() && u.to_string() == s);
+        let hash = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        };
+        if !uuid(&control.source_incarnation)
+            || !uuid(&control.boundary_incarnation)
+            || !hash(&control.profile_sha256)
+            || !control
+                .execution_id
+                .strip_prefix("exec-v1:")
+                .is_some_and(hash)
+        {
+            return false;
+        }
+        if control.state == "capability" {
+            if !control.original_key.is_empty() || !control.request_sha256.is_empty() {
+                return false;
+            }
+            return if let Some(original) = &session.witness_capability {
+                original == &control
+            } else {
+                session.witness_capability = Some(control);
+                true
+            };
+        }
+        let Some(original) = session.witness_originals.get_mut(&control.original_key) else {
+            return false;
+        };
+        if original.request_sha256 != control.request_sha256
+            || original.source_incarnation != control.source_incarnation
+            || original.boundary_incarnation != control.boundary_incarnation
+            || original.execution_id != control.execution_id
+            || original.profile_sha256 != control.profile_sha256
+            || !matches!(
+                control.state.as_str(),
+                "unknown" | "source-invalidated" | "cancel-pending" | "boundary-quiesced"
+            )
+        {
+            return false;
+        }
+        // Observations may only advance toward cancellation/quiescence, never
+        // erase an already observed fence or manufacture native refusal proof.
+        let rank = |v: &str| match v {
+            "source-invalidated" => 1,
+            "cancel-pending" => 2,
+            "boundary-quiesced" => 3,
+            _ => 0,
+        };
+        if rank(&control.state) < rank(&original.state) {
+            return true;
+        }
+        *original = control;
+        true
+    }
+
+    pub(crate) fn observe_provider_witness(
+        &self,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+        result: &mut openshell_core::proto::ProviderDetachWitnessInvocationV1,
+    ) {
+        let Some(target) = q
+            .installed_arm
+            .as_ref()
+            .and_then(|s| s.request.as_ref())
+            .and_then(|r| r.original_action.as_ref())
+            .and_then(|a| a.target.as_ref())
+        else {
+            return;
+        };
+        let Ok(sessions) = self.sessions.lock() else {
+            return;
+        };
+        let Ok(session) = Self::witness_session(&sessions, &target.sandbox_id, q) else {
+            return;
+        };
+        let Some(obs) = session
+            .witness_originals
+            .get(&result.original_key)
+            .filter(|v| v.request_sha256 == q.request_sha256)
+        else {
+            return;
+        };
+        result.source_invalidated = matches!(
+            obs.state.as_str(),
+            "source-invalidated" | "cancel-pending" | "boundary-quiesced"
+        );
+        result.boundary_cancel_pending = matches!(obs.state.as_str(), "cancel-pending");
+        result.boundary_quiesced = obs.state == "boundary-quiesced";
+        // No process/cancellation observation establishes credential refusal.
     }
 
     /// One bounded native metadata transition under the current authenticated
@@ -2462,6 +2749,11 @@ async fn handle_supervisor_message(
     owner_guard: &mut OwnerGuard,
 ) -> bool {
     match msg.payload {
+        Some(supervisor_message::Payload::ProviderDetachWitness(control)) => {
+            return state
+                .supervisor_sessions
+                .record_provider_witness(sandbox_id, session_id, control);
+        }
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
             match tokio::time::timeout(OWNER_RENEW_TIMEOUT, owner_index.renew(owner_guard)).await {
@@ -2879,6 +3171,7 @@ mod tests {
     fn user_principal(subject: &str) -> Principal {
         Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: subject.to_string(),
                 display_name: None,
                 roles: vec![],

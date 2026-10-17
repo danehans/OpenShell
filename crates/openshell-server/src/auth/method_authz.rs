@@ -203,6 +203,18 @@ mod tests {
         for (method, scope) in [
             ("ArmProviderDetachAttempt", "sandbox:provider-detach"),
             (
+                "ReserveProviderDetachWitness",
+                "sandbox:provider-detach:witness",
+            ),
+            (
+                "InvokeProviderDetachWitness",
+                "sandbox:provider-detach:witness",
+            ),
+            (
+                "GetProviderDetachWitnessInvocation",
+                "sandbox:provider-detach:witness:read",
+            ),
+            (
                 "ConditionalDetachSandboxProvider",
                 "sandbox:provider-detach",
             ),

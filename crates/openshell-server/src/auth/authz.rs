@@ -188,6 +188,81 @@ pub fn check_provider_detach_grant(
     Ok(())
 }
 
+/// Discovery discloses correlation metadata only; it never grants an invocation.
+#[allow(clippy::result_large_err)]
+pub fn check_provider_witness_metadata_grant(
+    identity: &Identity,
+    policy: &AuthzPolicy,
+    resource_sha256: &str,
+) -> Result<(), Status> {
+    let target = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method = "sandbox:provider-detach:witness:read";
+    if identity.provider != super::identity::IdentityProvider::Oidc
+        || !policy.scopes_enabled
+        || policy.admin_role.is_empty()
+        || policy.user_role.is_empty()
+        || (!policy.admin_role.is_empty() && identity.roles.contains(&policy.admin_role))
+        || (!policy.user_role.is_empty() && !identity.roles.contains(&policy.user_role))
+        || resource_sha256.len() != 64
+        || !resource_sha256
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        || !identity.scopes.iter().any(|v| v == method)
+        || !identity.scopes.contains(&target)
+        || identity.scopes.iter().any(|v| v != method && v != &target)
+    {
+        return Err(Status::permission_denied(
+            "witness metadata grant unavailable",
+        ));
+    }
+    Ok(())
+}
+
+/// Closed original witness authority, additional to ordinary method/workspace
+/// authorization. A broad/admin token never substitutes for this approval.
+#[allow(clippy::result_large_err)]
+pub fn check_provider_witness_grant<'a>(
+    identity: &'a Identity,
+    policy: &AuthzPolicy,
+    write: bool,
+    resource_sha256: &str,
+    request_sha256: &str,
+    now_ms: i64,
+) -> Result<&'a super::identity::ProviderDetachWitnessApproval, Status> {
+    let bad = || Status::permission_denied("provider witness approval unavailable");
+    let approval = identity
+        .provider_detach_witness_approval
+        .as_ref()
+        .ok_or_else(bad)?;
+    let target = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method = if write {
+        "sandbox:provider-detach:witness"
+    } else {
+        "sandbox:provider-detach:witness:read"
+    };
+    let allowed = [
+        "sandbox:provider-detach:witness",
+        "sandbox:provider-detach:witness:read",
+    ];
+    if identity.provider != super::identity::IdentityProvider::Oidc
+        || !policy.scopes_enabled
+        || !approval.valid_shape(&identity.subject)
+        || (!policy.admin_role.is_empty() && identity.roles.contains(&policy.admin_role))
+        || approval.resource_sha256 != resource_sha256
+        || approval.request_sha256 != request_sha256
+        || (write && now_ms >= approval.deadline_unix_ms)
+        || !identity.scopes.iter().any(|s| s == method)
+        || !identity.scopes.contains(&target)
+        || identity
+            .scopes
+            .iter()
+            .any(|s| s != &target && !allowed.contains(&s.as_str()))
+    {
+        return Err(bad());
+    }
+    Ok(approval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +342,7 @@ mod tests {
 
     fn identity_with_roles(roles: &[&str]) -> Identity {
         Identity {
+            provider_detach_witness_approval: None,
             subject: "test-user".to_string(),
             display_name: None,
             roles: roles.iter().map(|r| (*r).to_string()).collect(),
@@ -277,6 +353,7 @@ mod tests {
 
     fn identity_with_roles_and_scopes(roles: &[&str], scopes: &[&str]) -> Identity {
         Identity {
+            provider_detach_witness_approval: None,
             subject: "test-user".to_string(),
             display_name: None,
             roles: roles.iter().map(|r| (*r).to_string()).collect(),

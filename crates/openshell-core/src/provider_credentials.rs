@@ -11,9 +11,263 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 const MAX_RETAINED_CREDENTIAL_GENERATIONS: usize = 8;
+
+/// Immutable build input, never a runtime environment/configuration selector.
+/// Absence disables the optional witness before any new transport request.
+pub fn fixed_provider_witness_artifact_sha256() -> Option<&'static str> {
+    let digest = option_env!("OPENSHELL_PROVIDER_WITNESS_ARTIFACT_SHA256")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(digest)
+}
+pub fn fixed_provider_witness_profile() -> Option<String> {
+    let artifact = fixed_provider_witness_artifact_sha256()?;
+    Some(witness_sha256(format!("openshell.provider-detach.fixed-profile/v1\nartifact-sha256:{artifact}\nargv:--provider-detach-benign-witness-v1\nstdin:eof\nenv:empty\npty:false\n").as_bytes()))
+}
+
+/// Bounded typed decoding for Native adapters without adding a second
+/// protobuf dependency or permitting arbitrary JSON/command fields.
+pub fn decode_provider_witness_arm(
+    bytes: &[u8],
+) -> Option<crate::proto::ProviderDetachArmRequestV1> {
+    use prost::Message;
+    if bytes.len() > 8192 {
+        return None;
+    }
+    crate::proto::ProviderDetachArmRequestV1::decode(bytes).ok()
+}
+
+pub fn witness_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+pub fn witness_request_digest(request: &crate::proto::ProviderDetachWitnessRequestV1) -> String {
+    use prost::Message;
+    use sha2::{Digest, Sha256};
+    let mut original = request.clone();
+    original.request_sha256.clear();
+    let mut digest = Sha256::new();
+    digest.update(b"openshell.provider-detach.witness-request/v1\n");
+    digest.update(original.encode_to_vec());
+    format!("{:x}", digest.finalize())
+}
+pub fn witness_original_key(authority: &str, run: &str, action: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"openshell.provider-detach.original-witness/v1\n");
+    for value in [authority, run, action] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// Metadata for exactly one fixed-profile operation; never an argv/env request.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessOperation {
+    pub prepared_source_incarnation: String,
+    pub prepared_source_epoch: u64,
+    pub original_key: String,
+    pub request_sha256: String,
+    pub profile_sha256: String,
+    pub installed_arm_sha256: String,
+    pub boundary_incarnation: String,
+    pub prepared_ticket: String,
+    pub supervisor_session: String,
+    pub execution_id: String,
+    pub deadline_unix_ms: i64,
+    pub arm_request: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessCommittedPermit {
+    pub source_incarnation: String,
+    pub source_epoch: u64,
+    pub permit_id: String,
+    pub operation: WitnessOperation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessSourceFence {
+    pub source_incarnation: String,
+    pub epoch: u64,
+    pub disabled: bool,
+}
+
+#[derive(Debug)]
+struct WitnessSourceState {
+    incarnation: String,
+    epoch: u64,
+    usable: bool,
+    committed: HashSet<String>,
+    latest_wall_time_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessBoundaryCapability {
+    pub boundary_incarnation: String,
+    pub execution_id: String,
+    pub profile_sha256: String,
+}
+
+/// Native adapter only: authenticated existing boundary connection, exactly one
+/// exchange for prepare/permit/fence, and no generic execution fallback.
+#[async_trait::async_trait]
+pub trait ProviderWitnessBoundary: Send + Sync + fmt::Debug {
+    async fn capability(&self) -> Option<WitnessBoundaryCapability>;
+    async fn prepare(&self, operation: WitnessOperation) -> Option<WitnessOperation>;
+    async fn permit(&self, permit: WitnessCommittedPermit) -> bool;
+    async fn fence(&self, fence: WitnessSourceFence) -> bool;
+}
+
+impl fmt::Debug for WitnessOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WitnessOperation(<original-metadata>)")
+    }
+}
+impl fmt::Debug for WitnessCommittedPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WitnessCommittedPermit(<one-shot>)")
+    }
+}
+
+/// One outer gate shared by live Core handles and OPA for one execution.
+/// This is ephemeral authority; the gateway claim is the durable no-replay fence.
+#[derive(Debug)]
+pub struct WitnessLaunchGate {
+    state: Mutex<WitnessSourceState>,
+    fences: tokio::sync::watch::Sender<WitnessSourceFence>,
+}
+
+/// Borrowed owner-checked evidence of holding the outer gate; not serializable.
+pub struct WitnessSourceGuard<'a> {
+    owner: &'a WitnessLaunchGate,
+    state: MutexGuard<'a, WitnessSourceState>,
+}
+
+impl WitnessLaunchGate {
+    pub fn new() -> Arc<Self> {
+        let incarnation = uuid::Uuid::new_v4().to_string();
+        let (fences, _) = tokio::sync::watch::channel(WitnessSourceFence {
+            source_incarnation: incarnation.clone(),
+            epoch: 1,
+            disabled: false,
+        });
+        Arc::new(Self {
+            state: Mutex::new(WitnessSourceState {
+                incarnation,
+                epoch: 1,
+                usable: true,
+                committed: HashSet::new(),
+                latest_wall_time_ms: 0,
+            }),
+            fences,
+        })
+    }
+
+    pub fn lock(&self) -> WitnessSourceGuard<'_> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.usable = false;
+                state.epoch = state.epoch.saturating_add(1);
+                self.fences.send_replace(WitnessSourceFence {
+                    source_incarnation: state.incarnation.clone(),
+                    epoch: state.epoch,
+                    disabled: true,
+                });
+                state
+            }
+        };
+        WitnessSourceGuard { owner: self, state }
+    }
+
+    /// A notification, not a stop ACK. Transport runs after releasing the gate.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<WitnessSourceFence> {
+        self.fences.subscribe()
+    }
+
+    pub fn snapshot(&self) -> WitnessSourceFence {
+        let guard = self.lock();
+        WitnessSourceFence {
+            source_incarnation: guard.state.incarnation.clone(),
+            epoch: guard.state.epoch,
+            disabled: !guard.state.usable,
+        }
+    }
+}
+
+impl Drop for WitnessSourceGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.state.usable = false;
+            self.state.epoch = self.state.epoch.saturating_add(1);
+            self.owner.fences.send_replace(WitnessSourceFence {
+                source_incarnation: self.state.incarnation.clone(),
+                epoch: self.state.epoch,
+                disabled: true,
+            });
+        }
+    }
+}
+
+impl WitnessSourceGuard<'_> {
+    pub fn belongs_to(&self, gate: &Arc<WitnessLaunchGate>) -> bool {
+        std::ptr::eq(self.owner, Arc::as_ptr(gate))
+    }
+
+    /// R happens before effective publication; exhausted epochs never reset.
+    pub fn invalidate(&mut self) {
+        match self.state.epoch.checked_add(1) {
+            Some(epoch) => self.state.epoch = epoch,
+            None => self.state.usable = false,
+        }
+        self.owner.fences.send_replace(WitnessSourceFence {
+            source_incarnation: self.state.incarnation.clone(),
+            epoch: self.state.epoch,
+            disabled: !self.state.usable,
+        });
+    }
+
+    pub fn disable(&mut self) {
+        self.state.usable = false;
+        self.invalidate();
+    }
+
+    fn commit(
+        &mut self,
+        operation: &WitnessOperation,
+        now_ms: i64,
+    ) -> Option<WitnessCommittedPermit> {
+        self.state.latest_wall_time_ms = self.state.latest_wall_time_ms.max(now_ms);
+        if !self.state.usable
+            || self.state.committed.len() >= 16
+            || operation.prepared_source_incarnation != self.state.incarnation
+            || operation.prepared_source_epoch != self.state.epoch
+            || operation.deadline_unix_ms <= self.state.latest_wall_time_ms
+            || self.state.committed.contains(&operation.original_key)
+        {
+            return None;
+        }
+        self.state.committed.insert(operation.original_key.clone());
+        Some(WitnessCommittedPermit {
+            source_incarnation: self.state.incarnation.clone(),
+            source_epoch: self.state.epoch,
+            permit_id: uuid::Uuid::new_v4().to_string(),
+            operation: operation.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentialSnapshot {
@@ -80,6 +334,8 @@ struct CompiledStaticCredentialEndpointBinding {
 
 #[derive(Debug, Clone)]
 pub struct ProviderCredentialState {
+    witness_gate: Arc<WitnessLaunchGate>,
+    witness_boundary: Arc<OnceLock<Arc<dyn ProviderWitnessBoundary>>>,
     inner: Arc<RwLock<ProviderCredentialStateInner>>,
 }
 
@@ -332,6 +588,107 @@ fn retain_current_provider_subjects(inner: &mut ProviderCredentialStateInner) {
 }
 
 impl ProviderCredentialState {
+    /// Bind once to this execution's authenticated Native backend. No later
+    /// reconnect, alternate backend or unsupported peer replaces the original.
+    pub fn install_witness_boundary(&self, boundary: Arc<dyn ProviderWitnessBoundary>) -> bool {
+        self.witness_boundary.set(boundary).is_ok()
+    }
+    pub fn witness_boundary(&self) -> Option<Arc<dyn ProviderWitnessBoundary>> {
+        self.witness_boundary.get().cloned()
+    }
+    /// Bootstrap only, before any clones can observe this credential state.
+    /// Live state never swaps its gate independently of existing handles.
+    pub fn bind_witness_launch_gate(&mut self, gate: Arc<WitnessLaunchGate>) -> bool {
+        if Arc::strong_count(&self.inner) != 1 {
+            return false;
+        }
+        let old = self.witness_gate.lock();
+        if !old.state.committed.is_empty() || !old.state.usable {
+            return false;
+        }
+        let Ok(inner) = self.inner.read() else {
+            return false;
+        };
+        if inner.provider_detach.enabled || !inner.provider_detach.arms.is_empty() {
+            return false;
+        }
+        drop(inner);
+        drop(old);
+        self.witness_gate = gate;
+        true
+    }
+    pub fn witness_launch_gate(&self) -> Arc<WitnessLaunchGate> {
+        self.witness_gate.clone()
+    }
+
+    /// L is a one-shot authorization commit, never a child-start/refusal proof.
+    /// Caller holds matching outer gate and actual OPA publication locks.
+    pub fn commit_provider_witness_under_source_gate(
+        &self,
+        guard: &mut WitnessSourceGuard<'_>,
+        operation: &WitnessOperation,
+        now_ms: i64,
+    ) -> Option<WitnessCommittedPermit> {
+        use prost::Message;
+        use sha2::{Digest, Sha256};
+        if !guard.belongs_to(&self.witness_gate) || operation.arm_request.len() > 8192 {
+            return None;
+        }
+        let digest = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if [
+            &operation.original_key,
+            &operation.request_sha256,
+            &operation.profile_sha256,
+            &operation.installed_arm_sha256,
+        ]
+        .into_iter()
+        .any(|v| !digest(v))
+            || [&operation.boundary_incarnation, &operation.prepared_ticket]
+                .into_iter()
+                .any(|v| uuid::Uuid::parse_str(v).is_err())
+        {
+            return None;
+        }
+        let request =
+            crate::proto::ProviderDetachArmRequestV1::decode(operation.arm_request.as_slice())
+                .ok()?;
+        let attempt = request.attempt.as_ref()?;
+        let now = prost_types::Timestamp {
+            seconds: now_ms.div_euclid(1000),
+            nanos: i32::try_from(now_ms.rem_euclid(1000) * 1_000_000).ok()?,
+        };
+        if !detach_arm_time_valid(attempt, &now)
+            || attempt.supervisor_session != operation.supervisor_session
+            || attempt.execution_id != operation.execution_id
+            || detach_time_ns(attempt.deadline.as_ref()?)? / 1_000_000
+                != i128::from(operation.deadline_unix_ms)
+        {
+            return None;
+        }
+        let inner = self.inner.read().ok()?;
+        let arm = inner.provider_detach.arms.get(&request.attempt_id)?;
+        let installed = arm.server_install_ack.as_ref()?;
+        if !inner.provider_detach.enabled
+            || inner.provider_detach.boot_id != attempt.gateway_boot_id
+            || inner.provider_detach.session_id != operation.supervisor_session
+            || arm.seal.request.as_ref() != Some(&request)
+            || arm.installation_id != inner.current.installation_id
+            || inner.current.revision != attempt.provider_env_revision
+            || format!("{:x}", Sha256::digest(installed.encode_to_vec()))
+                != operation.installed_arm_sha256
+            || !(arm.policy_current)()
+            || arm.consumed
+        {
+            return None;
+        }
+        // This does not consume the separate Native credential-refusal witness.
+        guard.commit(operation, now_ms)
+    }
+
     /// Capture only a grounded static-provider identity. Refresh handles and
     /// dynamic grants have a different association contract and are unsupported.
     pub fn capture_static_provider_revocation(
@@ -345,6 +702,8 @@ impl ProviderCredentialState {
     /// Explicit trusted source/configuration switch, default OFF. This changes
     /// observation support only; it grants neither an arm nor an invocation.
     pub fn enable_provider_detach_attempts(&self) {
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -454,6 +813,8 @@ impl ProviderCredentialState {
         let combined_resolver = merge_resolvers(&generations, current_resolver.as_ref());
 
         Self {
+            witness_gate: WitnessLaunchGate::new(),
+            witness_boundary: Arc::new(OnceLock::new()),
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
                 files: HashMap::new(),
@@ -511,6 +872,8 @@ impl ProviderCredentialState {
         );
 
         Ok(Self {
+            witness_gate: WitnessLaunchGate::new(),
+            witness_boundary: Arc::new(OnceLock::new()),
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
                 files: HashMap::new(),
@@ -546,6 +909,8 @@ impl ProviderCredentialState {
         });
 
         Self {
+            witness_gate: WitnessLaunchGate::new(),
+            witness_boundary: Arc::new(OnceLock::new()),
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
                 current: snapshot.clone(),
                 files: HashMap::new(),
@@ -575,6 +940,8 @@ impl ProviderCredentialState {
         revision: u64,
         mut child_env: HashMap<String, String>,
     ) -> usize {
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -744,6 +1111,8 @@ impl ProviderCredentialState {
     /// and the corresponding env var should not be inherited by child processes
     /// or SSH sessions.
     pub fn remove_env_key(&self, key: &str) {
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -811,6 +1180,8 @@ impl ProviderCredentialState {
 
     /// Attach the complete file set to a prepared provider snapshot.
     pub fn set_managed_files(&self, files: HashMap<String, String>) {
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         self.inner
             .write()
             .expect("provider credential state poisoned")
@@ -881,6 +1252,8 @@ impl ProviderCredentialState {
         revision: u64,
         mut child_env: HashMap<String, String>,
     ) -> std::io::Result<u64> {
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -984,6 +1357,8 @@ impl ProviderCredentialState {
                 credential_expires_at_ms,
                 revision,
             );
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -1052,6 +1427,8 @@ impl ProviderCredentialState {
                 revision,
                 &stable_handles,
             );
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -1104,6 +1481,19 @@ impl ProviderCredentialState {
     /// keys or authorize old placeholders for a different provider. Callers
     /// must serialize installs and revocations, as for bound-environment installs.
     pub fn install_prepared(&self, prepared: &Self) -> usize {
+        let mut guard = self.witness_gate.lock();
+        self.install_prepared_under_source_gate(prepared, &mut guard)
+    }
+
+    pub fn install_prepared_under_source_gate(
+        &self,
+        prepared: &Self,
+        source_gate: &mut WitnessSourceGuard<'_>,
+    ) -> usize {
+        assert!(
+            source_gate.belongs_to(&self.witness_gate),
+            "source gate owner mismatch"
+        );
         // Release the candidate lock before taking the live lock, including
         // when a caller passes another handle to the same state.
         let (snapshot, generations, current_resolver, bindings, non_secret_keys, files) = {
@@ -1120,6 +1510,7 @@ impl ProviderCredentialState {
                 candidate.files.clone(),
             )
         };
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -1178,6 +1569,8 @@ impl ProviderCredentialState {
         revision: u64,
         dynamic_credentials: Option<HashMap<String, crate::proto::ProviderProfileCredential>>,
     ) {
+        let mut source_gate = self.witness_gate.lock();
+        source_gate.invalidate();
         let mut inner = self
             .inner
             .write()
@@ -1395,6 +1788,7 @@ impl ProviderCredentialState {
         if !valid(boot) || !valid(session) {
             return;
         }
+        let mut source_gate = self.witness_gate.lock();
         let mut inner = self
             .inner
             .write()
@@ -1403,6 +1797,7 @@ impl ProviderCredentialState {
             return;
         }
         if inner.provider_detach.boot_id != boot || inner.provider_detach.session_id != session {
+            source_gate.invalidate();
             for arm in inner.provider_detach.arms.values_mut() {
                 arm.consumed = true;
                 arm.result = 4;
@@ -1463,11 +1858,13 @@ impl ProviderCredentialState {
         {
             return false;
         }
+        let mut source_gate = self.witness_gate.lock();
         let mut inner = self
             .inner
             .write()
             .expect("provider credential state poisoned");
-        if !inner.provider_detach.enabled
+        if !(policy_current)()
+            || !inner.provider_detach.enabled
             || inner.provider_detach.boot_id != a.gateway_boot_id
             || inner.provider_detach.session_id != a.supervisor_session
             || inner.current.revision != a.provider_env_revision
@@ -1478,6 +1875,7 @@ impl ProviderCredentialState {
         if let Some(old) = inner.provider_detach.arms.get(&q.attempt_id) {
             return old.seal == *seal; // Never renew or reinstall an original record.
         }
+        source_gate.invalidate();
         let original_env_revision = before.provider_env_revision;
         let mut originals = inner
             .provider_detach
@@ -1575,6 +1973,7 @@ impl ProviderCredentialState {
         let Some(a) = q.attempt.as_ref() else {
             return false;
         };
+        let mut source_gate = self.witness_gate.lock();
         let mut inner = self
             .inner
             .write()
@@ -1603,6 +2002,9 @@ impl ProviderCredentialState {
         if let Some(old) = arm.server_install_ack.as_ref() {
             return old == seal;
         }
+        if arm.server_install_ack.as_ref() != Some(seal) {
+            source_gate.invalidate();
+        }
         arm.server_install_ack = Some(seal.clone());
         true
     }
@@ -1614,6 +2016,7 @@ impl ProviderCredentialState {
         sequence: u64,
         now: &prost_types::Timestamp,
     ) -> Option<crate::proto::ProviderDetachSupervisorReportV1> {
+        let mut source_gate = self.witness_gate.lock();
         let mut inner = self.inner.write().ok()?;
         if !inner.provider_detach.enabled {
             return None;
@@ -1622,6 +2025,17 @@ impl ProviderCredentialState {
         let revision = inner.current.revision;
         let installation = inner.current.installation_id.clone();
         let time = detach_time_ns(now)?;
+        if inner.provider_detach.arms.values().any(|arm| {
+            arm.seal
+                .request
+                .as_ref()
+                .and_then(|q| q.attempt.as_ref())
+                .and_then(|a| a.deadline.as_ref())
+                .and_then(detach_time_ns)
+                .is_none_or(|end| time >= end)
+        }) {
+            source_gate.invalidate();
+        }
         inner.provider_detach.arms.retain(|_, arm| {
             arm.seal
                 .request
@@ -1693,6 +2107,7 @@ impl ProviderCredentialState {
         if report.result == 0 {
             return;
         }
+        let _source_gate = self.witness_gate.lock();
         let mut inner = self
             .inner
             .write()
@@ -1724,6 +2139,7 @@ impl ProviderCredentialState {
         captured_revision: u64,
         now: prost_types::Timestamp,
     ) -> ProviderDetachWitness {
+        let mut source_gate = self.witness_gate.lock();
         let mut inner = self
             .inner
             .write()
@@ -1743,6 +2159,7 @@ impl ProviderCredentialState {
         if a.challenge != challenge || arm.consumed || arm.server_install_ack.is_none() {
             return ProviderDetachWitness::NotArmed;
         }
+        source_gate.invalidate();
         arm.consumed = true;
         let valid = a.gateway_boot_id == inner.provider_detach.boot_id
             && a.supervisor_session == inner.provider_detach.session_id
@@ -1823,6 +2240,82 @@ impl ProviderCredentialState {
 
 #[cfg(test)]
 mod tests {
+    fn witness_operation(gate: &super::WitnessLaunchGate, key: &str) -> super::WitnessOperation {
+        let current = gate.snapshot();
+        super::WitnessOperation {
+            prepared_source_incarnation: current.source_incarnation,
+            prepared_source_epoch: current.epoch,
+            original_key: key.into(),
+            request_sha256: "b".repeat(64),
+            profile_sha256: "c".repeat(64),
+            installed_arm_sha256: "d".repeat(64),
+            boundary_incarnation: uuid::Uuid::new_v4().to_string(),
+            prepared_ticket: uuid::Uuid::new_v4().to_string(),
+            supervisor_session: uuid::Uuid::new_v4().to_string(),
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            deadline_unix_ms: 2000,
+            arm_request: vec![],
+        }
+    }
+    #[test]
+    fn witness_gate_revocation_before_commit_refuses_original() {
+        let gate = super::WitnessLaunchGate::new();
+        let op = witness_operation(&gate, "original");
+        gate.lock().invalidate();
+        assert!(gate.lock().commit(&op, 1000).is_none());
+        let current = witness_operation(&gate, "fresh");
+        assert!(gate.lock().commit(&current, 1000).is_some());
+        assert!(gate.lock().commit(&current, 1000).is_none());
+    }
+    #[test]
+    fn witness_gate_commit_before_revocation_keeps_original_permit_distinct() {
+        let gate = super::WitnessLaunchGate::new();
+        let op = witness_operation(&gate, "original");
+        let permit = gate.lock().commit(&op, 1000).unwrap();
+        gate.lock().invalidate();
+        assert!(permit.source_epoch < gate.snapshot().epoch);
+        assert!(gate.lock().commit(&op, 1000).is_none());
+        // The earlier permit exists; remote cancellation is a separate fact.
+        assert_eq!(permit.operation.original_key, "original");
+    }
+    #[test]
+    fn witness_gate_restart_deadline_quota_and_overflow_never_reopen() {
+        let gate = super::WitnessLaunchGate::new();
+        let op = witness_operation(&gate, "original");
+        let restarted = super::WitnessLaunchGate::new();
+        assert!(restarted.lock().commit(&op, 1000).is_none());
+        assert!(gate.lock().commit(&op, 2000).is_none());
+        assert!(gate.lock().commit(&op, 1000).is_none());
+        let gate = super::WitnessLaunchGate::new();
+        for n in 0..16 {
+            let op = witness_operation(&gate, &format!("original-{n}"));
+            assert!(gate.lock().commit(&op, 1000).is_some());
+        }
+        let op = witness_operation(&gate, "seventeenth");
+        assert!(gate.lock().commit(&op, 1000).is_none());
+        {
+            let mut guard = gate.lock();
+            guard.state.epoch = u64::MAX;
+            guard.invalidate();
+        }
+        assert!(gate.snapshot().disabled);
+    }
+    #[test]
+    fn witness_gate_poison_disables_and_foreign_guard_cannot_authorize() {
+        let gate = super::WitnessLaunchGate::new();
+        let clone = gate.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = clone.state.lock().unwrap();
+            panic!("synthetic gate poison");
+        })
+        .join();
+        assert!(gate.snapshot().disabled);
+        let op = witness_operation(&gate, "original");
+        assert!(gate.lock().commit(&op, 1000).is_none());
+        let other = super::WitnessLaunchGate::new();
+        assert!(!gate.lock().belongs_to(&other));
+    }
+
     use super::*;
     use crate::google_cloud;
 
@@ -3882,6 +4375,102 @@ mod tests {
             installed_time: None,
         };
         (state, seal, obs, now)
+    }
+    #[test]
+    fn witness_source_commit_requires_actual_server_arm_and_current_installation() {
+        use prost::Message;
+        let (state, mut seal, obs, now) = local_detach_arm_fixture();
+        let installed = state.snapshot().installation_id.clone();
+        assert!(state.install_provider_detach_arm(
+            &seal,
+            &obs,
+            &installed,
+            11,
+            now,
+            Arc::new(|| true)
+        ));
+        seal.install_sequence = 11;
+        seal.installed_time = Some(now);
+        let current = state.witness_launch_gate().snapshot();
+        let arm = seal.request.as_ref().unwrap();
+        let attempt = arm.attempt.as_ref().unwrap();
+        let mut op = super::WitnessOperation {
+            prepared_source_incarnation: current.source_incarnation,
+            prepared_source_epoch: current.epoch,
+            original_key: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+            profile_sha256: "c".repeat(64),
+            installed_arm_sha256: super::witness_sha256(&seal.encode_to_vec()),
+            boundary_incarnation: uuid::Uuid::new_v4().to_string(),
+            prepared_ticket: uuid::Uuid::new_v4().to_string(),
+            supervisor_session: attempt.supervisor_session.clone(),
+            execution_id: attempt.execution_id.clone(),
+            deadline_unix_ms: attempt.deadline.as_ref().unwrap().seconds * 1000,
+            arm_request: arm.encode_to_vec(),
+        };
+        let millis = now.seconds * 1000;
+        assert!(
+            state
+                .commit_provider_witness_under_source_gate(
+                    &mut state.witness_launch_gate().lock(),
+                    &op,
+                    millis
+                )
+                .is_none()
+        );
+        assert!(state.acknowledge_provider_detach_arm(&seal));
+        assert!(
+            state
+                .commit_provider_witness_under_source_gate(
+                    &mut state.witness_launch_gate().lock(),
+                    &op,
+                    millis
+                )
+                .is_none()
+        );
+        op.prepared_source_epoch = state.witness_launch_gate().snapshot().epoch;
+        let permit = state
+            .commit_provider_witness_under_source_gate(
+                &mut state.witness_launch_gate().lock(),
+                &op,
+                millis,
+            )
+            .unwrap();
+        assert_eq!(permit.operation, op);
+        assert!(
+            state
+                .commit_provider_witness_under_source_gate(
+                    &mut state.witness_launch_gate().lock(),
+                    &op,
+                    millis
+                )
+                .is_none()
+        );
+        // Source commitment did not spend the separate actual Native resolver
+        // refusal witness. A process/permit remains a different observation.
+        let observed = state
+            .provider_detach_report(&obs.session_id, 12, &now)
+            .unwrap();
+        assert_eq!(observed.result, 0);
+    }
+    #[test]
+    fn witness_gate_binding_is_bootstrap_only_and_actual_writers_invalidate() {
+        let mut state = ProviderCredentialState::from_child_env_snapshot(1, HashMap::new());
+        let gate = super::WitnessLaunchGate::new();
+        assert!(state.bind_witness_launch_gate(gate.clone()));
+        let original = gate.snapshot().epoch;
+        state.enable_provider_detach_attempts();
+        assert!(gate.snapshot().epoch > original);
+        assert!(!state.bind_witness_launch_gate(super::WitnessLaunchGate::new()));
+        let original = gate.snapshot().epoch;
+        state.bind_provider_detach_session(
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        );
+        assert!(gate.snapshot().epoch > original);
+        let clone = state.clone();
+        assert!(!state.bind_witness_launch_gate(super::WitnessLaunchGate::new()));
+        drop(clone);
     }
     #[test]
     fn provider_detach_arm_requires_actual_install_ack_and_consumes_exact_header_once() {

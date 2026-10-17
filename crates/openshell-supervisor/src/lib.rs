@@ -543,12 +543,23 @@ pub async fn run_network_proxy(
         }),
     };
 
-    let provider_credentials = ProviderCredentialState::from_environment(
+    let mut provider_credentials = ProviderCredentialState::from_environment(
         0,
         std::collections::HashMap::new(),
         std::collections::HashMap::new(),
         std::collections::HashMap::new(),
     );
+    if let Some(engine) = opa_engine.as_ref() {
+        if !provider_credentials.bind_witness_launch_gate(engine.witness_launch_gate()) {
+            return Err(miette::miette!(
+                "credential source was shared before gate binding"
+            ));
+        }
+        if openshell_core::provider_credentials::fixed_provider_witness_profile().is_some() {
+            provider_credentials.enable_provider_detach_attempts();
+        }
+    }
+
     let (_, workspace_rx) = tokio::sync::watch::channel(String::new());
     let tls_dir = prepare_network_proxy_tls_dir(tls_dir)?;
     let mut networking = openshell_supervisor_network::run::run_networking(
@@ -840,7 +851,7 @@ async fn run_sandbox_with_backend(
     let workspace = workdir;
 
     let provider_readiness = ProviderReadinessTracker::new();
-    let provider_credentials = if let Some(environment) = captured_provider_environment {
+    let mut provider_credentials = if let Some(environment) = captured_provider_environment {
         environment.install(&provider_readiness)
     } else {
         // Fetch provider environment variables from the server.
@@ -892,6 +903,17 @@ async fn run_sandbox_with_backend(
             |result| initial_provider_credentials(result, &provider_readiness),
         )
     };
+
+    if let Some(engine) = opa_engine.as_ref() {
+        if !provider_credentials.bind_witness_launch_gate(engine.witness_launch_gate()) {
+            return Err(miette::miette!(
+                "credential source was shared before gate binding"
+            ));
+        }
+        if openshell_core::provider_credentials::fixed_provider_witness_profile().is_some() {
+            provider_credentials.enable_provider_detach_attempts();
+        }
+    }
 
     if credential_gating_unavailable(
         &loaded_policy_origin,
@@ -1244,6 +1266,16 @@ async fn run_sandbox_with_backend(
         workload_started_tx.send_replace(true);
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();
+        let witness_control = match opa_engine.as_ref() {
+            Some(engine) => {
+                provider_readiness::fixed_witness_control(
+                    provider_credentials.clone(),
+                    engine.clone(),
+                )
+                .await
+            }
+            None => None,
+        };
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
@@ -1256,6 +1288,7 @@ async fn run_sandbox_with_backend(
             running.loopback_connector(),
             agent.clone(),
             Some(supervisor_session_updates),
+            witness_control,
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
@@ -3004,7 +3037,7 @@ async fn reload_gateway_policy_runtime(
         middleware,
         transparent_tcp,
         None,
-        || {},
+        |_| {},
     )
     .await
 }
@@ -3016,7 +3049,7 @@ async fn reload_gateway_configuration_runtime(
     middleware: MiddlewareReloadContext<'_>,
     transparent_tcp: TransparentTcpReloadState,
     vm_identity: Option<VmPolicyIdentity>,
-    commit_credentials: impl FnOnce(),
+    commit_credentials: impl FnOnce(&mut openshell_core::provider_credentials::WitnessSourceGuard<'_>),
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
     if let (Some(identity), Some(policy)) = (vm_identity, policy) {
         // Global policy changes also reach this path. Validate before any
@@ -4732,9 +4765,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 },
                 ctx.transparent_tcp,
                 ctx.vm_identity,
-                || {
+                |source_gate| {
                     if let Some(prepared) = prepared_provider.as_ref() {
-                        ctx.provider_credentials.install_prepared(prepared);
+                        ctx.provider_credentials
+                            .install_prepared_under_source_gate(prepared, source_gate);
                     }
                 },
             )
@@ -6014,7 +6048,7 @@ network_policies:
                 uid: 1000,
                 gid: 1001,
             }),
-            || {
+            |_| {
                 committed.store(true, Ordering::SeqCst);
             },
         )
@@ -8049,7 +8083,7 @@ network_policies:
         middleware_connector: MiddlewareConnector,
     ) -> PolicyPollLoopContext {
         let (workspace_tx, _workspace_rx) = tokio::sync::watch::channel(String::new());
-        let provider_credentials =
+        let mut provider_credentials =
             ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
         let provider_readiness = ProviderReadinessTracker::new();
         // This fixture models a successfully installed initial launch snapshot.
@@ -8068,6 +8102,7 @@ network_policies:
                 None,
             );
         }
+        assert!(provider_credentials.bind_witness_launch_gate(opa_engine.witness_launch_gate()));
         PolicyPollLoopContext {
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),

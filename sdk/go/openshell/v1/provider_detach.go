@@ -815,3 +815,199 @@ func (c *ProviderDetachmentClient) QueryDetachAttempt(ctx context.Context, q Pro
 	}
 	return detachReadbackFromProto(reply.GetAttempt(), q, time.Now())
 }
+
+// ProviderDetachWitnessProfile is the sole compiled benign profile. Selecting
+// this name does not create an issuer grant, installed artifact or Native support.
+const ProviderDetachWitnessProfile = "provider-detach-benign-witness-v1"
+
+type ProviderDetachWitnessRequest struct {
+	RunID               string                `json:"run_id"`
+	ProfileID           string                `json:"profile_id"`
+	ProfileSHA256       string                `json:"profile_sha256"`
+	InstalledArm        ProviderDetachArmSeal `json:"installed_arm"`
+	SourceIncarnation   string                `json:"source_incarnation"`
+	BoundaryIncarnation string                `json:"boundary_incarnation"`
+	RequestSHA256       string                `json:"request_sha256"`
+}
+
+// No argv, environment, stdin, PTY, helper or executable selector is exposed.
+func (q ProviderDetachWitnessRequest) native() *pb.ProviderDetachWitnessRequestV1 {
+	return &pb.ProviderDetachWitnessRequestV1{RunId: q.RunID, ProfileId: q.ProfileID, ProfileSha256: q.ProfileSHA256,
+		InstalledArm: &pb.ProviderDetachArmSealV1{Request: detachArmToProto(q.InstalledArm.Request), HoldGeneration: q.InstalledArm.HoldGeneration,
+			RowResourceVersion: q.InstalledArm.RowResourceVersion, InstallSequence: q.InstalledArm.InstallSequence, InstalledTime: timestamppb.New(q.InstalledArm.InstalledAt)},
+		SourceIncarnation: q.SourceIncarnation, BoundaryIncarnation: q.BoundaryIncarnation, RequestSha256: q.RequestSHA256}
+}
+func (q ProviderDetachWitnessRequest) SHA256() string {
+	native := q.native()
+	native.RequestSha256 = ""
+	raw, err := (gproto.MarshalOptions{Deterministic: true}).Marshal(native)
+	if err != nil {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte("openshell.provider-detach.witness-request/v1\n"))
+	h.Write(raw)
+	return hex.EncodeToString(h.Sum(nil))
+}
+func (q ProviderDetachWitnessRequest) originalKey() string {
+	h := sha256.New()
+	h.Write([]byte("openshell.provider-detach.original-witness/v1\n"))
+	for _, v := range []string{q.InstalledArm.Request.OriginalAction.Target.Authority, q.RunID, q.InstalledArm.Request.OriginalAction.ActionID} {
+		var size [8]byte
+		for i := 7; i >= 0; i-- {
+			size[i] = byte(uint64(len(v)) >> uint((7-i)*8))
+		}
+		h.Write(size[:])
+		h.Write([]byte(v))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+func (q ProviderDetachWitnessRequest) Validate() error {
+	if q.InstalledArm.Request.Validate() != nil || !detachValidUUID(q.RunID) || !detachValidUUID(q.SourceIncarnation) || !detachValidUUID(q.BoundaryIncarnation) ||
+		q.ProfileID != ProviderDetachWitnessProfile || !detachHashPattern.MatchString(q.ProfileSHA256) || q.RequestSHA256 != q.SHA256() ||
+		q.InstalledArm.HoldGeneration == 0 || q.InstalledArm.RowResourceVersion == 0 || q.InstalledArm.InstallSequence == 0 || q.InstalledArm.InstalledAt.IsZero() ||
+		timestamppb.New(q.InstalledArm.InstalledAt).CheckValid() != nil {
+		return detachNativeError()
+	}
+	raw, err := gproto.Marshal(q.native())
+	if err != nil || len(raw) > 12*1024 {
+		return detachNativeError()
+	}
+	return nil
+}
+
+type ProviderDetachWitnessInvocation struct {
+	OriginalKey           string                         `json:"original_key"`
+	RequestSHA256         string                         `json:"request_sha256"`
+	State                 string                         `json:"state"` // reserved or unknown; never an automatic replay grant
+	SourceInvalidated     bool                           `json:"source_invalidated"`
+	BoundaryCancelPending bool                           `json:"boundary_cancel_pending"`
+	BoundaryQuiesced      bool                           `json:"boundary_quiesced"`
+	NativeObservation     *ProviderDetachAttemptReadback `json:"native_observation,omitempty"`
+}
+
+func witnessReadback(p *pb.ProviderDetachWitnessInvocationV1, q ProviderDetachWitnessRequest) (ProviderDetachWitnessInvocation, error) {
+	unknown := ProviderDetachWitnessInvocation{State: "unknown"}
+	if p == nil || p.OriginalKey != q.originalKey() || p.RequestSha256 != q.RequestSHA256 || (p.State != "reserved" && p.State != "unknown") ||
+		(p.BoundaryCancelPending && p.BoundaryQuiesced) || ((p.BoundaryCancelPending || p.BoundaryQuiesced) && !p.SourceInvalidated) {
+		return unknown, detachNativeError()
+	}
+	result := ProviderDetachWitnessInvocation{p.OriginalKey, p.RequestSha256, p.State, p.SourceInvalidated, p.BoundaryCancelPending, p.BoundaryQuiesced, nil}
+	if p.NativeObservation != nil {
+		native, err := detachReadbackFromProto(p.NativeObservation, q.InstalledArm.Request, time.Now())
+		if err != nil {
+			return unknown, err
+		}
+		result.NativeObservation = &native
+	}
+	return result, nil
+}
+func (c *ProviderDetachmentClient) witnessBound(ctx context.Context, q ProviderDetachWitnessRequest, write bool) (context.Context, context.CancelFunc, error) {
+	if q.Validate() != nil {
+		return nil, nil, detachNativeError()
+	}
+	bounded, cancel, err := c.bound(ctx, &q.InstalledArm.Request.OriginalAction)
+	if err != nil {
+		return nil, nil, err
+	}
+	if write {
+		deadline := q.InstalledArm.Request.Attempt.Deadline.Time()
+		if !time.Now().Before(deadline) {
+			cancel()
+			return nil, nil, detachNativeError()
+		}
+		shorter, shortCancel := context.WithDeadline(bounded, deadline)
+		return shorter, func() { shortCancel(); cancel() }, nil
+	}
+	return bounded, cancel, nil
+}
+
+// ReserveDetachWitness reserves original gateway ownership; it does not start a child.
+func (c *ProviderDetachmentClient) ReserveDetachWitness(ctx context.Context, q ProviderDetachWitnessRequest) (ProviderDetachWitnessInvocation, error) {
+	unknown := ProviderDetachWitnessInvocation{State: "unknown"}
+	bounded, cancel, err := c.witnessBound(ctx, q, true)
+	if err != nil {
+		return unknown, err
+	}
+	defer cancel()
+	reply, err := c.rpc.ReserveProviderDetachWitness(bounded, &pb.ReserveProviderDetachWitnessRequest{WorkspaceScope: namedWorkspaceScope(c.resource.Workspace), Request: q.native()})
+	if err != nil {
+		return unknown, converter.FromGRPCError(err)
+	}
+	if reply == nil {
+		return unknown, detachNativeError()
+	}
+	return witnessReadback(reply.Invocation, q)
+}
+
+// InvokeDetachWitness makes ONE call. Any unknown result permits only original
+// readback, never another invoke, fresh attempt, rearm or generic Exec fallback.
+func (c *ProviderDetachmentClient) InvokeDetachWitness(ctx context.Context, q ProviderDetachWitnessRequest) (ProviderDetachWitnessInvocation, error) {
+	unknown := ProviderDetachWitnessInvocation{State: "unknown"}
+	bounded, cancel, err := c.witnessBound(ctx, q, true)
+	if err != nil {
+		return unknown, err
+	}
+	defer cancel()
+	reply, err := c.rpc.InvokeProviderDetachWitness(bounded, &pb.InvokeProviderDetachWitnessRequest{WorkspaceScope: namedWorkspaceScope(c.resource.Workspace), Request: q.native()})
+	if err != nil {
+		return unknown, converter.FromGRPCError(err)
+	}
+	if reply == nil {
+		return unknown, detachNativeError()
+	}
+	return witnessReadback(reply.Invocation, q)
+}
+
+// QueryDetachWitness is read-only; it cannot refresh a deadline or grant a launch.
+func (c *ProviderDetachmentClient) QueryDetachWitness(ctx context.Context, q ProviderDetachWitnessRequest) (ProviderDetachWitnessInvocation, error) {
+	unknown := ProviderDetachWitnessInvocation{State: "unknown"}
+	bounded, cancel, err := c.witnessBound(ctx, q, false)
+	if err != nil {
+		return unknown, err
+	}
+	defer cancel()
+	reply, err := c.rpc.GetProviderDetachWitnessInvocation(bounded, &pb.GetProviderDetachWitnessInvocationRequest{WorkspaceScope: namedWorkspaceScope(c.resource.Workspace), Request: q.native()})
+	if err != nil {
+		return unknown, converter.FromGRPCError(err)
+	}
+	if reply == nil || reply.Capability != nil || reply.CapabilityResource != nil || reply.CapabilitySupervisorSession != "" {
+		return unknown, detachNativeError()
+	}
+	return witnessReadback(reply.Invocation, q)
+}
+
+// ProviderDetachWitnessMetadata is a stale-able authenticated snapshot, not
+// transferable authority. Discovery never refreshes an original invocation.
+type ProviderDetachWitnessMetadata struct {
+	Resource                                                                 ProviderDetachResource
+	SupervisorSession, SourceIncarnation, BoundaryIncarnation, ProfileSHA256 string
+}
+
+func witnessMetadataReadback(p *pb.GetProviderDetachWitnessInvocationResponse, resource ProviderDetachResource) (ProviderDetachWitnessMetadata, error) {
+	empty := ProviderDetachWitnessMetadata{}
+	if p == nil || p.Invocation != nil || p.Capability == nil || p.CapabilityResource == nil || !detachValidUUID(p.CapabilitySupervisorSession) || !gproto.Equal(p.CapabilityResource, detachResourceToProto(resource)) {
+		return empty, detachNativeError()
+	}
+	cap := p.Capability
+	if cap.State != "capability" || cap.OriginalKey != "" || cap.RequestSha256 != "" || cap.ExecutionId != resource.ExecutionID || !detachValidUUID(cap.SourceIncarnation) || !detachValidUUID(cap.BoundaryIncarnation) || !detachHashPattern.MatchString(cap.ProfileSha256) {
+		return empty, detachNativeError()
+	}
+	return ProviderDetachWitnessMetadata{resource, p.CapabilitySupervisorSession, cap.SourceIncarnation, cap.BoundaryIncarnation, cap.ProfileSha256}, nil
+}
+
+// DiscoverDetachWitnessMetadata makes one explicit read, with no reserve,
+// approval issuance, Arm, dispatch or unknown-operation retry fallback.
+func (c *ProviderDetachmentClient) DiscoverDetachWitnessMetadata(ctx context.Context) (ProviderDetachWitnessMetadata, error) {
+	empty := ProviderDetachWitnessMetadata{}
+	bounded, cancel, err := c.bound(ctx, nil)
+	if err != nil {
+		return empty, err
+	}
+	defer cancel()
+	reply, err := c.rpc.GetProviderDetachWitnessInvocation(bounded, &pb.GetProviderDetachWitnessInvocationRequest{WorkspaceScope: namedWorkspaceScope(c.resource.Workspace), CapabilityResources: []*pb.ProviderDetachResourceV1{detachResourceToProto(c.resource)}})
+	if err != nil {
+		return empty, converter.FromGRPCError(err)
+	}
+	return witnessMetadataReadback(reply, c.resource)
+}

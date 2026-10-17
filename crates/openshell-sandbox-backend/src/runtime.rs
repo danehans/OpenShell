@@ -437,6 +437,20 @@ impl ReadyBoundary for RemoteReady {
         else {
             return Err(unexpected_response("started", &response));
         };
+        // Installed only after the original Native agent starts. The weak
+        // adapter cannot prolong/adopt a lost boundary or expose generic Exec.
+        let original_credential = BoundaryCredential::capture(&self.client.sandbox_bearer).ok();
+        let original_connection = self.client.grpc_channel.lock().await.clone();
+        if let (Some(credential), Some(connection)) = (original_credential, original_connection)
+            && credential.epoch == connection.credential_epoch
+            && credential.fingerprint == connection.bearer_fingerprint
+            && connection.generation != 0
+            && !connection.transport.is_aborted()
+        {
+            let _ = self.provider_credentials.install_witness_boundary(Arc::new(
+                NativeWitnessBoundary::pin(&self.client, &connection),
+            ));
+        }
         let process = Arc::new(RemoteProcess {
             client: self.client.clone(),
             process_id,
@@ -613,6 +627,164 @@ async fn pump_process_responses(
     };
     if let Some(completion) = completion {
         let _ = completion.send(status);
+    }
+}
+
+struct NativeWitnessBoundary {
+    client: std::sync::Weak<BoundaryClient>,
+    original_generation: u64,
+    original_epoch: openshell_core::jwt::CredentialEpoch,
+    original_bearer_fingerprint: [u8; 32],
+    original_transport: std::sync::Weak<TransportAbort>,
+}
+impl std::fmt::Debug for NativeWitnessBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeWitnessBoundary(<original-authenticated-connection>)")
+    }
+}
+
+impl std::fmt::Debug for BoundaryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BoundaryClient(<authenticated>)")
+    }
+}
+impl NativeWitnessBoundary {
+    fn pin(client: &Arc<BoundaryClient>, original: &CachedGrpcChannel) -> Self {
+        Self {
+            client: Arc::downgrade(client),
+            original_generation: original.generation,
+            original_epoch: original.credential_epoch,
+            original_bearer_fingerprint: original.bearer_fingerprint,
+            original_transport: Arc::downgrade(&original.transport),
+        }
+    }
+    fn matches_original(&self, current: &CachedGrpcChannel) -> bool {
+        current.generation == self.original_generation
+            && current.credential_epoch == self.original_epoch
+            && current.bearer_fingerprint == self.original_bearer_fingerprint
+            && std::sync::Weak::ptr_eq(
+                &self.original_transport,
+                &Arc::downgrade(&current.transport),
+            )
+            && !current.transport.is_aborted()
+    }
+    async fn once(&self, request: Request, deadline_ms: Option<i64>) -> Option<Response> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        let millis = match deadline_ms {
+            Some(d) => u64::try_from(i128::from(d) - i128::try_from(now).ok()?)
+                .ok()?
+                .min(5000),
+            None => 5000,
+        };
+        if millis == 0 {
+            return None;
+        }
+        // One total deadline includes cache-lock waits and closing checks. Never
+        // enter ordinary connection renewal, attach, confirm or recovery paths.
+        tokio::time::timeout(Duration::from_millis(millis), async {
+            let client = self.client.upgrade()?;
+            let credential = BoundaryCredential::capture(&client.sandbox_bearer).ok()?;
+            if credential.epoch != self.original_epoch
+                || credential.fingerprint != self.original_bearer_fingerprint
+            {
+                return None;
+            }
+            let channel = {
+                let cache = client.grpc_channel.lock().await;
+                let original = cache.as_ref().filter(|v| self.matches_original(v))?;
+                original.channel.clone()
+            };
+            if let Some(deadline) = deadline_ms {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis();
+                if i128::try_from(now).ok()? >= i128::from(deadline) {
+                    return None;
+                }
+            }
+            let envelope = BoundaryClient::prepare_request(request).ok()?;
+            let response = client
+                .exchange_on_channel(channel, &envelope, &credential)
+                .await
+                .ok()?;
+            let closing = BoundaryCredential::capture(&client.sandbox_bearer).ok()?;
+            if closing.epoch != self.original_epoch
+                || closing.fingerprint != self.original_bearer_fingerprint
+            {
+                return None;
+            }
+            if !client
+                .grpc_channel
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|v| self.matches_original(v))
+            {
+                return None;
+            }
+            Some(response)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+#[async_trait]
+impl openshell_core::provider_credentials::ProviderWitnessBoundary for NativeWitnessBoundary {
+    async fn capability(
+        &self,
+    ) -> Option<openshell_core::provider_credentials::WitnessBoundaryCapability> {
+        match self.once(Request::WitnessCapability, None).await? {
+            Response::WitnessCapability { capability } => Some(capability),
+            _ => None,
+        }
+    }
+    async fn prepare(
+        &self,
+        operation: openshell_core::provider_credentials::WitnessOperation,
+    ) -> Option<openshell_core::provider_credentials::WitnessOperation> {
+        let deadline = operation.deadline_unix_ms;
+        match self
+            .once(
+                Request::WitnessPrepare(crate::boundary_protocol::WitnessPrepareRequest {
+                    binding: operation,
+                }),
+                Some(deadline),
+            )
+            .await?
+        {
+            Response::WitnessPrepared { operation } => Some(operation),
+            _ => None,
+        }
+    }
+    async fn permit(
+        &self,
+        permit: openshell_core::provider_credentials::WitnessCommittedPermit,
+    ) -> bool {
+        let deadline = permit.operation.deadline_unix_ms;
+        matches!(
+            self.once(
+                Request::WitnessPermit(crate::boundary_protocol::WitnessPermitRequest { permit }),
+                Some(deadline)
+            )
+            .await,
+            Some(Response::WitnessPermitConsumed)
+        )
+    }
+    async fn fence(&self, fence: openshell_core::provider_credentials::WitnessSourceFence) -> bool {
+        matches!(
+            self.once(
+                Request::WitnessFence(crate::boundary_protocol::WitnessFenceRequest { fence }),
+                None
+            )
+            .await,
+            Some(Response::WitnessFenceObserved { quiesced: true })
+        )
     }
 }
 
@@ -2308,6 +2480,13 @@ mod tests {
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
                         response: match envelope.request {
+                            Request::WitnessCapability
+                            | Request::WitnessPrepare(_)
+                            | Request::WitnessPermit(_)
+                            | Request::WitnessFence(_) => Response::Error {
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
+                                message: "optional witness unsupported by legacy fixture".into(),
+                            },
                             Request::DiscoverPolicy => Response::ImagePolicy {
                                 yaml: None,
                                 invalid: false,
@@ -3604,5 +3783,77 @@ mod tests {
         // The server observes the client's fatal alert and may fail its accept;
         // completing the task is sufficient for this rejection test.
         let _ = server.await;
+    }
+    #[tokio::test]
+    async fn witness_transport_never_adopts_replacement_connection_generation() {
+        use openshell_core::provider_credentials::ProviderWitnessBoundary as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: requests.clone(),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
+            provider_environment_generation: 0,
+            confirmation: test_confirmation(),
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBoundaryServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(address, test_certificate().client_tls),
+            test_bearer(&"a".repeat(32)),
+        ));
+        let original = CachedGrpcChannel {
+            credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            bearer_fingerprint: BoundaryCredential::capture(&client.sandbox_bearer)
+                .unwrap()
+                .fingerprint,
+            generation: 1,
+            channel,
+            transport: Arc::default(),
+        };
+        *client.grpc_channel.lock().await = Some(original.clone());
+        let adapter = NativeWitnessBoundary::pin(&client, &original);
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            generation: 2,
+            ..original.clone()
+        });
+        assert!(adapter.capability().await.is_none());
+        assert_eq!(
+            requests.load(Ordering::Acquire),
+            0,
+            "replacement transport must not receive an old adapter's request"
+        );
+        *client.grpc_channel.lock().await = None;
+        assert!(adapter.capability().await.is_none());
+        assert!(client.grpc_channel.lock().await.is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 0);
+        *client.grpc_channel.lock().await = Some(original.clone());
+        assert!(adapter.capability().await.is_none()); // One typed legacy refusal.
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            bearer_fingerprint: [0; 32],
+            ..original.clone()
+        });
+        assert!(adapter.capability().await.is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        *client.grpc_channel.lock().await = Some(original.clone());
+        original.transport.abort();
+        assert!(adapter.capability().await.is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        server.abort();
     }
 }

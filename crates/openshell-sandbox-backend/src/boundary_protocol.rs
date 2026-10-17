@@ -703,10 +703,30 @@ impl fmt::Debug for RequestEnvelope {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessPrepareRequest {
+    pub binding: openshell_core::provider_credentials::WitnessOperation,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessPermitRequest {
+    pub permit: openshell_core::provider_credentials::WitnessCommittedPermit,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessFenceRequest {
+    pub fence: openshell_core::provider_credentials::WitnessSourceFence,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Request {
     /// Read image policy without attaching or launching a workload.
     DiscoverPolicy,
+    WitnessCapability,
+    WitnessPrepare(WitnessPrepareRequest),
+    WitnessPermit(WitnessPermitRequest),
+    WitnessFence(WitnessFenceRequest),
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
@@ -797,6 +817,10 @@ impl fmt::Debug for Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DiscoverPolicy => formatter.write_str("DiscoverPolicy"),
+            Self::WitnessCapability => formatter.write_str("WitnessCapability"),
+            Self::WitnessPrepare(_) => formatter.write_str("WitnessPrepare(<metadata>)"),
+            Self::WitnessPermit(_) => formatter.write_str("WitnessPermit(<one-shot>)"),
+            Self::WitnessFence(_) => formatter.write_str("WitnessFence(<metadata>)"),
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
@@ -900,6 +924,16 @@ pub struct ResponseEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
+    WitnessCapability {
+        capability: openshell_core::provider_credentials::WitnessBoundaryCapability,
+    },
+    WitnessPrepared {
+        operation: openshell_core::provider_credentials::WitnessOperation,
+    },
+    WitnessPermitConsumed,
+    WitnessFenceObserved {
+        quiesced: bool,
+    },
     ImagePolicy {
         yaml: Option<String>,
         invalid: bool,
@@ -1899,6 +1933,90 @@ mod tests {
         assert_eq!(
             decoded.runtime_helper,
             Some(openshell_isolation_interface::contract::RuntimeHelper::Sftp)
+        );
+    }
+    fn witness_wire_fixture() -> openshell_core::provider_credentials::WitnessOperation {
+        openshell_core::provider_credentials::WitnessOperation {
+            prepared_source_incarnation: "11111111-1111-4111-8111-111111111111".into(),
+            prepared_source_epoch: 1,
+            original_key: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+            profile_sha256: "c".repeat(64),
+            installed_arm_sha256: "d".repeat(64),
+            boundary_incarnation: "22222222-2222-4222-8222-222222222222".into(),
+            prepared_ticket: "33333333-3333-4333-8333-333333333333".into(),
+            supervisor_session: "44444444-4444-4444-8444-444444444444".into(),
+            execution_id: format!("exec-v1:{}", "e".repeat(64)),
+            deadline_unix_ms: 2000,
+            arm_request: b"synthetic-private-arm-reference".to_vec(),
+        }
+    }
+    #[test]
+    fn witness_wire_closed_phases_roundtrip_without_generic_selector() {
+        let operation = witness_wire_fixture();
+        let permit = openshell_core::provider_credentials::WitnessCommittedPermit {
+            source_incarnation: operation.prepared_source_incarnation.clone(),
+            source_epoch: 1,
+            permit_id: "55555555-5555-4555-8555-555555555555".into(),
+            operation: operation.clone(),
+        };
+        let cases = [
+            Request::WitnessPrepare(WitnessPrepareRequest { binding: operation }),
+            Request::WitnessPermit(WitnessPermitRequest { permit }),
+            Request::WitnessFence(WitnessFenceRequest {
+                fence: openshell_core::provider_credentials::WitnessSourceFence {
+                    source_incarnation: "11111111-1111-4111-8111-111111111111".into(),
+                    epoch: 2,
+                    disabled: false,
+                },
+            }),
+        ];
+        for request in cases {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Request>(encoded.clone()).unwrap(),
+                request
+            );
+            for field in ["argv", "env", "program", "workdir", "pty", "runtime_helper"] {
+                let mut extra = encoded.clone();
+                extra
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.into(), serde_json::json!("not-a-selector"));
+                assert!(serde_json::from_value::<Request>(extra).is_err(), "{field}");
+            }
+        }
+        assert!(
+            serde_json::from_str::<Request>(r#"{"operation":"witness_exec","argv":["sh"]}"#)
+                .is_err()
+        );
+    }
+    #[test]
+    fn witness_wire_nested_authority_fields_are_closed_and_debug_redacted() {
+        let request = Request::WitnessPrepare(WitnessPrepareRequest {
+            binding: witness_wire_fixture(),
+        });
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        encoded["binding"]["caller_approval"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Request>(encoded).is_err());
+        assert_eq!(format!("{request:?}"), "WitnessPrepare(<metadata>)");
+        assert!(!format!("{request:?}").contains("synthetic-private"));
+        let duplicate = r#"{"operation":"witness_fence","fence":{"source_incarnation":"a","epoch":1,"epoch":2,"disabled":false}}"#;
+        assert!(serde_json::from_str::<Request>(duplicate).is_err());
+    }
+    #[test]
+    fn witness_wire_capability_and_legacy_read_have_distinct_no_effect_tags() {
+        assert_eq!(
+            serde_json::to_string(&Request::WitnessCapability).unwrap(),
+            r#"{"operation":"witness_capability"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::DiscoverPolicy).unwrap(),
+            r#"{"operation":"discover_policy"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"operation":"discover_policy"}"#).unwrap(),
+            Request::DiscoverPolicy
         );
     }
 }

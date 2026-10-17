@@ -235,37 +235,52 @@ impl OpenShell for TestOpenShell {
     async fn conditional_detach_sandbox_provider(
         &self,
         _request: tonic::Request<openshell_core::proto::ConditionalDetachSandboxProviderRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>,
-        tonic::Status,
-    > {
-        Err(tonic::Status::unimplemented(
-            "optional provider detach capability",
+    ) -> Result<Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>, Status>
+    {
+        Err(Status::unimplemented("optional provider detach capability"))
+    }
+
+    async fn reserve_provider_detach_witness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReserveProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReserveProviderDetachWitnessResponse>, Status> {
+        Err(Status::unimplemented(
+            "fixed witness unsupported by fixture",
+        ))
+    }
+
+    async fn invoke_provider_detach_witness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::InvokeProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::InvokeProviderDetachWitnessResponse>, Status> {
+        Err(Status::unimplemented(
+            "fixed witness unsupported by fixture",
+        ))
+    }
+
+    async fn get_provider_detach_witness_invocation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderDetachWitnessInvocationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderDetachWitnessInvocationResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "fixed witness unsupported by fixture",
         ))
     }
 
     async fn arm_provider_detach_attempt(
         &self,
         _request: tonic::Request<openshell_core::proto::ArmProviderDetachAttemptRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::ArmProviderDetachAttemptResponse>,
-        tonic::Status,
-    > {
-        Err(tonic::Status::unimplemented(
-            "optional provider detach capability",
-        ))
+    ) -> Result<Response<openshell_core::proto::ArmProviderDetachAttemptResponse>, Status> {
+        Err(Status::unimplemented("optional provider detach capability"))
     }
 
     async fn get_conditional_provider_detach_state(
         &self,
         _request: tonic::Request<openshell_core::proto::GetConditionalProviderDetachStateRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>,
-        tonic::Status,
-    > {
-        Err(tonic::Status::unimplemented(
-            "optional provider detach capability",
-        ))
+    ) -> Result<Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>, Status>
+    {
+        Err(Status::unimplemented("optional provider detach capability"))
     }
 
     async fn hold_sandbox_admission(

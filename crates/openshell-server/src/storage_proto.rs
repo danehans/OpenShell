@@ -147,7 +147,7 @@ mod tests {
     // dependencies. Separate literal predecessor checks below retain every
     // prior API/storage declaration rather than accepting a regenerated golden.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "9c4ecaa93fb90b5f87bf2216799aeca196022c4c01b7361f209c7553396d6eb9";
+        "0a3db5cf667a58f7ca96388450f0dd75ebd8bc2a248d2ef0b55a1b53611205e5";
     const DURABLE_SCHEMA_SHA256: &str =
         "efa52e12c00b94ea12555c9209e872239ee8810db079e2fd5338e31c5d2c6f84";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -195,10 +195,13 @@ mod tests {
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
     ];
-    const PROVIDER_DETACH_RPC_SIGNATURES: [&str; 3] = [
+    const PROVIDER_DETACH_RPC_SIGNATURES: [&str; 6] = [
         "openshell.v1.OpenShell/ConditionalDetachSandboxProvider|.openshell.v1.ConditionalDetachSandboxProviderRequest|.openshell.v1.ConditionalDetachSandboxProviderResponse|false|false",
         "openshell.v1.OpenShell/ArmProviderDetachAttempt|.openshell.v1.ArmProviderDetachAttemptRequest|.openshell.v1.ArmProviderDetachAttemptResponse|false|false",
         "openshell.v1.OpenShell/GetConditionalProviderDetachState|.openshell.v1.GetConditionalProviderDetachStateRequest|.openshell.v1.GetConditionalProviderDetachStateResponse|false|false",
+        "openshell.v1.OpenShell/ReserveProviderDetachWitness|.openshell.v1.ReserveProviderDetachWitnessRequest|.openshell.v1.ReserveProviderDetachWitnessResponse|false|false",
+        "openshell.v1.OpenShell/InvokeProviderDetachWitness|.openshell.v1.InvokeProviderDetachWitnessRequest|.openshell.v1.InvokeProviderDetachWitnessResponse|false|false",
+        "openshell.v1.OpenShell/GetProviderDetachWitnessInvocation|.openshell.v1.GetProviderDetachWitnessInvocationRequest|.openshell.v1.GetProviderDetachWitnessInvocationResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -441,9 +444,610 @@ mod tests {
         (names, schema)
     }
 
+    const WITNESS_MESSAGES: &[(&str, &str)] = &[
+        (
+            "ProviderDetachWitnessRequestV1",
+            "b9a7a3f0adf3e18b23c5650e0fc98c992428bac317eec3d0d53feea7dcd2219b",
+        ),
+        (
+            "ReserveProviderDetachWitnessRequest",
+            "a2f8d9155e3f5e98439d7fc06fcbeb36b1930b699c25427b1a25bae8b9cd6f6e",
+        ),
+        (
+            "ReserveProviderDetachWitnessResponse",
+            "73209c86bf315d02193bdd646d40959b749180b6f42133899081459648f01c11",
+        ),
+        (
+            "InvokeProviderDetachWitnessRequest",
+            "d7f5617504dc35d913c354e54c3f043e6e27b930b3fadf8444932fd616f56583",
+        ),
+        (
+            "InvokeProviderDetachWitnessResponse",
+            "b42c2a8530d039d1595574e732d683448e3562274b5fed95b59c6841005850df",
+        ),
+        (
+            "GetProviderDetachWitnessInvocationRequest",
+            "2f73754a41bea735bf0812067ca6ef721b967c907ea02f46172da550a7823816",
+        ),
+        (
+            "GetProviderDetachWitnessInvocationResponse",
+            "7d5911deae071c80671b2144d3ff4c3c0ea35147aba23d6ba1298b873713021b",
+        ),
+        (
+            "ProviderDetachWitnessInvocationV1",
+            "f121a388b4c4b2bac4a5d20be1655d7b2ea8249412ef67a032aabac9f69ee513",
+        ),
+        (
+            "ProviderDetachWitnessControlV1",
+            "b7e5f5f1bb642eb803bdd1c84ea49b70834f10e994901d1886aacc7e7e7977ac",
+        ),
+    ];
+    const WITNESS_METHODS: &[(&str, &str)] = &[
+        (
+            "ReserveProviderDetachWitness",
+            "e4db79d1455c5a10c36be09b65ca6deaa2b6a0a9381925e08e8fde248bfb43b5",
+        ),
+        (
+            "InvokeProviderDetachWitness",
+            "4f6f5959755b7f7f1baf03af9fa444463a50971ab06e0ea85f73d4d1268921e9",
+        ),
+        (
+            "GetProviderDetachWitnessInvocation",
+            "33b8a13e6b187fedf699833ecd56ad1d4b63f199b1767fe668e6d3eb83a02022",
+        ),
+    ];
+    const WITNESS_FIELDS: &[(&str, u64, &str)] = &[
+        (
+            "SupervisorMessage",
+            5,
+            "fed717e94efd9343ba6adf5f161cf2554891ffbcd7fc24ebb932d047ebf8432d",
+        ),
+        (
+            "GatewayMessage",
+            6,
+            "4ab577a073c1a7c932cdf9e89b9a075eaa11b355cdd58c8868d08380fe60cc7f",
+        ),
+    ];
+
+    // prost_types intentionally drops unknown MethodOptions extensions. These
+    // guards therefore inspect ORIGINAL wire bytes, including custom auth
+    // metadata, before any lossy typed decoding or additive strip.
+    #[derive(Clone)]
+    struct RawSchemaField<'a> {
+        number: u64,
+        wire: u8,
+        value: &'a [u8],
+        encoded: &'a [u8],
+    }
+    fn raw_schema_fields(raw: &[u8]) -> Result<Vec<RawSchemaField<'_>>, String> {
+        fn var(raw: &[u8], offset: &mut usize) -> Result<u64, String> {
+            let mut value = 0u64;
+            for shift in (0..70).step_by(7) {
+                let b = *raw.get(*offset).ok_or("truncated descriptor")?;
+                *offset += 1;
+                if shift == 63 && b > 1 {
+                    return Err("descriptor varint overflow".into());
+                }
+                value |= u64::from(b & 127) << shift;
+                if b & 128 == 0 {
+                    return Ok(value);
+                }
+            }
+            Err("descriptor varint overflow".into())
+        }
+        if raw.len() > 4 * 1024 * 1024 {
+            return Err("descriptor limit".into());
+        }
+        let mut offset = 0;
+        let mut fields = Vec::new();
+        while offset < raw.len() {
+            let start = offset;
+            let tag = var(raw, &mut offset)?;
+            let number = tag >> 3;
+            let wire = (tag & 7) as u8;
+            if number == 0 {
+                return Err("descriptor field zero".into());
+            }
+            let value = match wire {
+                0 => {
+                    let begin = offset;
+                    var(raw, &mut offset)?;
+                    &raw[begin..offset]
+                }
+                2 => {
+                    let len =
+                        usize::try_from(var(raw, &mut offset)?).map_err(|_| "descriptor length")?;
+                    let end = offset.checked_add(len).ok_or("descriptor length")?;
+                    let value = raw.get(offset..end).ok_or("truncated descriptor")?;
+                    offset = end;
+                    value
+                }
+                1 | 5 => {
+                    let end = offset
+                        .checked_add(if wire == 1 { 8 } else { 4 })
+                        .ok_or("descriptor length")?;
+                    let value = raw.get(offset..end).ok_or("truncated descriptor")?;
+                    offset = end;
+                    value
+                }
+                _ => return Err("unsupported descriptor wire type".into()),
+            };
+            fields.push(RawSchemaField {
+                number,
+                wire,
+                value,
+                encoded: &raw[start..offset],
+            });
+        }
+        Ok(fields)
+    }
+    fn raw_schema_name(raw: &[u8]) -> Result<&str, String> {
+        let fields = raw_schema_fields(raw)?;
+        let names = fields
+            .iter()
+            .filter(|f| f.number == 1 && f.wire == 2)
+            .collect::<Vec<_>>();
+        if names.len() != 1 {
+            return Err("descriptor name multiplicity".into());
+        }
+        std::str::from_utf8(names[0].value).map_err(|_| "descriptor name encoding".into())
+    }
+    fn raw_schema_length(number: u64, value: &[u8]) -> Vec<u8> {
+        fn var(mut n: u64, output: &mut Vec<u8>) {
+            while n > 127 {
+                output.push((n as u8 & 127) | 128);
+                n >>= 7;
+            }
+            output.push(n as u8);
+        }
+        let mut out = Vec::new();
+        var(number * 8 + 2, &mut out);
+        var(value.len() as u64, &mut out);
+        out.extend_from_slice(value);
+        out
+    }
+    fn raw_schema_file(raw: &[u8]) -> Result<&[u8], String> {
+        let fields = raw_schema_fields(raw)?;
+        let files = fields
+            .iter()
+            .filter(|f| f.number == 1 && f.wire == 2)
+            .filter(|f| raw_schema_name(f.value).is_ok_and(|name| name == "openshell.proto"))
+            .collect::<Vec<_>>();
+        if files.len() != 1 {
+            return Err("public descriptor file multiplicity".into());
+        }
+        Ok(files[0].value)
+    }
+    const DISCOVERY_MESSAGES: &[(&str, &str)] = &[
+        (
+            "GetProviderDetachWitnessInvocationRequest",
+            "d3c8b2dadee669e2a0cd06dd307ddefc52900ae227ab7d1fffbf0e3601f947a6",
+        ),
+        (
+            "GetProviderDetachWitnessInvocationResponse",
+            "c01016df5a34c2c0895b19945a2d196b30b605ed9bad24022688bb5e49dc2ca8",
+        ),
+        (
+            "ProviderDetachWitnessControlV1",
+            "cabb2581eb1077682d5d76c20d1abba599cfd44581dd54eff175da9f16809a8e",
+        ),
+    ];
+    const DISCOVERY_FIELDS: &[(&str, u64, &str)] = &[
+        (
+            "GetProviderDetachWitnessInvocationRequest",
+            3,
+            "8d1f1d7bafafc2ebead3a570db7fc2fe9795e0f6b29c59091d5e3182a95dfbb5",
+        ),
+        (
+            "GetProviderDetachWitnessInvocationResponse",
+            2,
+            "e232add62bbcc7931b2b247a29164cf92d39e60079f4fa491f833310d852a5b7",
+        ),
+        (
+            "GetProviderDetachWitnessInvocationResponse",
+            3,
+            "6da437077fb64ec235d9fa817f8e000aad1f33331111bb886e7a72770e0cef3c",
+        ),
+        (
+            "GetProviderDetachWitnessInvocationResponse",
+            4,
+            "0496b6903d3c5aaa266835391776a377cb371468a603aee061f764e06f601058",
+        ),
+        (
+            "ProviderDetachWitnessControlV1",
+            7,
+            "20848bc57b288868cb8164e7d21d76a38348a953103619e1a401cfcaef23e41f",
+        ),
+    ];
+    fn strip_discovery_raw(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let mut seen = [0; 5];
+        let mut seen_messages = [0; 3];
+        let mut output = Vec::new();
+        for file in raw_schema_fields(raw)? {
+            if file.number != 1
+                || file.wire != 2
+                || raw_schema_name(file.value)? != "openshell.proto"
+            {
+                output.extend_from_slice(file.encoded);
+                continue;
+            }
+            let mut body = Vec::new();
+            for message in raw_schema_fields(file.value)? {
+                if message.number != 4 || message.wire != 2 {
+                    body.extend_from_slice(message.encoded);
+                    continue;
+                }
+                let name = raw_schema_name(message.value)?;
+                let Some((mi, (_, hash))) = DISCOVERY_MESSAGES
+                    .iter()
+                    .enumerate()
+                    .find(|(_, m)| m.0 == name)
+                else {
+                    body.extend_from_slice(message.encoded);
+                    continue;
+                };
+                if format!("{:x}", Sha256::digest(message.value)) != *hash {
+                    return Err("discovery declaration changed".into());
+                }
+                seen_messages[mi] += 1;
+                let mut original = Vec::new();
+                for entry in raw_schema_fields(message.value)? {
+                    if entry.number == 2 && entry.wire == 2 {
+                        let fd = prost_types::FieldDescriptorProto::decode(entry.value)
+                            .map_err(|_| "discovery descriptor")?;
+                        if let Some((index, (_, _, hash))) = DISCOVERY_FIELDS
+                            .iter()
+                            .enumerate()
+                            .find(|(_, v)| v.0 == name && Some(v.1 as i32) == fd.number)
+                        {
+                            if format!("{:x}", Sha256::digest(entry.value)) != *hash {
+                                return Err("discovery field changed".into());
+                            }
+                            seen[index] += 1;
+                            continue;
+                        }
+                    }
+                    original.extend_from_slice(entry.encoded);
+                }
+                // Preserve the approved pre-discovery declaration, including
+                // every option and original field, rather than stripping names.
+                let hash = WITNESS_MESSAGES
+                    .iter()
+                    .find(|v| v.0 == name)
+                    .ok_or("initial declaration absent")?
+                    .1;
+                if format!("{:x}", Sha256::digest(&original)) != hash {
+                    return Err("initial witness declaration changed".into());
+                }
+                body.extend(raw_schema_length(4, &original));
+            }
+            output.extend(raw_schema_length(1, &body));
+        }
+        if seen.iter().chain(seen_messages.iter()).any(|n| *n != 1) {
+            return Err("discovery multiplicity".into());
+        }
+        // Complete initial FileDescriptorProto domain, not the enclosing FDS.
+        // Only commentary SourceCodeInfo is excluded, as in the c109 guard.
+        let initial = raw_schema_fields(raw_schema_file(&output)?)?
+            .iter()
+            .filter(|field| field.number != 9)
+            .flat_map(|field| field.encoded.iter().copied())
+            .collect::<Vec<_>>();
+        if format!("{:x}", Sha256::digest(&initial))
+            != "bb690a5a94c73bc356a52e3fb83307221c0451ac4af76c02dc779ca2abbca3e1"
+        {
+            return Err("complete initial witness declaration changed".into());
+        }
+        Ok(output)
+    }
+    fn strip_witness_raw(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let initial = strip_discovery_raw(raw)?;
+        let file = raw_schema_file(&initial)?;
+        let mut messages = vec![0; WITNESS_MESSAGES.len()];
+        let mut methods = vec![0; WITNESS_METHODS.len()];
+        let mut additions = vec![0; WITNESS_FIELDS.len()];
+        let mut stripped = Vec::new();
+        for field in raw_schema_fields(file)? {
+            if field.number == 9 {
+                continue;
+            } // SourceCodeInfo is commentary, not API/options.
+            if field.number == 4 && field.wire == 2 {
+                let name = raw_schema_name(field.value)?;
+                if let Some((index, (_, expected))) = WITNESS_MESSAGES
+                    .iter()
+                    .enumerate()
+                    .find(|(_, v)| v.0 == name)
+                {
+                    if format!("{:x}", Sha256::digest(field.value)) != *expected {
+                        return Err("witness message declaration changed".into());
+                    }
+                    messages[index] += 1;
+                    continue;
+                }
+                if let Some((index, (_, number, expected))) =
+                    WITNESS_FIELDS.iter().enumerate().find(|(_, v)| v.0 == name)
+                {
+                    let mut message = Vec::new();
+                    for entry in raw_schema_fields(field.value)? {
+                        if entry.number == 2 && entry.wire == 2 {
+                            let descriptor = prost_types::FieldDescriptorProto::decode(entry.value)
+                                .map_err(|_| "field descriptor")?;
+                            if descriptor.number == i32::try_from(*number).ok() {
+                                if format!("{:x}", Sha256::digest(entry.value)) != *expected {
+                                    return Err("witness transport field changed".into());
+                                }
+                                additions[index] += 1;
+                                continue;
+                            }
+                        }
+                        message.extend_from_slice(entry.encoded);
+                    }
+                    stripped.extend(raw_schema_length(4, &message));
+                    continue;
+                }
+            }
+            if field.number == 6 && field.wire == 2 && raw_schema_name(field.value)? == "OpenShell"
+            {
+                let mut service = Vec::new();
+                for entry in raw_schema_fields(field.value)? {
+                    if entry.number == 2 && entry.wire == 2 {
+                        let name = raw_schema_name(entry.value)?;
+                        if let Some((index, (_, expected))) = WITNESS_METHODS
+                            .iter()
+                            .enumerate()
+                            .find(|(_, v)| v.0 == name)
+                        {
+                            // Full MethodDescriptorProto includes streaming flags
+                            // AND raw custom auth/scope/workspace MethodOptions.
+                            if format!("{:x}", Sha256::digest(entry.value)) != *expected {
+                                return Err("witness RPC/auth declaration changed".into());
+                            }
+                            methods[index] += 1;
+                            continue;
+                        }
+                    }
+                    service.extend_from_slice(entry.encoded);
+                }
+                stripped.extend(raw_schema_length(6, &service));
+                continue;
+            }
+            stripped.extend_from_slice(field.encoded);
+        }
+        if messages
+            .iter()
+            .chain(methods.iter())
+            .chain(additions.iter())
+            .any(|n| *n != 1)
+        {
+            return Err("witness extension multiplicity".into());
+        }
+        // Independently measured complete c109 openshell.proto wire declaration
+        // (only SourceCodeInfo omitted). This also catches unlisted additions,
+        // including unreachable messages and changes to predecessor auth options.
+        if format!("{:x}", Sha256::digest(&stripped))
+            != "13a04a83ff07acd88dcc6f05ae1a879c99d2e0deafe295ceaf14eff79d7704f0"
+        {
+            return Err("complete predecessor declaration changed".into());
+        }
+        Ok(stripped)
+    }
+    fn remove_witness_transport_fields(public: &mut FileDescriptorSet) {
+        for file in &mut public.file {
+            if file.package.as_deref() != Some("openshell.v1") {
+                continue;
+            }
+            for message in &mut file.message_type {
+                if let Some((_, number, _)) = WITNESS_FIELDS
+                    .iter()
+                    .find(|v| Some(v.0) == message.name.as_deref())
+                {
+                    message
+                        .field
+                        .retain(|field| field.number != i32::try_from(*number).ok());
+                }
+            }
+        }
+    }
+    #[test]
+    fn witness_extension_preserves_complete_c109_public_schema() {
+        strip_witness_raw(openshell_core::FILE_DESCRIPTOR_SET).expect("exact lossless extension");
+        let mut public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        remove_witness_transport_fields(&mut public);
+        for file in &mut public.file {
+            if file.package.as_deref() != Some("openshell.v1") {
+                continue;
+            }
+            file.message_type.retain(|m| {
+                !WITNESS_MESSAGES
+                    .iter()
+                    .any(|v| Some(v.0) == m.name.as_deref())
+            });
+            for service in &mut file.service {
+                if service.name.as_deref() == Some("OpenShell") {
+                    service.method.retain(|m| {
+                        !WITNESS_METHODS
+                            .iter()
+                            .any(|v| Some(v.0) == m.name.as_deref())
+                    });
+                }
+            }
+        }
+        let storage = FileDescriptorSet::decode(STORAGE_FILE_DESCRIPTOR_SET).unwrap();
+        let mut index = SchemaIndex::default();
+        index_descriptor(&mut index, &storage);
+        index_descriptor(&mut index, &public);
+        let mut roots = BTreeSet::new();
+        let mut methods = Vec::new();
+        for file in &public.file {
+            for service in &file.service {
+                if !matches!(
+                    (file.package.as_deref(), service.name.as_deref()),
+                    (Some("openshell.v1"), Some("OpenShell"))
+                        | (Some("openshell.inference.v1"), Some("Inference"))
+                ) {
+                    continue;
+                }
+                for method in &service.method {
+                    let input = method.input_type.as_ref().unwrap();
+                    let output = method.output_type.as_ref().unwrap();
+                    roots.insert(input.clone());
+                    roots.insert(output.clone());
+                    methods.push(format!(
+                        "{}.{}/{}|{}|{}|{}|{}",
+                        file.package.as_ref().unwrap(),
+                        service.name.as_ref().unwrap(),
+                        method.name.as_ref().unwrap(),
+                        input,
+                        output,
+                        method.client_streaming.unwrap_or(false),
+                        method.server_streaming.unwrap_or(false)
+                    ));
+                }
+            }
+        }
+        methods.sort();
+        let closure = schema_closure(&index, roots);
+        assert_eq!((closure.messages.len(), closure.enums.len()), (348, 31));
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}\n{}",
+                        methods.join("\n"),
+                        schema_fingerprint(&index, &closure)
+                    )
+                    .as_bytes()
+                )
+            ),
+            "9c4ecaa93fb90b5f87bf2216799aeca196022c4c01b7361f209c7553396d6eb9"
+        );
+    }
+    #[test]
+    fn witness_discovery_preserves_complete_initial_schema() {
+        let original = strip_discovery_raw(openshell_core::FILE_DESCRIPTOR_SET)
+            .expect("exact five-field strip");
+        let public = FileDescriptorSet::decode(original.as_slice()).unwrap();
+        let storage = FileDescriptorSet::decode(STORAGE_FILE_DESCRIPTOR_SET).unwrap();
+        let mut index = SchemaIndex::default();
+        index_descriptor(&mut index, &storage);
+        index_descriptor(&mut index, &public);
+        let mut roots = BTreeSet::new();
+        let mut methods = Vec::new();
+        for file in &public.file {
+            for service in &file.service {
+                if !matches!(
+                    (file.package.as_deref(), service.name.as_deref()),
+                    (Some("openshell.v1"), Some("OpenShell"))
+                        | (Some("openshell.inference.v1"), Some("Inference"))
+                ) {
+                    continue;
+                }
+                for method in &service.method {
+                    let input = method.input_type.as_ref().unwrap();
+                    let output = method.output_type.as_ref().unwrap();
+                    roots.insert(input.clone());
+                    roots.insert(output.clone());
+                    methods.push(format!(
+                        "{}.{}/{}|{}|{}|{}|{}",
+                        file.package.as_ref().unwrap(),
+                        service.name.as_ref().unwrap(),
+                        method.name.as_ref().unwrap(),
+                        input,
+                        output,
+                        method.client_streaming.unwrap_or(false),
+                        method.server_streaming.unwrap_or(false)
+                    ));
+                }
+            }
+        }
+        methods.sort();
+        let closure = schema_closure(&index, roots);
+        assert_eq!((closure.messages.len(), closure.enums.len()), (357, 31));
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}\n{}",
+                        methods.join("\n"),
+                        schema_fingerprint(&index, &closure)
+                    )
+                    .as_bytes()
+                )
+            ),
+            "ae561d63fdb9a18d645049219199e5bb11a1857fb0ad25221dd7fc37520fa987"
+        );
+    }
+
+    #[test]
+    fn witness_lossless_guard_refuses_missing_duplicate_rename_extra_and_auth_mutations() {
+        let raw = openshell_core::FILE_DESCRIPTOR_SET;
+        let file = raw_schema_file(raw).unwrap();
+        let fields = raw_schema_fields(file).unwrap();
+        let selected = fields
+            .iter()
+            .position(|f| {
+                f.number == 4 && raw_schema_name(f.value).is_ok_and(|n| n == WITNESS_MESSAGES[0].0)
+            })
+            .unwrap();
+        let replacement = |parts: Vec<Vec<u8>>| {
+            let changed = parts.concat();
+            raw_schema_fields(raw)
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    if f.number == 1
+                        && f.wire == 2
+                        && raw_schema_name(f.value).is_ok_and(|n| n == "openshell.proto")
+                    {
+                        raw_schema_length(1, &changed)
+                    } else {
+                        f.encoded.to_vec()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        let original = fields
+            .iter()
+            .map(|f| f.encoded.to_vec())
+            .collect::<Vec<_>>();
+        let mut missing = original.clone();
+        missing.remove(selected);
+        assert!(strip_witness_raw(&replacement(missing)).is_err());
+        let mut duplicate = original.clone();
+        duplicate.push(original[selected].clone());
+        assert!(strip_witness_raw(&replacement(duplicate)).is_err());
+        let mut renamed = original.clone();
+        let mut msg = fields[selected].value.to_vec();
+        let position = msg
+            .windows(WITNESS_MESSAGES[0].0.len())
+            .position(|v| v == WITNESS_MESSAGES[0].0.as_bytes())
+            .unwrap();
+        msg[position] = b'X';
+        renamed[selected] = raw_schema_length(4, &msg);
+        assert!(strip_witness_raw(&replacement(renamed)).is_err());
+        let mut extra = original.clone();
+        extra.push(raw_schema_length(
+            4,
+            &raw_schema_length(1, b"UnlistedPublicAddition"),
+        ));
+        assert!(strip_witness_raw(&replacement(extra)).is_err());
+        // Mutate actual custom scope bytes, not prost_types' lossy options view.
+        let mut auth = raw.to_vec();
+        let scope = b"sandbox:provider-detach:witness";
+        let position = auth.windows(scope.len()).position(|v| v == scope).unwrap();
+        auth[position] = b'X';
+        assert!(strip_witness_raw(&auth).is_err());
+    }
+
     #[test]
     fn provider_detach_additions_preserve_complete_predecessor_schemas() {
         let mut public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        strip_witness_raw(openshell_core::FILE_DESCRIPTOR_SET)
+            .expect("exact lossless witness extension");
+        remove_witness_transport_fields(&mut public);
         // Precisely validate/remove ONLY the additive attempt fields before
         // measuring the complete literal predecessor. Never rewrite its hash.
         for file in &mut public.file {
@@ -860,7 +1464,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (348, 31),
+                (357, 31),
                 (104, 23),
                 (90, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
@@ -1170,5 +1774,76 @@ mod tests {
         assert_eq!(draft.rule_name, "rule");
         assert_eq!(draft.host, "example.com");
         assert_eq!(draft.port, 443);
+    }
+    #[test]
+    fn witness_discovery_guards_each_added_field_before_strip() {
+        let raw = openshell_core::FILE_DESCRIPTOR_SET;
+        let file = raw_schema_file(raw).unwrap();
+        for (message_name, number, _) in DISCOVERY_FIELDS {
+            for mutation in 0..5 {
+                let mut body = Vec::new();
+                for message in raw_schema_fields(file).unwrap() {
+                    if message.number != 4
+                        || message.wire != 2
+                        || raw_schema_name(message.value).unwrap() != *message_name
+                    {
+                        body.extend_from_slice(message.encoded);
+                        continue;
+                    }
+                    let mut changed = Vec::new();
+                    for field in raw_schema_fields(message.value).unwrap() {
+                        if field.number == 2 && field.wire == 2 {
+                            let mut descriptor =
+                                prost_types::FieldDescriptorProto::decode(field.value).unwrap();
+                            if descriptor.number == Some(*number as i32) {
+                                match mutation {
+                                    0 => continue,
+                                    1 => {
+                                        changed.extend_from_slice(field.encoded);
+                                        changed.extend_from_slice(field.encoded);
+                                        continue;
+                                    }
+                                    2 => descriptor.name = Some("foreign".into()),
+                                    3 => {
+                                        descriptor.r#type = Some(
+                                            prost_types::field_descriptor_proto::Type::Bytes as i32,
+                                        )
+                                    }
+                                    _ => {
+                                        let mut data = field.value.to_vec();
+                                        data.extend(raw_schema_length(99, b"foreign-option"));
+                                        changed.extend(raw_schema_length(2, &data));
+                                        continue;
+                                    }
+                                }
+                                changed.extend(raw_schema_length(2, &descriptor.encode_to_vec()));
+                                continue;
+                            }
+                        }
+                        changed.extend_from_slice(field.encoded);
+                    }
+                    body.extend(raw_schema_length(4, &changed));
+                }
+                let modified = raw_schema_fields(raw)
+                    .unwrap()
+                    .iter()
+                    .map(|file| {
+                        if file.number == 1
+                            && file.wire == 2
+                            && raw_schema_name(file.value).unwrap() == "openshell.proto"
+                        {
+                            raw_schema_length(1, &body)
+                        } else {
+                            file.encoded.to_vec()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .concat();
+                assert!(
+                    strip_discovery_raw(&modified).is_err(),
+                    "{message_name}#{number} mutation{mutation}"
+                );
+            }
+        }
     }
 }

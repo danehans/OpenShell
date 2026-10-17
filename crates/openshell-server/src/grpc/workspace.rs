@@ -1654,6 +1654,7 @@ mod tests {
             let mut req = Request::new(inner);
             req.extensions_mut().insert(Principal::User(UserPrincipal {
                 identity: Identity {
+                    provider_detach_witness_approval: None,
                     subject: "non-member".to_string(),
                     display_name: None,
                     roles: vec![],

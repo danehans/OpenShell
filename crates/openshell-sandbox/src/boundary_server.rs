@@ -1995,6 +1995,16 @@ mod linux {
             let payload_digest = envelope.payload_digest;
             let response = match envelope.request {
                 Request::DiscoverPolicy => Self::discover_image_policy(),
+                Request::WitnessCapability => self.witness_control(None, None, None),
+                Request::WitnessPrepare(request) => {
+                    self.witness_control(Some(request.binding), None, None)
+                }
+                Request::WitnessPermit(request) => {
+                    self.witness_control(None, Some(request.permit), None)
+                }
+                Request::WitnessFence(request) => {
+                    self.witness_control(None, None, Some(request.fence))
+                }
                 Request::Attach {
                     supervisor_instance_id: _,
                     policy,
@@ -2620,6 +2630,114 @@ mod linux {
             }
         }
 
+        fn witness_control(
+            &self,
+            operation: Option<openshell_core::provider_credentials::WitnessOperation>,
+            permit: Option<openshell_core::provider_credentials::WitnessCommittedPermit>,
+            fence: Option<openshell_core::provider_credentials::WitnessSourceFence>,
+        ) -> Response {
+            let bad = || {
+                guest_error(
+                    BoundaryErrorKind::Denied,
+                    "fixed witness original unavailable",
+                )
+            };
+            let Some(profile) = crate::boundary_exec::fixed_witness_profile() else {
+                return bad();
+            };
+            let process = {
+                let state = lock(&self.state);
+                let RuntimeState::Running(process) = &*state else {
+                    return bad();
+                };
+                process.clone()
+            };
+            let execution = openshell_core::traffic_identity::execution_id(
+                &self.config.boundary_id,
+                &self.config.generation,
+                self.config.auth_epoch.get(),
+            );
+            let Some(incarnation) = process.boundary_runtime.witness_incarnation() else {
+                return bad();
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|v| i64::try_from(v.as_millis()).ok());
+            let Some(now) = now else { return bad() };
+            if let Some(fence) = fence {
+                return match process.boundary_runtime.fence_witness(&fence) {
+                    Ok(quiesced) => Response::WitnessFenceObserved { quiesced },
+                    Err(_) => bad(),
+                };
+            }
+            let valid_local = |op: &openshell_core::provider_credentials::WitnessOperation| {
+                let Some(arm) = openshell_core::provider_credentials::decode_provider_witness_arm(
+                    op.arm_request.as_slice(),
+                ) else {
+                    return false;
+                };
+                let Some(attempt) = arm.attempt else {
+                    return false;
+                };
+                // Exact local execution and installed environment are checked
+                // again at consume, independently of the source permit.
+                attempt.sandbox_id == self.config.boundary_id
+                    && attempt.execution_id == execution
+                    && attempt.supervisor_session == op.supervisor_session
+                    && process
+                        .provider_credentials
+                        .child_environment_snapshot()
+                        .is_ok_and(|s| s.revision == attempt.provider_env_revision)
+            };
+            if let Some(op) = operation {
+                if !valid_local(&op) {
+                    return bad();
+                }
+                return process
+                    .boundary_runtime
+                    .prepare_witness(op, now, &profile, &execution)
+                    .map_or_else(bad, |operation| Response::WitnessPrepared { operation });
+            }
+            if let Some(permit) = permit {
+                if !valid_local(&permit.operation) {
+                    return bad();
+                }
+                return match process.boundary_runtime.consume_witness_with(
+                    &permit,
+                    now,
+                    &profile,
+                    &execution,
+                    || {
+                        if !valid_local(&permit.operation) {
+                            return Err(
+                                openshell_isolation_interface::contract::BackendError::Unavailable(
+                                    "witness local installation changed".into(),
+                                ),
+                            );
+                        }
+                        let _runtime = self.process_runtime.enter();
+                        process
+                            .witness_exec
+                            .spawn_fixed_witness(permit.operation.deadline_unix_ms)
+                    },
+                ) {
+                    Ok(()) => Response::WitnessPermitConsumed,
+                    Err(_) => bad(),
+                };
+            }
+            if !process.witness_exec.fixed_witness_artifact_available() {
+                return bad();
+            }
+            Response::WitnessCapability {
+                capability: openshell_core::provider_credentials::WitnessBoundaryCapability {
+                    boundary_incarnation: incarnation,
+                    execution_id: execution,
+                    profile_sha256: profile,
+                },
+            }
+        }
+
         fn update_provider_environment(
             &self,
             generation: u64,
@@ -2658,42 +2776,58 @@ mod linux {
                     format!("invalid provider files: {error}"),
                 );
             }
-            let requested_revision = revision;
-            let revision = match process
-                .provider_credentials
-                .compare_and_install_child_env_snapshot(current.revision, revision, provider_env)
-            {
-                Ok(revision) => revision,
-                Err(error) => return guest_error(BoundaryErrorKind::Process, error.to_string()),
-            };
-            if revision != requested_revision {
-                return guest_error(
-                    BoundaryErrorKind::Invalid,
-                    "provider environment changed during update",
-                );
-            }
-            let provider_file_count = provider_files.len();
-            if let Err(error) = self.network_broker.provider_files().replace(provider_files) {
-                return guest_error(
-                    BoundaryErrorKind::Process,
-                    format!("install provider files: {error}"),
-                );
-            }
-            *installed_generation = generation;
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Informational)
-                    .status(openshell_ocsf::StatusId::Success)
-                    .message(format!(
-                        "Provider file snapshot updated [file_count:{provider_file_count}]"
-                    ))
-                    .build()
-            );
-            Response::ProviderEnvironmentUpdated {
-                revision,
-                generation,
-                applied: true,
-            }
+            process
+                .boundary_runtime
+                .with_witness_configuration_change(|| {
+                    let requested_revision = revision;
+                    let revision = match process
+                        .provider_credentials
+                        .compare_and_install_child_env_snapshot(
+                            current.revision,
+                            revision,
+                            provider_env,
+                        ) {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            return guest_error(BoundaryErrorKind::Process, error.to_string());
+                        }
+                    };
+                    if revision != requested_revision {
+                        return guest_error(
+                            BoundaryErrorKind::Invalid,
+                            "provider environment changed during update",
+                        );
+                    }
+                    let provider_file_count = provider_files.len();
+                    if let Err(error) = self.network_broker.provider_files().replace(provider_files)
+                    {
+                        return guest_error(
+                            BoundaryErrorKind::Process,
+                            format!("install provider files: {error}"),
+                        );
+                    }
+                    *installed_generation = generation;
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                            .severity(openshell_ocsf::SeverityId::Informational)
+                            .status(openshell_ocsf::StatusId::Success)
+                            .message(format!(
+                                "Provider file snapshot updated [file_count:{provider_file_count}]"
+                            ))
+                            .build()
+                    );
+                    Response::ProviderEnvironmentUpdated {
+                        revision,
+                        generation,
+                        applied: true,
+                    }
+                })
+                .unwrap_or_else(|_| {
+                    guest_error(
+                        BoundaryErrorKind::Unavailable,
+                        "boundary configuration gate unavailable",
+                    )
+                })
         }
 
         fn wait(&self, process_id: &str) -> Response {
@@ -2961,6 +3095,7 @@ mod linux {
         signaler: AgentSignaler,
         exit: SharedProcessExit,
         boundary_exec: Arc<dyn BoundaryExec>,
+        witness_exec: crate::boundary_exec::LocalBoundaryExec,
         loopback_connector: Arc<dyn BoundaryLoopbackConnector>,
         main_session: Arc<MainSession>,
         attached: Arc<AtomicBool>,
@@ -3018,6 +3153,15 @@ mod linux {
                 provider_env_revision,
                 provider_env.clone(),
             );
+            let witness_exec = crate::boundary_exec::LocalBoundaryExec::new(
+                policy.clone(),
+                None,
+                ca_file_paths.clone().map(Arc::new),
+                provider_credentials.clone(),
+                std::collections::HashMap::new(),
+                boundary_runtime.clone(),
+                launcher.clone(),
+            );
             let mut spawned = runtime
                 .block_on(spawn_workload(
                     launcher,
@@ -3055,6 +3199,7 @@ mod linux {
                 signaler,
                 exit,
                 boundary_exec,
+                witness_exec,
                 loopback_connector,
                 main_session,
                 attached: Arc::new(AtomicBool::new(false)),

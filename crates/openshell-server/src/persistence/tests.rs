@@ -8,6 +8,227 @@ use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
 
+// Storage-only fixtures: these do not authenticate an approval or authorize a
+// runtime send. The RPC/source/boundary gates remain independent prerequisites.
+async fn provider_witness_storage_fixture() -> (Store, super::ProviderDetachWitnessPlan) {
+    use openshell_core::proto::{
+        ProviderDetachArmRequestV1, ProviderDetachArmSealV1, ProviderDetachAttemptV1,
+    };
+    let (store, detach) = provider_detach_commit_fixture().await;
+    let result = store.commit_provider_detach(&detach).await.unwrap();
+    assert_eq!(result.state, "applied");
+    let now = super::current_time_ms();
+    let deadline = now + 60_000;
+    let arm = ProviderDetachArmSealV1 {
+        request: Some(ProviderDetachArmRequestV1 {
+            original_action: Some(detach.action.clone()),
+            original_receipt: Some(detach.receipt.clone()),
+            attempt: Some(ProviderDetachAttemptV1 {
+                deadline: openshell_core::time::timestamp_from_millis(deadline).ok(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        hold_generation: 1,
+        row_resource_version: 1,
+        install_sequence: 42,
+        installed_time: openshell_core::time::timestamp_from_millis(now).ok(),
+        ..Default::default()
+    };
+    let target = detach.action.target.as_ref().unwrap();
+    let sandbox = store
+        .get("sandbox", &target.sandbox_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let binding = super::ProviderDetachWitnessBinding {
+        authority: target.authority.clone(),
+        run_id: uuid::Uuid::new_v4().to_string(),
+        action_id: detach.action.action_id.clone(),
+        request_sha256: "a".repeat(64),
+        profile_sha256: "b".repeat(64),
+        original_action: detach.action.encode_to_vec(),
+        original_receipt: detach.receipt.encode_to_vec(),
+        installed_arm: arm.encode_to_vec(),
+        hold_generation: 1,
+        hold_resource_version: 1,
+        sandbox_resource_version: sandbox.resource_version,
+        provider_resource_version: 1,
+        deadline_ms: deadline,
+    };
+    let fence = store.provider_detach_fence().await.unwrap();
+    (store, super::ProviderDetachWitnessPlan { binding, fence })
+}
+
+#[tokio::test]
+async fn provider_witness_first_claim_is_permanent_and_duplicates_never_select_sender() {
+    let (store, plan) = provider_witness_storage_fixture().await;
+    assert!(
+        store
+            .reserve_provider_detach_witness(&plan, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .reserve_provider_detach_witness(&plan, false)
+            .await
+            .unwrap()
+            .dispatch_claimed
+    );
+    let (one, two) = tokio::join!(
+        store.reserve_provider_detach_witness(&plan, true),
+        store.reserve_provider_detach_witness(&plan, true),
+    );
+    assert_ne!(one.is_ok(), two.is_ok());
+    // Losing a commit reply supplies only readback of the original, not send
+    // authority. Reading twice or reserving again cannot reset this tombstone.
+    for _ in 0..2 {
+        assert!(
+            store
+                .read_provider_detach_witness(&plan.binding)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_claimed
+        );
+        assert!(
+            store
+                .reserve_provider_detach_witness(&plan, false)
+                .await
+                .unwrap()
+                .dispatch_claimed
+        );
+        assert!(
+            store
+                .reserve_provider_detach_witness(&plan, true)
+                .await
+                .is_err()
+        );
+    }
+    let mut changed = plan.binding.clone();
+    changed.request_sha256 = "c".repeat(64);
+    assert_eq!(changed.original_key(), plan.binding.original_key());
+    assert!(store.read_provider_detach_witness(&changed).await.is_err());
+    let id = plan.binding.original_key();
+    assert!(
+        store
+            .delete(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE, &id)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .put(
+                super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE,
+                &id,
+                &id,
+                "default",
+                b"{}",
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_all_in_workspace(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE, "default")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn provider_witness_dependency_drift_between_external_read_and_transaction_refuses_both_phases()
+ {
+    for claim in [false, true] {
+        let (store, plan) = provider_witness_storage_fixture().await;
+        if claim {
+            store
+                .reserve_provider_detach_witness(&plan, false)
+                .await
+                .unwrap();
+        }
+        // A real DB dependency changes after the external fence was captured,
+        // before the reserve/claim transaction begins.
+        store
+            .put(
+                "gateway_settings",
+                "changed",
+                "changed",
+                "",
+                b"changed",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reserve_provider_detach_witness(&plan, claim)
+                .await
+                .is_err()
+        );
+        let original = store
+            .read_provider_detach_witness(&plan.binding)
+            .await
+            .unwrap();
+        assert_eq!(
+            original.map(|v| v.dispatch_claimed),
+            if claim { Some(false) } else { None }
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_witness_actual_provider_replacement_refuses_even_with_refreshed_external_fence() {
+    let (store, mut plan) = provider_witness_storage_fixture().await;
+    store
+        .reserve_provider_detach_witness(&plan, false)
+        .await
+        .unwrap();
+    let action = openshell_core::proto::ProviderDetachActionV1::decode(
+        plan.binding.original_action.as_slice(),
+    )
+    .unwrap();
+    let target = action.target.unwrap();
+    store.delete("provider", &target.provider_id).await.unwrap();
+    let replacement = openshell_core::proto::Provider {
+        metadata: Some(ProtoObjectMeta {
+            id: "replacement".into(),
+            name: target.provider.clone(),
+            workspace: target.workspace.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store
+        .put(
+            "provider",
+            "replacement",
+            &target.provider,
+            &target.workspace,
+            &replacement.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    plan.fence = store.provider_detach_fence().await.unwrap();
+    assert!(
+        store
+            .reserve_provider_detach_witness(&plan, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .read_provider_detach_witness(&plan.binding)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_claimed
+    );
+}
+
 /// A failed store call must be visible as a failure in the trace, not as a
 /// span that merely happened to return nothing.
 #[tokio::test]

@@ -37,12 +37,35 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Closed, optional fixed-witness control path. Implementations must not
+/// retry an original request or translate it into ordinary Exec/RelayOpen.
+#[async_trait::async_trait]
+pub trait ProviderWitnessControl: Send + Sync {
+    fn capability(
+        &self,
+        session_id: &str,
+    ) -> Option<openshell_core::proto::ProviderDetachWitnessControlV1>;
+    async fn invoke(
+        &self,
+        session_id: &str,
+        request: openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> openshell_core::proto::ProviderDetachWitnessControlV1;
+    /// Source R happens before publishing session loss/reconnect.
+    fn disconnect(&self);
+    fn observations(
+        &self,
+    ) -> Option<mpsc::Receiver<openshell_core::proto::ProviderDetachWitnessControlV1>> {
+        None
+    }
+}
+
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
     /// Identifies the local supervisor process across gateway reconnects.
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    pub witness_control: Option<Arc<dyn ProviderWitnessControl>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -335,6 +358,7 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        witness_control: runtime.witness_control,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -350,6 +374,7 @@ struct SessionConfig {
     instance_id: String,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    witness_control: Option<Arc<dyn ProviderWitnessControl>>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -361,6 +386,9 @@ async fn run_session_loop(config: SessionConfig) {
         attempt += 1;
 
         let result = run_single_session(&config, attempt).await;
+        if let Some(control) = &config.witness_control {
+            control.disconnect();
+        }
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
@@ -458,12 +486,40 @@ async fn run_single_session(
     ocsf_emit!(event);
     config.ready_tx.send_replace(true);
 
+    if let Some(control) = &config.witness_control
+        && let Some(capability) = control.capability(&accepted.session_id)
+    {
+        tx.send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::ProviderDetachWitness(
+                capability,
+            )),
+        })
+        .await
+        .map_err(|_| "witness capability transport lost")?;
+    }
+
+    let mut witness_observations = config
+        .witness_control
+        .as_ref()
+        .and_then(|c| c.observations());
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {
         tokio::select! {
+            observation = async {
+                match &mut witness_observations {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match observation {
+                    Some(control) => { tx.try_send(SupervisorMessage { payload:Some(supervisor_message::Payload::ProviderDetachWitness(control)) })
+                        .map_err(|_| "witness observation transport unknown")?; }
+                    None => {witness_observations=None;}
+                }
+            }
             msg = inbound.message() => {
                 let msg = match map_session_stream_message(
                     msg,
@@ -473,6 +529,15 @@ async fn run_single_session(
                     SessionStreamMessage::Message(msg) => msg,
                     SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
                 };
+                if let Some(gateway_message::Payload::ProviderDetachWitness(request)) = &msg.payload {
+                    if let Some(control) = &config.witness_control {
+                        let outcome = control.invoke(&accepted.session_id, request.clone()).await;
+                        // One send only. Queue/stream loss never retries execution.
+                        tx.try_send(SupervisorMessage { payload: Some(supervisor_message::Payload::ProviderDetachWitness(outcome)) })
+                            .map_err(|_| "witness original outcome unknown")?;
+                    }
+                    continue;
+                }
                 let context = GatewayMessageContext {
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,

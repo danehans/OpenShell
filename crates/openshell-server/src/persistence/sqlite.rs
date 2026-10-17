@@ -512,6 +512,203 @@ async fn recover_provider_detach_on(
 }
 
 impl SqliteStore {
+    /// D1: all related predicates and the original admission transition share
+    /// one write transaction. No launch, transport, session wait or detach occurs.
+    pub(crate) async fn reserve_provider_detach_witness(
+        &self,
+        plan: &super::ProviderDetachWitnessPlan,
+        claim_dispatch: bool,
+    ) -> PersistenceResult<super::ProviderDetachWitnessAdmission> {
+        use crate::storage_proto::{StoredProviderDetachActionV1, StoredProviderDetachHoldV1};
+        use openshell_core::proto::{
+            ProviderDetachActionV1, ProviderDetachArmSealV1, ProviderDetachReceiptV1, Sandbox,
+            SandboxPhase,
+        };
+        use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+        let bad = || {
+            PersistenceError::Config("provider witness original/current predicate refused".into())
+        };
+        let binding = &plan.binding;
+        let is_digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if binding.authority.is_empty()
+            || binding.authority.len() > 253
+            || uuid::Uuid::parse_str(&binding.run_id).is_err()
+            || !is_digest(&binding.request_sha256)
+            || !is_digest(&binding.profile_sha256)
+            || binding.original_action.len() > 8192
+            || binding.original_receipt.len() > 8192
+            || binding.installed_arm.len() > 8192
+            || binding.installed_arm.is_empty()
+            || binding.hold_generation == 0
+            || binding.hold_resource_version == 0
+            || binding.sandbox_resource_version == 0
+            || binding.provider_resource_version == 0
+        {
+            return Err(bad());
+        }
+        let action = ProviderDetachActionV1::decode(binding.original_action.as_slice())
+            .map_err(|_| bad())?;
+        let receipt = ProviderDetachReceiptV1::decode(binding.original_receipt.as_slice())
+            .map_err(|_| bad())?;
+        let arm =
+            ProviderDetachArmSealV1::decode(binding.installed_arm.as_slice()).map_err(|_| bad())?;
+        crate::grpc::validate_provider_detach_original_action(&action).map_err(|_| bad())?;
+        let target = action.target.as_ref().ok_or_else(bad)?;
+        let request = arm.request.as_ref().ok_or_else(bad)?;
+        let attempt = request.attempt.as_ref().ok_or_else(bad)?;
+        if action.action_id != binding.action_id
+            || target.authority != binding.authority
+            || receipt.action_id != action.action_id
+            || receipt.target != action.target
+            || request.original_action.as_ref() != Some(&action)
+            || request.original_receipt.as_ref() != Some(&receipt)
+            || arm.hold_generation != binding.hold_generation
+            || arm.row_resource_version != binding.hold_resource_version
+            || arm.install_sequence == 0
+            || arm.installed_time.is_none()
+            || attempt.deadline.as_ref().and_then(|t| {
+                if !(0..1_000_000_000).contains(&t.nanos) {
+                    return None;
+                }
+                t.seconds
+                    .checked_mul(1000)?
+                    .checked_add(i64::from(t.nanos / 1_000_000))
+            }) != Some(binding.deadline_ms)
+        {
+            return Err(bad());
+        }
+        let payload = serde_json::to_vec(&super::ProviderDetachWitnessAdmission {
+            binding: binding.clone(),
+            dispatch_claimed: claim_dispatch,
+        })
+        .map_err(|_| bad())?;
+        if payload.len() > 32 * 1024 {
+            return Err(bad());
+        }
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        // This reads the actual dependency rows *after* BEGIN IMMEDIATE.
+        if provider_detach_fence_on(&mut tx).await? != plan.fence {
+            return Err(bad());
+        }
+        let hold: Option<(String, String, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT name,workspace,payload,resource_version FROM objects WHERE object_type=? AND id=? AND length(payload)<=16384")
+            .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(&receipt.hold_id)
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let (hold_name, hold_workspace, hold_bytes, hold_rv) = hold.ok_or_else(bad)?;
+        let hold = StoredProviderDetachHoldV1::decode(hold_bytes.as_slice()).map_err(|_| bad())?;
+        let original: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT payload FROM objects WHERE object_type=? AND id=? AND workspace=? AND length(payload)<=16384")
+            .bind(super::PROVIDER_DETACH_ACTION_OBJECT_TYPE).bind(&action.action_id).bind(&target.workspace)
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let original = StoredProviderDetachActionV1::decode(original.ok_or_else(bad)?.0.as_slice())
+            .map_err(|_| bad())?;
+        let sandbox: Option<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload,resource_version FROM objects WHERE object_type='sandbox' AND id=? AND workspace=? AND name=? AND length(payload)<=16777216")
+            .bind(&target.sandbox_id).bind(&target.workspace).bind(&target.sandbox)
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let (sandbox_bytes, sandbox_rv) = sandbox.ok_or_else(bad)?;
+        let sandbox = Sandbox::decode(sandbox_bytes.as_slice()).map_err(|_| bad())?;
+        let provider: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id,resource_version FROM objects WHERE object_type='provider' AND workspace=? AND name=?")
+            .bind(&target.workspace).bind(&target.provider).fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        if hold.schema_version != 1
+            || hold.hold_id != receipt.hold_id
+            || hold_name != format!("{}:{}", target.sandbox_id, target.provider)
+            || hold_workspace != target.workspace
+            || hold.workspace != target.workspace
+            || hold.sandbox_id != target.sandbox_id
+            || hold.provider_id != target.provider_id
+            || hold.provider != target.provider
+            || hold.generation != binding.hold_generation
+            || u64::try_from(hold_rv).ok() != Some(binding.hold_resource_version)
+            || hold.original_action.as_ref() != Some(&action)
+            || hold.original_receipt.as_ref() != Some(&receipt)
+            || hold.native_receipt_id != receipt.native_receipt_id
+            || original.schema_version != 1
+            || original.original_action.as_ref() != Some(&action)
+            || !original
+                .outcome
+                .as_ref()
+                .is_some_and(|o| o.state == "applied" && o.receipt.as_ref() == Some(&receipt))
+            || sandbox.object_id() != target.sandbox_id
+            || sandbox.object_name() != target.sandbox
+            || sandbox.object_workspace() != target.workspace
+            || sandbox.phase() != SandboxPhase::Ready as i32
+            || u64::try_from(sandbox_rv).ok() != Some(binding.sandbox_resource_version)
+            || crate::auth::sandbox_session::sandbox_execution_id(&sandbox)
+                .ok()
+                .as_deref()
+                != Some(target.execution_id.as_str())
+            || !sandbox.spec.as_ref().is_some_and(|s| {
+                s.provider_attachment_epoch == receipt.after_attachment_epoch
+                    && !s.providers.contains(&target.provider)
+            })
+            || provider.as_ref().is_none_or(|(id, rv)| {
+                id != &target.provider_id
+                    || u64::try_from(*rv).ok() != Some(binding.provider_resource_version)
+            })
+        {
+            return Err(bad());
+        }
+        let now = current_time_ms();
+        if now >= binding.deadline_ms {
+            return Err(bad());
+        }
+        let id = binding.original_key();
+        let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload,resource_version FROM objects WHERE object_type=? AND id=? AND length(payload)<=32768")
+            .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE).bind(&id)
+            .fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        if let Some((bytes, rv)) = existing {
+            let original: super::ProviderDetachWitnessAdmission =
+                serde_json::from_slice(&bytes).map_err(|_| bad())?;
+            if original.binding != *binding || (claim_dispatch && original.dispatch_claimed) {
+                return Err(bad());
+            }
+            if !claim_dispatch {
+                return Ok(original);
+            }
+            let updated = sqlx::query("UPDATE objects SET payload=?,resource_version=resource_version+1,updated_at_ms=? WHERE object_type=? AND id=? AND resource_version=?")
+                    .bind(&payload).bind(now).bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE).bind(&id).bind(rv)
+                    .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            if updated.rows_affected() != 1 {
+                return Err(bad());
+            }
+        } else {
+            // An invoke cannot create its own reservation or recover an
+            // absent reservation into another original dispatch.
+            if claim_dispatch {
+                return Err(bad());
+            }
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type=?")
+                .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            if count >= 4096 {
+                return Err(bad());
+            }
+            sqlx::query("INSERT INTO objects(object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?)")
+                    .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE).bind(&id).bind(&id).bind(&target.workspace)
+                    .bind(&payload).bind(now).bind(now).execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        }
+        // No sender is selected if commit's response is lost or ambiguous.
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(super::ProviderDetachWitnessAdmission {
+            binding: binding.clone(),
+            dispatch_claimed: claim_dispatch,
+        })
+    }
+
     pub(crate) async fn reject_provider_detach(
         &self,
         action: &openshell_core::proto::ProviderDetachActionV1,
@@ -1024,6 +1221,11 @@ impl SqliteStore {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Box::pin(self.put_provider_detach_hold(id, name, workspace, payload)).await;
         }
@@ -1081,6 +1283,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1122,6 +1329,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1238,6 +1450,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1281,6 +1498,11 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1339,6 +1561,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1395,6 +1622,11 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
         labels: Option<&str>,
         max_count: u64,
     ) -> PersistenceResult<Option<WriteResult>> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1502,6 +1734,11 @@ WHERE "object_type" = ?1 AND "workspace" = ?2 AND "name" = ?3
     }
 
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1522,6 +1759,11 @@ WHERE "object_type" = ?1 AND "id" = ?2
     }
 
     pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1571,6 +1813,11 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1591,6 +1838,11 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
     }
 
     pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),
@@ -1616,6 +1868,11 @@ WHERE "object_type" = ?1 AND "scope" = ?2
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<bool> {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+            return Err(PersistenceError::Config(
+                "provider witness requires original native transaction".into(),
+            ));
+        }
         if object_type == super::PROVIDER_DETACH_HOLD_OBJECT_TYPE {
             return Err(PersistenceError::Config(
                 "provider hold requires immutable native creation".into(),

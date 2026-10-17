@@ -167,6 +167,33 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+  // Reserve one original fixed-profile witness; never arms or detaches.
+  rpc ReserveProviderDetachWitness(ReserveProviderDetachWitnessRequest)
+      returns (ReserveProviderDetachWitnessResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:witness"
+      workspace_role: "user"
+    };
+  }
+  // First durable dispatch claim only; ambiguous outcomes never authorize replay.
+  rpc InvokeProviderDetachWitness(InvokeProviderDetachWitnessRequest)
+      returns (InvokeProviderDetachWitnessResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:witness"
+      workspace_role: "user"
+    };
+  }
+  // Read the original invocation only; never reserves, arms, refreshes or sends.
+  rpc GetProviderDetachWitnessInvocation(GetProviderDetachWitnessInvocationRequest)
+      returns (GetProviderDetachWitnessInvocationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:witness:read"
+      workspace_role: "user"
+    };
+  }
   // Closed read-only resolve/recover/observe queries; never redispatches mutation.
   rpc GetConditionalProviderDetachState(GetConditionalProviderDetachStateRequest)
       returns (GetConditionalProviderDetachStateResponse) {
@@ -3169,6 +3196,7 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ProviderDetachWitnessControlV1 provider_detach_witness = 5;
   }
 }
 
@@ -3180,6 +3208,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    ProviderDetachWitnessRequestV1 provider_detach_witness = 6;
   }
 }
 
@@ -4297,6 +4326,74 @@ message ArmProviderDetachAttemptRequest {
 }
 message ArmProviderDetachAttemptResponse {
   ProviderDetachAttemptReadbackV1 readback = 1;
+}
+
+// Closed fixed-profile identity. No executable, argv, environment, body or PTY.
+message ProviderDetachWitnessRequestV1 {
+  string run_id = 1;
+  string profile_id = 2;
+  string profile_sha256 = 3;
+  ProviderDetachArmSealV1 installed_arm = 4;
+  string source_incarnation = 5;
+  string boundary_incarnation = 6;
+  // Domain-separated digest of this message with this field cleared.
+  string request_sha256 = 7;
+}
+
+message ReserveProviderDetachWitnessRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderDetachWitnessRequestV1 request = 2;
+}
+message ReserveProviderDetachWitnessResponse {
+  ProviderDetachWitnessInvocationV1 invocation = 1;
+}
+message InvokeProviderDetachWitnessRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderDetachWitnessRequestV1 request = 2;
+}
+message InvokeProviderDetachWitnessResponse {
+  ProviderDetachWitnessInvocationV1 invocation = 1;
+}
+message GetProviderDetachWitnessInvocationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // EXACTLY ONE mode: original request OR exactly one metadata resource.
+  ProviderDetachWitnessRequestV1 request = 2;
+  // Repeated only to preserve and reject duplicate metadata selectors.
+  // This is not a batch/list API; zero or more than one resource refuses.
+  repeated ProviderDetachResourceV1 capability_resources = 3;
+}
+message GetProviderDetachWitnessInvocationResponse {
+  // Exactly one result mode. Original reads have no metadata-mode extras.
+  ProviderDetachWitnessInvocationV1 invocation = 1;
+  ProviderDetachWitnessControlV1 capability = 2;
+  ProviderDetachResourceV1 capability_resource = 3;
+  string capability_supervisor_session = 4;
+}
+
+message ProviderDetachWitnessInvocationV1 {
+  string original_key = 1;
+  string request_sha256 = 2;
+  // reserved, dispatching, unknown, terminal-refused, terminal-not-refused or invalidated.
+  string state = 3;
+  // Original Native proof remains independent of process exit/start/cancellation.
+  ProviderDetachAttemptReadbackV1 native_observation = 4;
+  bool source_invalidated = 5;
+  bool boundary_cancel_pending = 6;
+  bool boundary_quiesced = 7;
+}
+
+// Authenticated session metadata only, not standalone evidence or a credential.
+// Capability is sent after SessionAccepted, never inferred from a driver label.
+message ProviderDetachWitnessControlV1 {
+  string original_key = 1;
+  string request_sha256 = 2;
+  string source_incarnation = 3;
+  string boundary_incarnation = 4;
+  string profile_sha256 = 5;
+  // capability, unknown, source-invalidated, cancel-pending, boundary-quiesced.
+  string state = 6;
+  // Actual Native boundary execution, never derived from a caller's resource.
+  string execution_id = 7;
 }
 // Capability defaults false. A report belongs to the original authenticated
 // readiness sequence; retries never rewrite a prior observation or event time.

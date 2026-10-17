@@ -979,6 +979,7 @@ impl<S> AuthGrpcRouter<S> {
 fn unauthenticated_dev_user_principal() -> Principal {
     Principal::User(UserPrincipal {
         identity: Identity {
+            provider_detach_witness_approval: None,
             subject: "unauthenticated-local-dev".to_string(),
             display_name: Some("Unauthenticated Local Dev".to_string()),
             roles: vec!["openshell-user".to_string(), "openshell-admin".to_string()],
@@ -1279,6 +1280,7 @@ where
         .collect();
 
     Some(Identity {
+        provider_detach_witness_approval: None,
         subject: cn.clone(),
         display_name: Some(cn),
         roles,
@@ -2690,6 +2692,7 @@ mod tests {
         fn user_principal(subject: &str) -> Principal {
             Principal::User(UserPrincipal {
                 identity: Identity {
+                    provider_detach_witness_approval: None,
                     subject: subject.to_string(),
                     display_name: None,
                     roles: vec![],
@@ -2702,6 +2705,7 @@ mod tests {
         fn provider_writer_principal() -> Principal {
             Principal::User(UserPrincipal {
                 identity: Identity {
+                    provider_detach_witness_approval: None,
                     subject: "provider-rotation-job".to_string(),
                     display_name: None,
                     roles: vec!["openshell-admin".to_string()],
@@ -2713,6 +2717,7 @@ mod tests {
 
         fn mtls_identity(subject: &str) -> Identity {
             Identity {
+                provider_detach_witness_approval: None,
                 subject: subject.to_string(),
                 display_name: Some(subject.to_string()),
                 roles: vec!["openshell-user".to_string()],
@@ -2937,6 +2942,7 @@ mod tests {
             fn admin_user() -> Principal {
                 Principal::User(UserPrincipal {
                     identity: Identity {
+                        provider_detach_witness_approval: None,
                         subject: "admin".to_string(),
                         display_name: None,
                         roles: vec!["openshell-admin".to_string()],

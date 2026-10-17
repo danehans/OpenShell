@@ -167,22 +167,43 @@ macro_rules! mock_gateway {
         &self,
         _request: tonic::Request<openshell_core::proto::ConditionalDetachSandboxProviderRequest>,
     ) -> Result<
-        tonic::Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>,
-        tonic::Status,
+        Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>,
+        Status,
     > {
-        Err(tonic::Status::unimplemented(
+        Err(Status::unimplemented(
             "optional provider detach capability",
         ))
+    }
+
+    async fn reserve_provider_detach_witness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReserveProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReserveProviderDetachWitnessResponse>, Status> {
+        Err(Status::unimplemented("fixed witness unsupported by fixture"))
+    }
+
+    async fn invoke_provider_detach_witness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::InvokeProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::InvokeProviderDetachWitnessResponse>, Status> {
+        Err(Status::unimplemented("fixed witness unsupported by fixture"))
+    }
+
+    async fn get_provider_detach_witness_invocation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderDetachWitnessInvocationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderDetachWitnessInvocationResponse>, Status> {
+        Err(Status::unimplemented("fixed witness unsupported by fixture"))
     }
 
     async fn arm_provider_detach_attempt(
         &self,
         _request: tonic::Request<openshell_core::proto::ArmProviderDetachAttemptRequest>,
     ) -> Result<
-        tonic::Response<openshell_core::proto::ArmProviderDetachAttemptResponse>,
-        tonic::Status,
+        Response<openshell_core::proto::ArmProviderDetachAttemptResponse>,
+        Status,
     > {
-        Err(tonic::Status::unimplemented(
+        Err(Status::unimplemented(
             "optional provider detach capability",
         ))
     }
@@ -191,10 +212,10 @@ macro_rules! mock_gateway {
         &self,
         _request: tonic::Request<openshell_core::proto::GetConditionalProviderDetachStateRequest>,
     ) -> Result<
-        tonic::Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>,
-        tonic::Status,
+        Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>,
+        Status,
     > {
-        Err(tonic::Status::unimplemented(
+        Err(Status::unimplemented(
             "optional provider detach capability",
         ))
     }

@@ -28,6 +28,55 @@ pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 /// Native holds are not response records and never expire with response retention.
 pub const PROVIDER_DETACH_HOLD_OBJECT_TYPE: &str = "provider_detach_hold_v1";
 pub const PROVIDER_DETACH_ACTION_OBJECT_TYPE: &str = "provider_detach_action_v1";
+/// Permanent original witness ownership; not a generic expiring mutation record.
+pub const PROVIDER_DETACH_WITNESS_OBJECT_TYPE: &str = "provider_detach_witness_v1";
+
+/// Private, bounded reservation metadata. Approval and live session validation
+/// remain mandatory RPC prerequisites; persistence never creates a grant.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDetachWitnessBinding {
+    pub authority: String,
+    pub run_id: String,
+    pub action_id: String,
+    pub request_sha256: String,
+    pub profile_sha256: String,
+    pub original_action: Vec<u8>,
+    pub original_receipt: Vec<u8>,
+    pub installed_arm: Vec<u8>,
+    pub hold_generation: u64,
+    pub hold_resource_version: u64,
+    pub sandbox_resource_version: u64,
+    pub provider_resource_version: u64,
+    pub deadline_ms: i64,
+}
+
+impl ProviderDetachWitnessBinding {
+    /// Caller identity, attempt UUID and request digest cannot change ownership.
+    pub(crate) fn original_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"openshell.provider-detach.original-witness/v1\n");
+        for value in [&self.authority, &self.run_id, &self.action_id] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        format!("{:x}", hash.finalize())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDetachWitnessAdmission {
+    pub binding: ProviderDetachWitnessBinding,
+    /// Once true, neither a crash nor expiry can make this original sendable.
+    pub dispatch_claimed: bool,
+}
+
+pub struct ProviderDetachWitnessPlan {
+    pub binding: ProviderDetachWitnessBinding,
+    pub fence: ProviderDetachFence,
+}
 
 /// Internal transaction fence; never a grant, public hash or retained workload.
 #[derive(Clone, PartialEq, Eq)]
@@ -312,6 +361,77 @@ impl Store {
                 "conditional provider detachment backend unsupported".into(),
             )),
         }
+    }
+
+    /// Reserve or claim under actual related-row validation in the same `SQLite`
+    /// transaction. A successful first claim alone selects one original sender.
+    pub(crate) async fn reserve_provider_detach_witness(
+        &self,
+        plan: &ProviderDetachWitnessPlan,
+        claim_dispatch: bool,
+    ) -> PersistenceResult<ProviderDetachWitnessAdmission> {
+        match self {
+            Self::Sqlite(store) => {
+                store
+                    .reserve_provider_detach_witness(plan, claim_dispatch)
+                    .await
+            }
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "provider witness backend unsupported".into(),
+            )),
+        }
+    }
+
+    /// Test-only full-binding observation. Production reads use the immutable
+    /// original key and request digest without revalidating mutable row versions.
+    #[cfg(test)]
+    pub(crate) async fn read_provider_detach_witness(
+        &self,
+        binding: &ProviderDetachWitnessBinding,
+    ) -> PersistenceResult<Option<ProviderDetachWitnessAdmission>> {
+        let Some(row) = self
+            .get(PROVIDER_DETACH_WITNESS_OBJECT_TYPE, &binding.original_key())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.payload.len() > 32 * 1024 {
+            return Err(PersistenceError::Decode("provider witness capacity".into()));
+        }
+        let admission: ProviderDetachWitnessAdmission = serde_json::from_slice(&row.payload)
+            .map_err(|_| PersistenceError::Decode("provider witness invalid".into()))?;
+        if admission.binding != *binding {
+            return Err(PersistenceError::Config(
+                "provider witness original conflict".into(),
+            ));
+        }
+        Ok(Some(admission))
+    }
+
+    pub(crate) async fn read_provider_witness_original(
+        &self,
+        original_key: &str,
+        request_sha256: &str,
+    ) -> PersistenceResult<Option<ProviderDetachWitnessAdmission>> {
+        let Some(row) = self
+            .get(PROVIDER_DETACH_WITNESS_OBJECT_TYPE, original_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.payload.len() > 32 * 1024 {
+            return Err(PersistenceError::Decode("provider witness capacity".into()));
+        }
+        let admission: ProviderDetachWitnessAdmission = serde_json::from_slice(&row.payload)
+            .map_err(|_| PersistenceError::Decode("provider witness invalid".into()))?;
+        if admission.binding.original_key() != original_key
+            || admission.binding.request_sha256 != request_sha256
+        {
+            return Err(PersistenceError::Config(
+                "provider witness original conflict".into(),
+            ));
+        }
+        Ok(Some(admission))
     }
 
     pub(crate) async fn commit_provider_detach(

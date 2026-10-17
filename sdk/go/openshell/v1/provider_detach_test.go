@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	gproto "google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"strings"
 	"time"
 
 	"encoding/json"
@@ -427,5 +428,154 @@ func TestProviderDetachArmBootstrapIsStrictZeroReadOnlyMetadata(t *testing.T) {
 	f.armReadback = native
 	if out, err = c.QueryDetachAttempt(context.Background(), bootstrap); err == nil || out.State != ProviderDetachUnknown {
 		t.Fatal("bootstrap accepted a positive seal")
+	}
+}
+
+type witnessTransportFake struct {
+	metadata  *pb.GetProviderDetachWitnessInvocationResponse
+	lastQuery *pb.GetProviderDetachWitnessInvocationRequest
+	pb.OpenShellClient
+	invokes, reserves, queries int
+	request                    *pb.ProviderDetachWitnessRequestV1
+	reply                      *pb.ProviderDetachWitnessInvocationV1
+	err                        error
+}
+
+func (f *witnessTransportFake) ReserveProviderDetachWitness(_ context.Context, q *pb.ReserveProviderDetachWitnessRequest, _ ...grpc.CallOption) (*pb.ReserveProviderDetachWitnessResponse, error) {
+	f.reserves++
+	f.request = q.Request
+	return &pb.ReserveProviderDetachWitnessResponse{Invocation: f.reply}, f.err
+}
+func (f *witnessTransportFake) InvokeProviderDetachWitness(_ context.Context, q *pb.InvokeProviderDetachWitnessRequest, _ ...grpc.CallOption) (*pb.InvokeProviderDetachWitnessResponse, error) {
+	f.invokes++
+	f.request = q.Request
+	return &pb.InvokeProviderDetachWitnessResponse{Invocation: f.reply}, f.err
+}
+func (f *witnessTransportFake) GetProviderDetachWitnessInvocation(_ context.Context, q *pb.GetProviderDetachWitnessInvocationRequest, _ ...grpc.CallOption) (*pb.GetProviderDetachWitnessInvocationResponse, error) {
+	f.queries++
+	f.lastQuery = q
+	f.request = q.Request
+	if f.metadata != nil {
+		return f.metadata, f.err
+	}
+	return &pb.GetProviderDetachWitnessInvocationResponse{Invocation: f.reply}, f.err
+}
+func witnessFixture(t *testing.T) ProviderDetachWitnessRequest {
+	t.Helper()
+	now := time.Now().UTC()
+	q := ProviderDetachWitnessRequest{RunID: "11111111-1111-4111-8111-111111111111", ProfileID: ProviderDetachWitnessProfile, ProfileSHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		InstalledArm: ProviderDetachArmSeal{Request: freshArmFixture(t, now), HoldGeneration: 1, RowResourceVersion: 2, InstallSequence: 3, InstalledAt: now}, SourceIncarnation: "22222222-2222-4222-8222-222222222222", BoundaryIncarnation: "33333333-3333-4333-8333-333333333333"}
+	q.RequestSHA256 = q.SHA256()
+	if err := q.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+func TestProviderDetachWitnessOneUnknownInvokeNeverRetriesOrFallsBack(t *testing.T) {
+	q := witnessFixture(t)
+	f := &witnessTransportFake{err: status.Error(codes.Unavailable, "synthetic lost original response")}
+	c := &ProviderDetachmentClient{rpc: f, resource: q.InstalledArm.Request.OriginalAction.Target.Resource(), timeout: time.Second}
+	result, err := c.InvokeDetachWitness(context.Background(), q)
+	if err == nil || result.State != "unknown" || f.invokes != 1 || f.reserves != 0 || f.queries != 0 {
+		t.Fatal("unknown call was retried or transformed", result, err)
+	}
+	if !gproto.Equal(f.request, q.native()) {
+		t.Fatal("original source/incarnation/arm binding changed")
+	}
+	f.err = nil
+	f.reply = &pb.ProviderDetachWitnessInvocationV1{OriginalKey: q.originalKey(), RequestSha256: q.RequestSHA256, State: "unknown", SourceInvalidated: true, BoundaryCancelPending: true}
+	result, err = c.QueryDetachWitness(context.Background(), q)
+	if err != nil || !result.BoundaryCancelPending || result.NativeObservation != nil || f.invokes != 1 || f.queries != 1 {
+		t.Fatal("readback manufactured native proof or invoked", result, err)
+	}
+}
+func TestProviderDetachWitnessSubstitutionsRefuseBeforeTransport(t *testing.T) {
+	original := witnessFixture(t)
+	f := &witnessTransportFake{}
+	c := &ProviderDetachmentClient{rpc: f, resource: original.InstalledArm.Request.OriginalAction.Target.Resource(), timeout: time.Second}
+	for _, mutate := range []func(*ProviderDetachWitnessRequest){func(q *ProviderDetachWitnessRequest) { q.ProfileID = "shell" }, func(q *ProviderDetachWitnessRequest) { q.SourceIncarnation = "" }, func(q *ProviderDetachWitnessRequest) { q.BoundaryIncarnation = "different" }, func(q *ProviderDetachWitnessRequest) { q.InstalledArm.InstallSequence++ }, func(q *ProviderDetachWitnessRequest) { q.RequestSHA256 = "0" }} {
+		q := original
+		mutate(&q)
+		if _, err := c.InvokeDetachWitness(context.Background(), q); err == nil || f.invokes != 0 {
+			t.Fatal("substitution reached transport")
+		}
+	}
+	f.reply = &pb.ProviderDetachWitnessInvocationV1{OriginalKey: original.originalKey(), RequestSha256: original.RequestSHA256, State: "unknown", BoundaryQuiesced: true}
+	if _, err := c.QueryDetachWitness(context.Background(), original); err == nil {
+		t.Fatal("unbound quiescence accepted")
+	}
+}
+
+func TestProviderDetachWitnessMetadataClosedResponseAndNoEffects(t *testing.T) {
+	q := witnessFixture(t)
+	r := q.InstalledArm.Request.OriginalAction.Target.Resource()
+	valid := &pb.GetProviderDetachWitnessInvocationResponse{Capability: &pb.ProviderDetachWitnessControlV1{State: "capability", SourceIncarnation: q.SourceIncarnation, BoundaryIncarnation: q.BoundaryIncarnation, ProfileSha256: q.ProfileSHA256, ExecutionId: r.ExecutionID}, CapabilityResource: detachResourceToProto(r), CapabilitySupervisorSession: q.InstalledArm.Request.Attempt.SupervisorSession}
+	f := &witnessTransportFake{metadata: valid}
+	c := &ProviderDetachmentClient{rpc: f, resource: r, timeout: time.Second}
+	out, err := c.DiscoverDetachWitnessMetadata(context.Background())
+	if err != nil || out.Resource != r || out.SourceIncarnation != q.SourceIncarnation || f.invokes != 0 || f.reserves != 0 || f.queries != 1 || f.lastQuery.Request != nil || len(f.lastQuery.CapabilityResources) != 1 {
+		t.Fatal("not one pure metadata read", out, err)
+	}
+	for caseID := 0; caseID < 14; caseID++ {
+		p := gproto.Clone(valid).(*pb.GetProviderDetachWitnessInvocationResponse)
+		switch caseID {
+		case 0:
+			p.Invocation = &pb.ProviderDetachWitnessInvocationV1{State: "unknown"}
+		case 1:
+			p.Capability = nil
+		case 2:
+			p.CapabilityResource = nil
+		case 3:
+			p.CapabilitySupervisorSession = ""
+		case 4:
+			p.CapabilityResource.ProviderId = "foreign"
+		case 5:
+			p.Capability.SourceIncarnation = ""
+		case 6:
+			p.Capability.BoundaryIncarnation = "00000000-0000-0000-0000-000000000000"
+		case 7:
+			p.Capability.State = "unknown"
+		case 8:
+			p.Capability.ExecutionId = "exec-v1:" + strings.Repeat("b", 64)
+		case 9:
+			p.Capability.OriginalKey = strings.Repeat("a", 64)
+		case 10:
+			p.Capability.RequestSha256 = strings.Repeat("a", 64)
+		case 11:
+			p.Capability.ProfileSha256 = "invalid"
+		case 12:
+			p.CapabilitySupervisorSession = "invalid"
+		case 13:
+			p = &pb.GetProviderDetachWitnessInvocationResponse{Invocation: &pb.ProviderDetachWitnessInvocationV1{}}
+		}
+		f.metadata = p
+		if _, err = c.DiscoverDetachWitnessMetadata(context.Background()); err == nil {
+			t.Fatalf("response case%d accepted", caseID)
+		}
+	}
+	f.metadata = valid
+	if _, err = c.QueryDetachWitness(context.Background(), q); err == nil {
+		t.Fatal("historical read accepted discovery-mode response")
+	}
+	if f.invokes != 0 || f.reserves != 0 {
+		t.Fatal("read caused a write")
+	}
+	// A fresh snapshot never mutates an already-issued original request/digest.
+	before := q.SHA256()
+	f.metadata = gproto.Clone(valid).(*pb.GetProviderDetachWitnessInvocationResponse)
+	f.metadata.Capability.SourceIncarnation = "44444444-4444-4444-8444-444444444444"
+	if _, err = c.DiscoverDetachWitnessMetadata(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if q.SHA256() != before {
+		t.Fatal("discovery rebound original")
+	}
+	f.metadata = nil
+	f.reply = &pb.ProviderDetachWitnessInvocationV1{OriginalKey: q.originalKey(), RequestSha256: q.RequestSHA256, State: "unknown"}
+	if _, err = c.QueryDetachWitness(context.Background(), q); err != nil {
+		t.Fatal("original history changed", err)
+	}
+	if !gproto.Equal(f.request, q.native()) {
+		t.Fatal("history query substituted new nonce")
 	}
 }

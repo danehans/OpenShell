@@ -81,6 +81,7 @@ pub fn authenticate_as_dev_user(mut request: Request<()>) -> Result<Request<()>,
         .extensions_mut()
         .insert(Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: "dev-user".to_string(),
                 display_name: None,
                 roles: vec!["openshell-admin".to_string(), "openshell-user".to_string()],
