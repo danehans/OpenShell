@@ -74,7 +74,7 @@ func identifier(s string) bool {
 	return len(s) >= 16 && len(s) <= 64 && !strings.ContainsAny(s, "/\\ \t\r\n")
 }
 func privateRead(name string, target any) error {
-	fd, e := unix.Open(name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, e := unix.Open(name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if e != nil {
 		return refused
 	}
@@ -108,7 +108,7 @@ func privateRead(name string, target any) error {
 	return nil
 }
 func tokenRead(name string) (string, error) {
-	fd, e := unix.Open(name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, e := unix.Open(name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if e != nil {
 		return "", refused
 	}

@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type fakeObservation struct {
@@ -151,5 +153,68 @@ func TestPrivateBoundedFilesAndPartialOriginalNeverReopened(t *testing.T) {
 	os.WriteFile(target, bytes.Repeat([]byte("x"), maxFile+1), 0600)
 	if privateRead(target, &v) == nil {
 		t.Fatal("oversized file accepted")
+	}
+}
+
+func TestPrivateFIFOInputsRefuseBeforeClientEffects(t *testing.T) {
+	for _, kind := range []string{"metadata", "grant"} {
+		t.Run(kind, func(t *testing.T) {
+			dir, request, token, l := fixture(t)
+			fifo := filepath.Join(dir, "private-fifo")
+			if err := unix.Mkfifo(fifo, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "metadata" {
+				request = fifo
+			} else {
+				token = fifo
+			}
+			var clients atomic.Int32
+			client := &fakeObservation{}
+			factory := func(v1.ProviderDetachmentConfig) (observationClient, error) {
+				clients.Add(1)
+				return client, nil
+			}
+			var out bytes.Buffer
+			done := make(chan error, 1)
+			go func() {
+				done <- run([]string{"begin", "-request-file", request, "-grant-file", token, "-ledger-dir", dir, "-operator-session", l.OperatorSession, "-run-profile-sha256", l.RunProfileSHA256}, &out, factory)
+			}()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(500 * time.Millisecond):
+				// Settle the old blocking implementation without leaving a reader
+				// behind. No writer is opened on the successful refusal path.
+				fd, openErr := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				unix.Close(fd)
+				select {
+				case err = <-done:
+				case <-time.After(time.Second):
+					t.Fatal("FIFO reader did not settle")
+				}
+				t.Error("private FIFO blocked before regular-file validation")
+			}
+			if err != refused || clients.Load() != 0 || client.begins.Load() != 0 || client.queries.Load() != 0 || out.Len() != 0 {
+				t.Fatal("nonregular input reached a client or produced output")
+			}
+			if _, err := os.Lstat(filepath.Join(dir, ledgerName(l.Request))); !os.IsNotExist(err) {
+				t.Fatal("FIFO refusal created or repaired an original ledger")
+			}
+		})
+	}
+}
+
+func TestPrivateRegularInputsRemainAccepted(t *testing.T) {
+	_, request, grant, l := fixture(t)
+	var decoded v1.OrdinaryObservationRequest
+	if err := privateRead(request, &decoded); err != nil || decoded.RequestSHA256 != l.Request.RequestSHA256 {
+		t.Fatal("private regular metadata refused")
+	}
+	if token, err := tokenRead(grant); err != nil || token != "synthetic-private-canary" {
+		t.Fatal("private regular grant refused")
 	}
 }
