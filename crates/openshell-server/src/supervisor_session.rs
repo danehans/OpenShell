@@ -276,6 +276,28 @@ impl PeerRouteCache {
 // ---------------------------------------------------------------------------
 
 /// A live supervisor session handle.
+#[derive(Default)]
+struct OrdinarySession {
+    originals: HashMap<
+        String,
+        (
+            openshell_core::proto::ProviderObservationRequestV1,
+            openshell_core::proto::ProviderObservationSnapshotV1,
+        ),
+    >,
+    capability: Option<openshell_core::proto::ProviderObservationSnapshotV1>,
+    reports: HashMap<String, openshell_core::proto::ProviderObservationResultV1>,
+    issued: std::collections::HashSet<Vec<u8>>,
+    current_ingress_seen: u64,
+    reads: HashMap<
+        Vec<u8>,
+        (
+            openshell_core::proto::ProviderObservationCurrentReadV1,
+            oneshot::Sender<openshell_core::proto::ProviderObservationCurrentReplyV1>,
+        ),
+    >,
+}
+
 struct LiveSession {
     #[allow(dead_code)]
     sandbox_id: String,
@@ -306,6 +328,7 @@ struct LiveSession {
     provider_readiness: Option<ProviderReadinessEvidence>,
     witness_capability: Option<openshell_core::proto::ProviderDetachWitnessControlV1>,
     witness_originals: HashMap<String, openshell_core::proto::ProviderDetachWitnessControlV1>,
+    ordinary: OrdinarySession,
     #[allow(dead_code)]
     connected_at: Instant,
     /// This session's share of `openshell_server_supervisor_sessions`, released when the entry
@@ -438,6 +461,7 @@ impl SupervisorSessionRegistry {
                 provider_readiness: None,
                 witness_capability: None,
                 witness_originals: HashMap::new(),
+                ordinary: OrdinarySession::default(),
                 connected_at: Instant::now(),
                 _gauge_slot: GaugeSlot::supervisor_session(),
             },
@@ -625,6 +649,386 @@ impl SupervisorSessionRegistry {
         )?;
         *evidence = candidate;
         Ok(())
+    }
+
+    pub(crate) fn ordinary_snapshot(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+    ) -> Result<openshell_core::proto::ProviderObservationSnapshotV1, Status> {
+        let boot = self
+            .provider_detach_attempts
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary boot unavailable"))?
+            .boot_id
+            .clone();
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+        let session = sessions
+            .get(&resource.sandbox_id)
+            .filter(|s| s.endpoint_status_initialized)
+            .ok_or_else(|| Status::failed_precondition("ordinary session unavailable"))?;
+        let mut cap = session
+            .ordinary
+            .capability
+            .clone()
+            .ok_or_else(|| Status::unimplemented("ordinary Native control unsupported"))?;
+        if cap.supervisor_session != session.session_id
+            || cap
+                .resource
+                .as_ref()
+                .is_none_or(|r| r.execution_id != resource.execution_id)
+        {
+            return Err(Status::failed_precondition("ordinary actor changed"));
+        }
+        cap.gateway_boot_id = boot;
+        cap.resource = Some(resource.clone());
+        // The gateway supplies its authenticated immutable selector; the Core
+        // must independently return this exact full resource via fresh F1 read.
+        cap.mediation_path_receipt_sha256 =
+            openshell_core::provider_credentials::ordinary_observation::path_digest(&cap);
+        Ok(cap)
+    }
+    pub(crate) fn ordinary_send_once(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+        expected: &openshell_core::proto::ProviderObservationSnapshotV1,
+        request: openshell_core::proto::ProviderObservationRequestV1,
+    ) -> Result<(), Status> {
+        use openshell_core::proto::{
+            GatewayMessage, ProviderObservationControlV1, gateway_message,
+            provider_observation_control_v1::Payload,
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+        let session = sessions
+            .get_mut(&resource.sandbox_id)
+            .filter(|s| {
+                s.session_id == expected.supervisor_session && s.endpoint_status_initialized
+            })
+            .ok_or_else(|| Status::failed_precondition("ordinary original session changed"))?;
+        if session.ordinary.reports.len() >= 16
+            || session
+                .ordinary
+                .reports
+                .contains_key(&request.request_sha256)
+        {
+            return Err(Status::failed_precondition(
+                "ordinary original not sendable",
+            ));
+        }
+        // Record delivery uncertainty before the only send; failure cannot reopen it.
+        session.ordinary.originals.insert(
+            request.request_sha256.clone(),
+            (request.clone(), expected.clone()),
+        );
+        session.ordinary.reports.insert(
+            request.request_sha256.clone(),
+            openshell_core::proto::ProviderObservationResultV1 {
+                state: openshell_core::proto::ProviderObservationStateV1::PendingInstall as i32,
+                ..Default::default()
+            },
+        );
+        session
+            .tx
+            .try_send(GatewayMessage {
+                payload: Some(gateway_message::Payload::ProviderDetachObservation(
+                    ProviderObservationControlV1 {
+                        payload: Some(Payload::InstallRequest(request)),
+                    },
+                )),
+            })
+            .map_err(|_| Status::unavailable("ordinary original delivery unknown"))
+    }
+    pub(crate) fn ordinary_result(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+        request: &openshell_core::proto::ProviderObservationRequestV1,
+    ) -> Option<openshell_core::proto::ProviderObservationResultV1> {
+        let sessions = self.sessions.lock().ok()?;
+        let s = sessions.get(&resource.sandbox_id)?;
+        let result = s.ordinary.reports.get(&request.request_sha256)?;
+        (result.window.as_ref()?.request.as_ref() == Some(request)).then(|| result.clone())
+    }
+    pub(crate) async fn ordinary_read(
+        &self,
+        selector: openshell_core::proto::GetProviderDetachObservationRequest,
+        expected: openshell_core::proto::ProviderObservationSnapshotV1,
+        result: Option<&openshell_core::proto::ProviderObservationResultV1>,
+    ) -> Result<openshell_core::proto::ProviderObservationCurrentReplyV1, Status> {
+        use openshell_core::proto::{
+            GatewayMessage, ProviderObservationControlV1, ProviderObservationCurrentReadV1,
+            gateway_message, provider_observation_control_v1,
+        };
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        use prost::Message;
+        let now = crate::persistence::current_time_ms();
+        let deadline = selector
+            .original_request
+            .as_ref()
+            .and_then(|q| q.deadline.as_ref())
+            .and_then(obs::time_ms)
+            .unwrap_or_else(|| now.saturating_add(2000))
+            .min(now.saturating_add(2000));
+        if !obs::valid_snapshot(&expected) {
+            return Err(Status::failed_precondition("ordinary path profile invalid"));
+        }
+        if deadline <= now {
+            return Err(Status::deadline_exceeded("ordinary read expired"));
+        }
+        let resource = expected
+            .resource
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("ordinary read resource absent"))?;
+        let correlation = Uuid::new_v4().as_bytes().to_vec();
+        let read = ProviderObservationCurrentReadV1 {
+            selector: Some(selector),
+            expected_identity: Some(expected.clone()),
+            read_correlation: correlation.clone(),
+            read_deadline: Some(obs::timestamp(deadline)),
+            window_sha256: result
+                .and_then(|r| r.window.as_ref())
+                .map(|w| w.window_sha256.clone())
+                .unwrap_or_default(),
+            terminal_sha256: result
+                .map(|r| r.terminal_sha256.clone())
+                .unwrap_or_default(),
+        };
+        if read.encoded_len() > obs::MAX_READ {
+            return Err(Status::resource_exhausted("ordinary read capacity"));
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+            if sessions
+                .values()
+                .map(|s| s.ordinary.reads.len())
+                .sum::<usize>()
+                >= 16
+            {
+                return Err(Status::resource_exhausted("ordinary read capacity"));
+            }
+            let session = sessions
+                .get_mut(&resource.sandbox_id)
+                .filter(|s| {
+                    s.endpoint_status_initialized && s.session_id == expected.supervisor_session
+                })
+                .ok_or_else(|| Status::failed_precondition("ordinary session changed"))?;
+            if !session.ordinary.reads.is_empty()
+                || session.ordinary.issued.len() >= 4096
+                || !session.ordinary.issued.insert(correlation.clone())
+            {
+                return Err(Status::resource_exhausted(
+                    "ordinary original read capacity",
+                ));
+            }
+            session
+                .ordinary
+                .reads
+                .insert(correlation.clone(), (read.clone(), tx));
+            if session
+                .tx
+                .try_send(GatewayMessage {
+                    payload: Some(gateway_message::Payload::ProviderDetachObservation(
+                        ProviderObservationControlV1 {
+                            payload: Some(provider_observation_control_v1::Payload::CurrentRead(
+                                read,
+                            )),
+                        },
+                    )),
+                })
+                .is_err()
+            {
+                session.ordinary.reads.remove(&correlation);
+                return Err(Status::unavailable("ordinary read unknown"));
+            }
+        }
+        let received = tokio::time::timeout(
+            Duration::from_millis(u64::try_from(deadline - now).unwrap_or(0)),
+            rx,
+        )
+        .await;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+        let session = sessions
+            .get_mut(&resource.sandbox_id)
+            .filter(|s| {
+                s.session_id == expected.supervisor_session && s.endpoint_status_initialized
+            })
+            .ok_or_else(|| Status::failed_precondition("ordinary session changed"))?;
+        session.ordinary.reads.remove(&correlation);
+        if crate::persistence::current_time_ms() >= deadline {
+            return Err(Status::deadline_exceeded("ordinary read expired"));
+        }
+        let reply = received
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| Status::unavailable("ordinary read unknown"))?;
+        // Closing peer check occurs after the source sample and await. DB and
+        // original Arm closing checks additionally occur at the RPC boundary.
+        if reply.sampled_snapshot.as_ref().is_none_or(|s| {
+            !obs::valid_snapshot(s)
+                || s.resource != expected.resource
+                || s.supervisor_session != expected.supervisor_session
+                || s.mediation_path_receipt_sha256 != expected.mediation_path_receipt_sha256
+                || s.current_ingress_sequence < expected.current_ingress_sequence
+                || s.current_ingress_sequence < session.ordinary.current_ingress_seen
+        }) {
+            return Err(Status::failed_precondition("ordinary closing path changed"));
+        }
+        Ok(reply)
+    }
+    pub(crate) fn ordinary_closing(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+        snapshot: &openshell_core::proto::ProviderObservationSnapshotV1,
+    ) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        sessions.get(&resource.sandbox_id).is_some_and(|s| {
+            s.endpoint_status_initialized
+                && s.session_id == snapshot.supervisor_session
+                && s.ordinary.capability.as_ref().is_some_and(|c| {
+                    c.mediation_path_id == snapshot.mediation_path_id
+                        && c.source_incarnation == snapshot.source_incarnation
+                        && c.boundary_incarnation == snapshot.boundary_incarnation
+                })
+                && s.ordinary.current_ingress_seen <= snapshot.current_ingress_sequence
+        })
+    }
+    fn record_ordinary(
+        &self,
+        sandbox: &str,
+        session_id: &str,
+        command: openshell_core::proto::ProviderObservationControlV1,
+    ) -> bool {
+        use openshell_core::proto::provider_observation_control_v1::Payload;
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        use prost::Message;
+        if command.encoded_len() > obs::MAX_RESULT {
+            return false;
+        }
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions
+            .get_mut(sandbox)
+            .filter(|s| s.session_id == session_id && s.endpoint_status_initialized)
+        else {
+            return false;
+        };
+        match command.payload {
+            Some(Payload::CurrentSnapshot(snapshot)) => {
+                if snapshot.supervisor_session != session_id
+                    || snapshot.profile_id != obs::PROFILE
+                    || snapshot.profile_sha256 != obs::profile_digest()
+                    || !obs::valid_snapshot(&snapshot)
+                    || session.ordinary.capability.is_some()
+                {
+                    return false;
+                }
+                session.ordinary.capability = Some(snapshot);
+                true
+            }
+            Some(Payload::Report(result)) => {
+                let Some(q) = result.window.as_ref().and_then(|w| w.request.as_ref()) else {
+                    return false;
+                };
+                let Some((original, expected)) = session.ordinary.originals.get(&q.request_sha256)
+                else {
+                    return false;
+                };
+                if original != q
+                    || result.window.as_ref().is_none_or(|w| {
+                        w.installed_snapshot.as_ref().is_none_or(|s| {
+                            !obs::same_identity(expected, s)
+                                || s.current_ingress_sequence != w.ingress_watermark
+                                || w.ingress_watermark < expected.current_ingress_sequence
+                        })
+                    })
+                {
+                    return false;
+                }
+                let Some(old) = session.ordinary.reports.get_mut(&q.request_sha256) else {
+                    return false;
+                };
+                if !obs::shape(q)
+                    || q.resource.as_ref().is_none_or(|r| r.sandbox_id != sandbox)
+                    || result.window.as_ref().is_none_or(|w| {
+                        w.installed_snapshot.as_ref().is_none_or(|s| {
+                            s.supervisor_session != session_id || !obs::valid_snapshot(s)
+                        })
+                    })
+                {
+                    return false;
+                }
+                if !result.terminal_sha256.is_empty()
+                    && obs::terminal_digest(&result) != result.terminal_sha256
+                {
+                    return false;
+                }
+                if !old.terminal_sha256.is_empty() && old != &result {
+                    return false;
+                }
+                session.ordinary.current_ingress_seen = session.ordinary.current_ingress_seen.max(
+                    result
+                        .events
+                        .iter()
+                        .map(|e| e.ingress_sequence)
+                        .max()
+                        .unwrap_or(0),
+                );
+                *old = result;
+                true
+            }
+            Some(Payload::CurrentReply(reply)) => {
+                let Some(read) = reply.original_read.as_ref() else {
+                    return false;
+                };
+                let Some((pending, sender)) = session.ordinary.reads.remove(&read.read_correlation)
+                else {
+                    return false;
+                };
+                if &pending != read
+                    || read
+                        .read_deadline
+                        .as_ref()
+                        .and_then(obs::time_ms)
+                        .is_none_or(|end| crate::persistence::current_time_ms() >= end)
+                    || reply.encoded_len() > obs::MAX_READ
+                    || reply.sampled_snapshot.as_ref().is_none_or(|s| {
+                        s.supervisor_session != session_id
+                            || !obs::valid_snapshot(s)
+                            || s.resource
+                                != pending
+                                    .expected_identity
+                                    .as_ref()
+                                    .and_then(|p| p.resource.clone())
+                            || s.current_ingress_sequence < session.ordinary.current_ingress_seen
+                    })
+                {
+                    return false;
+                }
+                session.ordinary.current_ingress_seen = session.ordinary.current_ingress_seen.max(
+                    reply
+                        .sampled_snapshot
+                        .as_ref()
+                        .map_or(0, |s| s.current_ingress_sequence),
+                );
+                let _ = sender.send(reply);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn witness_session<'a>(
@@ -2494,7 +2898,7 @@ async fn establish_supervisor_session(
             .ok(),
         })),
     };
-    if tx.send(accepted).await.is_err() {
+    if Box::pin(tx.send(accepted)).await.is_err() {
         // Only evict ourselves — a faster reconnect may already have
         // superseded this registration.
         state
@@ -2548,7 +2952,7 @@ async fn establish_supervisor_session(
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
-        run_session_loop(
+        Box::pin(run_session_loop(
             &state_clone,
             &sandbox_id_clone,
             &session_id,
@@ -2556,7 +2960,7 @@ async fn establish_supervisor_session(
             &mut inbound,
             shutdown_rx,
             &mut owner_guard,
-        )
+        ))
         .await;
         let terminal_finalized = state_clone
             .supervisor_sessions
@@ -2696,7 +3100,7 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        if !handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard).await {
+                        if !Box::pin(handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard)).await {
                             break;
                         }
                     }
@@ -2732,7 +3136,7 @@ async fn run_session_loop(
                         openshell_core::proto::GatewayHeartbeat {},
                     )),
                 };
-                if tx.send(hb).await.is_err() {
+                if Box::pin(tx.send(hb)).await.is_err() {
                     info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: outbound channel closed");
                     break;
                 }
@@ -2749,6 +3153,11 @@ async fn handle_supervisor_message(
     owner_guard: &mut OwnerGuard,
 ) -> bool {
     match msg.payload {
+        Some(supervisor_message::Payload::ProviderDetachObservation(control)) => {
+            return state
+                .supervisor_sessions
+                .record_ordinary(sandbox_id, session_id, control);
+        }
         Some(supervisor_message::Payload::ProviderDetachWitness(control)) => {
             return state
                 .supervisor_sessions
@@ -5318,5 +5727,239 @@ mod tests {
                 .state,
             6
         );
+    }
+}
+
+#[cfg(test)]
+mod ordinary_barrier_tests {
+    use super::*;
+    use openshell_core::proto::*;
+    use openshell_core::provider_credentials::ordinary_observation as obs;
+    fn fixture() -> (
+        Arc<SupervisorSessionRegistry>,
+        ProviderObservationSnapshotV1,
+        mpsc::Receiver<GatewayMessage>,
+    ) {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let (tx, rx) = mpsc::channel(4);
+        let (shutdown, _) = oneshot::channel();
+        let sandbox = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        registry.register(sandbox.clone(), session.clone(), tx, shutdown);
+        registry
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&sandbox)
+            .unwrap()
+            .endpoint_status_initialized = true;
+        let mut snapshot = ProviderObservationSnapshotV1 {
+            resource: Some(ProviderDetachResourceV1 {
+                sandbox_id: sandbox,
+                execution_id: format!("exec-v1:{}", "a".repeat(64)),
+                ..Default::default()
+            }),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: Uuid::new_v4().to_string(),
+            boundary_incarnation: Uuid::new_v4().to_string(),
+            gateway_boot_id: Uuid::new_v4().to_string(),
+            supervisor_instance: Uuid::new_v4().to_string(),
+            supervisor_session: session,
+            mediation_path_receipt_sha256: String::new(),
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            process_writer_attribution: obs::WRITER_UNPROVEN,
+            mediation_path_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+        snapshot.mediation_path_receipt_sha256 = obs::path_digest(&snapshot);
+        assert!(registry.record_ordinary(
+            &snapshot.resource.as_ref().unwrap().sandbox_id,
+            &snapshot.supervisor_session,
+            ProviderObservationControlV1 {
+                payload: Some(provider_observation_control_v1::Payload::CurrentSnapshot(
+                    snapshot.clone()
+                ))
+            }
+        ));
+        (registry, snapshot, rx)
+    }
+    #[tokio::test]
+    async fn ordinary_original_install_report_cannot_adopt_new_configuration() {
+        let (registry, expected, mut rx) = fixture();
+        let resource = expected.resource.clone().unwrap();
+        let mut q = ProviderObservationRequestV1 {
+            resource: Some(resource.clone()),
+            run_id: Uuid::new_v4().to_string(),
+            step_id: Uuid::new_v4().to_string(),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            source_incarnation: expected.source_incarnation.clone(),
+            boundary_incarnation: expected.boundary_incarnation.clone(),
+            deadline: Some(obs::timestamp(
+                crate::persistence::current_time_ms() + 60000,
+            )),
+            phase: ProviderObservationPhaseV1::Baseline as i32,
+            ..Default::default()
+        };
+        q.request_sha256 = obs::request_digest(&q);
+        registry
+            .ordinary_send_once(&resource, &expected, q.clone())
+            .unwrap();
+        assert!(rx.recv().await.is_some());
+        assert!(
+            registry
+                .ordinary_send_once(&resource, &expected, q.clone())
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+        let mut report = ProviderObservationResultV1 {
+            state: ProviderObservationStateV1::Open as i32,
+            window: Some(ProviderObservationWindowV1 {
+                request: Some(q.clone()),
+                installed_snapshot: Some(expected.clone()),
+                ingress_watermark: expected.current_ingress_sequence,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        report
+            .window
+            .as_mut()
+            .unwrap()
+            .installed_snapshot
+            .as_mut()
+            .unwrap()
+            .policy_generation += 1;
+        let command = |r| ProviderObservationControlV1 {
+            payload: Some(provider_observation_control_v1::Payload::Report(r)),
+        };
+        assert!(!registry.record_ordinary(
+            &resource.sandbox_id,
+            &expected.supervisor_session,
+            command(report.clone())
+        ));
+        report.window.as_mut().unwrap().installed_snapshot = Some(expected.clone());
+        assert!(registry.record_ordinary(
+            &resource.sandbox_id,
+            &expected.supervisor_session,
+            command(report.clone())
+        ));
+        assert_eq!(registry.ordinary_result(&resource, &q), Some(report));
+    }
+    #[tokio::test]
+    async fn ordinary_barrier_is_one_explicit_read_and_preserves_fresh_counter() {
+        let (registry, expected, mut rx) = fixture();
+        let resource = expected.resource.as_ref().unwrap().clone();
+        let selector = GetProviderDetachObservationRequest {
+            resource: Some(resource.clone()),
+            ..Default::default()
+        };
+        let waiter = registry.ordinary_read(selector, expected.clone(), None);
+        let peer = async {
+            let message = rx.recv().await.unwrap();
+            let Some(gateway_message::Payload::ProviderDetachObservation(command)) =
+                message.payload
+            else {
+                panic!("wrong channel")
+            };
+            let Some(provider_observation_control_v1::Payload::CurrentRead(read)) = command.payload
+            else {
+                panic!("read became install")
+            };
+            let mut sampled = expected.clone();
+            sampled.current_ingress_sequence = 2; // N+1 report deliberately absent
+            assert!(registry.record_ordinary(
+                &resource.sandbox_id,
+                &expected.supervisor_session,
+                ProviderObservationControlV1 {
+                    payload: Some(provider_observation_control_v1::Payload::CurrentReply(
+                        ProviderObservationCurrentReplyV1 {
+                            original_read: Some(read.clone()),
+                            sampled_snapshot: Some(sampled),
+                            sampled_time: Some(obs::timestamp(
+                                crate::persistence::current_time_ms()
+                            )),
+                            ..Default::default()
+                        }
+                    ))
+                }
+            ));
+            assert!(!registry.record_ordinary(
+                &resource.sandbox_id,
+                &expected.supervisor_session,
+                ProviderObservationControlV1 {
+                    payload: Some(provider_observation_control_v1::Payload::CurrentReply(
+                        ProviderObservationCurrentReplyV1 {
+                            original_read: Some(read),
+                            ..Default::default()
+                        }
+                    ))
+                }
+            ));
+        };
+        let (reply, ()) = tokio::join!(waiter, peer);
+        assert_eq!(
+            reply
+                .unwrap()
+                .sampled_snapshot
+                .unwrap()
+                .current_ingress_sequence,
+            2
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn ordinary_barrier_wrong_reply_and_session_replacement_fail() {
+        for replace in [false, true] {
+            let (registry, expected, mut rx) = fixture();
+            let resource = expected.resource.as_ref().unwrap().clone();
+            let selector = GetProviderDetachObservationRequest {
+                resource: Some(resource.clone()),
+                ..Default::default()
+            };
+            let waiter = registry.ordinary_read(selector, expected.clone(), None);
+            let peer = async {
+                let message = rx.recv().await.unwrap();
+                let Some(gateway_message::Payload::ProviderDetachObservation(command)) =
+                    message.payload
+                else {
+                    panic!()
+                };
+                let Some(provider_observation_control_v1::Payload::CurrentRead(mut read)) =
+                    command.payload
+                else {
+                    panic!()
+                };
+                if replace {
+                    let (tx, _) = mpsc::channel(1);
+                    let (shutdown, _) = oneshot::channel();
+                    registry.register(
+                        resource.sandbox_id.clone(),
+                        Uuid::new_v4().to_string(),
+                        tx,
+                        shutdown,
+                    );
+                } else {
+                    read.terminal_sha256 = "stale".into();
+                    assert!(!registry.record_ordinary(
+                        &resource.sandbox_id,
+                        &expected.supervisor_session,
+                        ProviderObservationControlV1 {
+                            payload: Some(provider_observation_control_v1::Payload::CurrentReply(
+                                ProviderObservationCurrentReplyV1 {
+                                    original_read: Some(read),
+                                    sampled_snapshot: Some(expected.clone()),
+                                    ..Default::default()
+                                }
+                            ))
+                        }
+                    ));
+                }
+            };
+            let (reply, ()) = tokio::join!(waiter, peer);
+            assert!(reply.is_err());
+        }
     }
 }

@@ -1532,7 +1532,7 @@ async fn current_detached_hold(
         .ok_or_else(bad)?;
     Ok((hold.generation, row.resource_version, instance))
 }
-async fn read_attempt(
+pub(super) async fn read_attempt(
     state: &Arc<ServerState>,
     q: &openshell_core::proto::ProviderDetachArmRequestV1,
     write: bool,

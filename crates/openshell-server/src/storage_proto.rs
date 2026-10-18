@@ -147,7 +147,7 @@ mod tests {
     // dependencies. Separate literal predecessor checks below retain every
     // prior API/storage declaration rather than accepting a regenerated golden.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "0a3db5cf667a58f7ca96388450f0dd75ebd8bc2a248d2ef0b55a1b53611205e5";
+        "c4dbf190e4c3f36d406ed8a13d9bd995da911160f66f1180be662cb37be4d719";
     const DURABLE_SCHEMA_SHA256: &str =
         "efa52e12c00b94ea12555c9209e872239ee8810db079e2fd5338e31c5d2c6f84";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -618,6 +618,374 @@ mod tests {
         }
         Ok(files[0].value)
     }
+    // Exact ordinary sandbox-path extension: original wire bytes retain ALL
+    // custom MethodOptions, enums, oneofs, labels and predecessor declarations.
+    // FileDescriptorProto SourceCodeInfo is commentary and is the ONLY omitted
+    // field; every imported file and raw option remains byte-identical to a12.
+    const ORDINARY_DECLARATIONS: &[(&str, u64, &str)] = &[
+        (
+            "ProviderObservationRequestV1",
+            4,
+            "1e223354696ef670435407588835d28808afbc644b7315c745a04430d021bff7",
+        ),
+        (
+            "ProviderObservationSnapshotV1",
+            4,
+            "c78d3f4d5b6489569eb57f9324d68638fd418ef68c124a36e30a822ab21a2602",
+        ),
+        (
+            "ProviderObservationWindowV1",
+            4,
+            "b1f3f5982921130fdb000ecb5b2c0215134974cb007c580ab8506238fc99d48d",
+        ),
+        (
+            "ProviderObservationEventV1",
+            4,
+            "0c1ef6f1a00bfbde7e44bf9bff46ae4a0a6bfaecfcc3d3b829895031990dbbc6",
+        ),
+        (
+            "ProviderObservationResultV1",
+            4,
+            "4f6319554c787d39ef44f1dd85e5bf887175e1b349077548ad1caa4bbf981233",
+        ),
+        (
+            "ProviderObservationControlV1",
+            4,
+            "661ce1c94b5300a144d8905bb921288921d6a3cd0886d8bdb5bf7d18034ccb3f",
+        ),
+        (
+            "BeginProviderDetachObservationRequest",
+            4,
+            "26ac459e809037c11839a1e0157c01ed35612e8a70a02d1eff540ec6256ad613",
+        ),
+        (
+            "BeginProviderDetachObservationResponse",
+            4,
+            "c012aa697e27c2491dc265030707510f876a287b79b66f48972e309823649c41",
+        ),
+        (
+            "GetProviderDetachObservationRequest",
+            4,
+            "0c5e1af8c5a8f1979c6d514f9b0670dbe875d0a9668aba730ff6193d40554a06",
+        ),
+        (
+            "GetProviderDetachObservationResponse",
+            4,
+            "f8e90eb589d8e15df8c649f523d0c24fe76e754c782ab3c472f885f2b418e78d",
+        ),
+        (
+            "ProviderObservationCurrentReadV1",
+            4,
+            "076f963aabd6c1cdc3912abd68cb342a05de87677c7d9a4c4717f0494b7d34a5",
+        ),
+        (
+            "ProviderObservationCurrentReplyV1",
+            4,
+            "9245fb001f1e19637abf64f8ca511cac07593e77152e5f999fc64fe31f48b8e6",
+        ),
+        (
+            "ProviderObservationPhaseV1",
+            5,
+            "81a48db1bd93867207a686a20d650eba62bfd1f9480e3647c8eec95cf7372ccb",
+        ),
+        (
+            "ProviderObservationStateV1",
+            5,
+            "183f06f0c38024547664d2aab93408432fd0b861511ca30999c4d5768889f41e",
+        ),
+        (
+            "ProviderObservationRewriteV1",
+            5,
+            "75419b80027688bdc7241488232e7bd11056a1a99f6c4ec37aa18a92d99c33d3",
+        ),
+        (
+            "ProviderObservationProcessWriterAttributionV1",
+            5,
+            "7a8a567b1a73786c4aa070c79ba83037bd4c2c3b81290a52f05e6f8b69f528c2",
+        ),
+    ];
+    const ORDINARY_METHODS: &[(&str, &str)] = &[
+        (
+            "BeginProviderDetachObservation",
+            "c53d310d18b14085c1047f1aed4ee23c07400defb9c6ad834a6f592b96f7fa3d",
+        ),
+        (
+            "GetProviderDetachObservation",
+            "49aee0e44e9047e9bc0e04949516985caa0bedf33655e21d5bb2c3a867b95960",
+        ),
+    ];
+    const ORDINARY_FIELDS: &[(&str, u64, &str)] = &[
+        (
+            "SupervisorMessage",
+            6,
+            "c76c4bde031dc29245a3beb1aed12abaa0f68ed52b6c01e1d5a795d5104e7867",
+        ),
+        (
+            "GatewayMessage",
+            7,
+            "0c0b02a1c7d06378e1d0ce14cb3597d49176fdbf247ab57320c88e999d84ca98",
+        ),
+    ];
+    const ORDINARY_OBSERVATION_RPC_SIGNATURES: [&str; 2] = [
+        "openshell.v1.OpenShell/BeginProviderDetachObservation|.openshell.v1.BeginProviderDetachObservationRequest|.openshell.v1.BeginProviderDetachObservationResponse|false|false",
+        "openshell.v1.OpenShell/GetProviderDetachObservation|.openshell.v1.GetProviderDetachObservationRequest|.openshell.v1.GetProviderDetachObservationResponse|false|false",
+    ];
+    fn strip_ordinary_raw(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let mut declarations = vec![0; ORDINARY_DECLARATIONS.len()];
+        let mut methods = vec![0; ORDINARY_METHODS.len()];
+        let mut additions = vec![0; ORDINARY_FIELDS.len()];
+        let mut output = Vec::new();
+        let mut public_files = 0;
+        for file in raw_schema_fields(raw)? {
+            if file.number != 1 || file.wire != 2 {
+                output.extend_from_slice(file.encoded);
+                continue;
+            }
+            let is_public = raw_schema_name(file.value)? == "openshell.proto";
+            if is_public {
+                public_files += 1;
+            }
+            let mut body = Vec::new();
+            for item in raw_schema_fields(file.value)? {
+                if item.number == 9 {
+                    continue;
+                }
+                if is_public && matches!(item.number, 4 | 5) && item.wire == 2 {
+                    let name = raw_schema_name(item.value)?;
+                    if let Some((i, (_, kind, sha))) = ORDINARY_DECLARATIONS
+                        .iter()
+                        .enumerate()
+                        .find(|(_, d)| d.0 == name)
+                    {
+                        if item.number != *kind
+                            || format!("{:x}", Sha256::digest(item.value)) != *sha
+                        {
+                            return Err("ordinary complete declaration changed".into());
+                        }
+                        declarations[i] += 1;
+                        continue;
+                    }
+                    if item.number == 4 && ORDINARY_FIELDS.iter().any(|a| a.0 == name) {
+                        let mut message = Vec::new();
+                        for field in raw_schema_fields(item.value)? {
+                            if field.number == 2 && field.wire == 2 {
+                                let descriptor =
+                                    prost_types::FieldDescriptorProto::decode(field.value)
+                                        .map_err(|_| "ordinary field descriptor")?;
+                                if let Some((i, (_, _, sha))) =
+                                    ORDINARY_FIELDS.iter().enumerate().find(|(_, a)| {
+                                        a.0 == name && descriptor.number == Some(a.1 as i32)
+                                    })
+                                {
+                                    if format!("{:x}", Sha256::digest(field.value)) != *sha {
+                                        return Err("ordinary transport field changed".into());
+                                    }
+                                    additions[i] += 1;
+                                    continue;
+                                }
+                            }
+                            message.extend_from_slice(field.encoded);
+                        }
+                        body.extend(raw_schema_length(4, &message));
+                        continue;
+                    }
+                }
+                if is_public
+                    && item.number == 6
+                    && item.wire == 2
+                    && raw_schema_name(item.value)? == "OpenShell"
+                {
+                    let mut service = Vec::new();
+                    for field in raw_schema_fields(item.value)? {
+                        if field.number == 2 && field.wire == 2 {
+                            let name = raw_schema_name(field.value)?;
+                            if let Some((i, (_, sha))) = ORDINARY_METHODS
+                                .iter()
+                                .enumerate()
+                                .find(|(_, a)| a.0 == name)
+                            {
+                                if format!("{:x}", Sha256::digest(field.value)) != *sha {
+                                    return Err("ordinary RPC or raw authorization changed".into());
+                                }
+                                methods[i] += 1;
+                                continue;
+                            }
+                        }
+                        service.extend_from_slice(field.encoded);
+                    }
+                    body.extend(raw_schema_length(6, &service));
+                    continue;
+                }
+                body.extend_from_slice(item.encoded);
+            }
+            output.extend(raw_schema_length(1, &body));
+        }
+        if public_files != 1
+            || declarations
+                .iter()
+                .chain(methods.iter())
+                .chain(additions.iter())
+                .any(|n| *n != 1)
+        {
+            return Err("ordinary declaration presence/multiplicity changed".into());
+        }
+        if format!("{:x}", Sha256::digest(&output))
+            != "ef556dfe22edd1e3fa6a48cf565deedc6585f328fc77aad67787b7e1cec6a4b0"
+        {
+            return Err("complete a12 predecessor or raw options changed".into());
+        }
+        Ok(output)
+    }
+    #[test]
+    fn ordinary_extension_preserves_complete_a12_public_and_auth() {
+        let old = strip_ordinary_raw(openshell_core::FILE_DESCRIPTOR_SET)
+            .expect("exact additive ordinary strip");
+        let public = FileDescriptorSet::decode(old.as_slice()).unwrap();
+        let storage = FileDescriptorSet::decode(STORAGE_FILE_DESCRIPTOR_SET).unwrap();
+        let mut index = SchemaIndex::default();
+        index_descriptor(&mut index, &storage);
+        index_descriptor(&mut index, &public);
+        let mut methods = Vec::new();
+        let mut roots = BTreeSet::new();
+        for file in &public.file {
+            for service in &file.service {
+                if !matches!(
+                    (file.package.as_deref(), service.name.as_deref()),
+                    (Some("openshell.v1"), Some("OpenShell"))
+                        | (Some("openshell.inference.v1"), Some("Inference"))
+                ) {
+                    continue;
+                }
+                for method in &service.method {
+                    let input = method.input_type.as_deref().unwrap();
+                    let output = method.output_type.as_deref().unwrap();
+                    roots.insert(input.to_owned());
+                    roots.insert(output.to_owned());
+                    methods.push(format!(
+                        "{}.{}/{}|{}|{}|{}|{}",
+                        file.package.as_deref().unwrap(),
+                        service.name.as_deref().unwrap(),
+                        method.name.as_deref().unwrap(),
+                        input,
+                        output,
+                        method.client_streaming.unwrap_or(false),
+                        method.server_streaming.unwrap_or(false)
+                    ));
+                }
+            }
+        }
+        methods.sort();
+        let closure = schema_closure(&index, roots);
+        assert_eq!((closure.messages.len(), closure.enums.len()), (357, 31));
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}\n{}",
+                        methods.join("\n"),
+                        schema_fingerprint(&index, &closure)
+                    )
+                    .as_bytes()
+                )
+            ),
+            "0a3db5cf667a58f7ca96388450f0dd75ebd8bc2a248d2ef0b55a1b53611205e5"
+        );
+    }
+    #[test]
+    fn ordinary_raw_guard_refuses_missing_duplicate_renamed_extra_and_auth() {
+        let raw = openshell_core::FILE_DESCRIPTOR_SET;
+        let file = raw_schema_file(raw).unwrap();
+        let items = raw_schema_fields(file).unwrap();
+        let target = items
+            .iter()
+            .position(|f| {
+                f.number == 4
+                    && raw_schema_name(f.value).is_ok_and(|n| n == ORDINARY_DECLARATIONS[0].0)
+            })
+            .unwrap();
+        let replace = |file: Vec<u8>| {
+            let mut output = Vec::new();
+            for f in raw_schema_fields(raw).unwrap() {
+                if f.number == 1
+                    && f.wire == 2
+                    && raw_schema_name(f.value).is_ok_and(|n| n == "openshell.proto")
+                {
+                    output.extend(raw_schema_length(1, &file));
+                } else {
+                    output.extend_from_slice(f.encoded);
+                }
+            }
+            output
+        };
+        let missing = items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != target)
+            .flat_map(|(_, f)| f.encoded.iter().copied())
+            .collect();
+        assert!(strip_ordinary_raw(&replace(missing)).is_err());
+        let mut duplicate = file.to_vec();
+        duplicate.extend_from_slice(items[target].encoded);
+        assert!(strip_ordinary_raw(&replace(duplicate)).is_err());
+        let mut message = prost_types::DescriptorProto::decode(items[target].value).unwrap();
+        message.name = Some("RenamedOrdinaryMessage".into());
+        let renamed = items
+            .iter()
+            .enumerate()
+            .flat_map(|(i, f)| {
+                if i == target {
+                    raw_schema_length(4, &message.encode_to_vec())
+                } else {
+                    f.encoded.to_vec()
+                }
+            })
+            .collect();
+        assert!(strip_ordinary_raw(&replace(renamed)).is_err());
+        let mut extra = file.to_vec();
+        extra.extend(raw_schema_length(
+            4,
+            &prost_types::DescriptorProto {
+                name: Some("UnexpectedOrdinaryRecord".into()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ));
+        assert!(strip_ordinary_raw(&replace(extra)).is_err());
+        let mut changed = Vec::new();
+        let mut mutated = false;
+        for f in &items {
+            if f.number == 6 && raw_schema_name(f.value).is_ok_and(|n| n == "OpenShell") {
+                let mut service = Vec::new();
+                for method in raw_schema_fields(f.value).unwrap() {
+                    if method.number == 2
+                        && raw_schema_name(method.value).is_ok_and(|n| n == ORDINARY_METHODS[0].0)
+                    {
+                        let mut body = Vec::new();
+                        for option in raw_schema_fields(method.value).unwrap() {
+                            if option.number == 4 && option.wire == 2 {
+                                let mut options = option.value.to_vec();
+                                *options.last_mut().unwrap() ^= 1;
+                                body.extend(raw_schema_length(4, &options));
+                                mutated = true;
+                            } else {
+                                body.extend_from_slice(option.encoded);
+                            }
+                        }
+                        service.extend(raw_schema_length(2, &body));
+                    } else {
+                        service.extend_from_slice(method.encoded);
+                    }
+                }
+                changed.extend(raw_schema_length(6, &service));
+            } else {
+                changed.extend_from_slice(f.encoded);
+            }
+        }
+        assert!(mutated);
+        assert!(strip_ordinary_raw(&replace(changed)).is_err());
+    }
+
     const DISCOVERY_MESSAGES: &[(&str, &str)] = &[
         (
             "GetProviderDetachWitnessInvocationRequest",
@@ -660,6 +1028,8 @@ mod tests {
         ),
     ];
     fn strip_discovery_raw(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let ordinary = strip_ordinary_raw(raw)?;
+        let raw = ordinary.as_slice();
         let mut seen = [0; 5];
         let mut seen_messages = [0; 3];
         let mut output = Vec::new();
@@ -851,7 +1221,12 @@ mod tests {
     #[test]
     fn witness_extension_preserves_complete_c109_public_schema() {
         strip_witness_raw(openshell_core::FILE_DESCRIPTOR_SET).expect("exact lossless extension");
-        let mut public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let mut public = FileDescriptorSet::decode(
+            strip_ordinary_raw(openshell_core::FILE_DESCRIPTOR_SET)
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
         remove_witness_transport_fields(&mut public);
         for file in &mut public.file {
             if file.package.as_deref() != Some("openshell.v1") {
@@ -1044,7 +1419,12 @@ mod tests {
 
     #[test]
     fn provider_detach_additions_preserve_complete_predecessor_schemas() {
-        let mut public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let mut public = FileDescriptorSet::decode(
+            strip_ordinary_raw(openshell_core::FILE_DESCRIPTOR_SET)
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
         strip_witness_raw(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("exact lossless witness extension");
         remove_witness_transport_fields(&mut public);
@@ -1393,6 +1773,7 @@ mod tests {
         for signature in PEER_OWNER_RPC_SIGNATURES
             .into_iter()
             .chain(PROVIDER_DETACH_RPC_SIGNATURES)
+            .chain(ORDINARY_OBSERVATION_RPC_SIGNATURES)
         {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -1403,14 +1784,16 @@ mod tests {
             compiled_method_count,
             108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
-                + PROVIDER_DETACH_RPC_SIGNATURES.len(),
+                + PROVIDER_DETACH_RPC_SIGNATURES.len()
+                + ORDINARY_OBSERVATION_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
             83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
-                + PROVIDER_DETACH_RPC_SIGNATURES.len(),
+                + PROVIDER_DETACH_RPC_SIGNATURES.len()
+                + ORDINARY_OBSERVATION_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -1421,6 +1804,7 @@ mod tests {
             83 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PROVIDER_DETACH_RPC_SIGNATURES.len()
+                + ORDINARY_OBSERVATION_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -1464,7 +1848,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (357, 31),
+                (369, 35),
                 (104, 23),
                 (90, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,

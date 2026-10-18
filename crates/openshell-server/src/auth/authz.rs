@@ -218,6 +218,52 @@ pub fn check_provider_witness_metadata_grant(
     Ok(())
 }
 
+/// Closed ordinary observer grant. This never authorizes model or task input.
+#[allow(clippy::result_large_err)]
+pub fn check_ordinary_observation_grant(
+    identity: &Identity,
+    policy: &AuthzPolicy,
+    resource_sha256: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let target = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method = if write {
+        "sandbox:provider-detach:observe"
+    } else {
+        "sandbox:provider-detach:observe:read"
+    };
+    let allowed = [
+        "sandbox:provider-detach:observe",
+        "sandbox:provider-detach:observe:read",
+        "openid",
+        "profile",
+        "email",
+    ];
+    if identity.provider != super::identity::IdentityProvider::Oidc
+        || identity.subject.is_empty()
+        || !policy.scopes_enabled
+        || policy.admin_role.is_empty()
+        || policy.user_role.is_empty()
+        || identity.roles.contains(&policy.admin_role)
+        || !identity.roles.contains(&policy.user_role)
+        || resource_sha256.len() != 64
+        || !resource_sha256
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        || !identity.scopes.contains(&target)
+        || !identity.scopes.iter().any(|s| s == method)
+        || identity
+            .scopes
+            .iter()
+            .any(|s| s != &target && !allowed.contains(&s.as_str()))
+    {
+        return Err(Status::permission_denied(
+            "ordinary observation grant mismatch",
+        ));
+    }
+    Ok(())
+}
+
 /// Closed original witness authority, additional to ordinary method/workspace
 /// authorization. A broad/admin token never substitutes for this approval.
 #[allow(clippy::result_large_err)]

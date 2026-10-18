@@ -41,6 +41,8 @@ const (
 	OpenShell_ReserveProviderDetachWitness_FullMethodName       = "/openshell.v1.OpenShell/ReserveProviderDetachWitness"
 	OpenShell_InvokeProviderDetachWitness_FullMethodName        = "/openshell.v1.OpenShell/InvokeProviderDetachWitness"
 	OpenShell_GetProviderDetachWitnessInvocation_FullMethodName = "/openshell.v1.OpenShell/GetProviderDetachWitnessInvocation"
+	OpenShell_BeginProviderDetachObservation_FullMethodName     = "/openshell.v1.OpenShell/BeginProviderDetachObservation"
+	OpenShell_GetProviderDetachObservation_FullMethodName       = "/openshell.v1.OpenShell/GetProviderDetachObservation"
 	OpenShell_GetConditionalProviderDetachState_FullMethodName  = "/openshell.v1.OpenShell/GetConditionalProviderDetachState"
 	OpenShell_DetachSandboxProvider_FullMethodName              = "/openshell.v1.OpenShell/DetachSandboxProvider"
 	OpenShell_GetSandboxProviderStatus_FullMethodName           = "/openshell.v1.OpenShell/GetSandboxProviderStatus"
@@ -176,6 +178,10 @@ type OpenShellClient interface {
 	InvokeProviderDetachWitness(ctx context.Context, in *InvokeProviderDetachWitnessRequest, opts ...grpc.CallOption) (*InvokeProviderDetachWitnessResponse, error)
 	// Read the original invocation only; never reserves, arms, refreshes or sends.
 	GetProviderDetachWitnessInvocation(ctx context.Context, in *GetProviderDetachWitnessInvocationRequest, opts ...grpc.CallOption) (*GetProviderDetachWitnessInvocationResponse, error)
+	// Optional ordinary observer metadata only; no input, detach or model operation.
+	BeginProviderDetachObservation(ctx context.Context, in *BeginProviderDetachObservationRequest, opts ...grpc.CallOption) (*BeginProviderDetachObservationResponse, error)
+	// Optional ordinary observer metadata only; no input, detach or model operation.
+	GetProviderDetachObservation(ctx context.Context, in *GetProviderDetachObservationRequest, opts ...grpc.CallOption) (*GetProviderDetachObservationResponse, error)
 	// Closed read-only resolve/recover/observe queries; never redispatches mutation.
 	GetConditionalProviderDetachState(ctx context.Context, in *GetConditionalProviderDetachStateRequest, opts ...grpc.CallOption) (*GetConditionalProviderDetachStateResponse, error)
 	DetachSandboxProvider(ctx context.Context, in *DetachSandboxProviderRequest, opts ...grpc.CallOption) (*DetachSandboxProviderResponse, error)
@@ -556,6 +562,26 @@ func (c *openShellClient) GetProviderDetachWitnessInvocation(ctx context.Context
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetProviderDetachWitnessInvocationResponse)
 	err := c.cc.Invoke(ctx, OpenShell_GetProviderDetachWitnessInvocation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) BeginProviderDetachObservation(ctx context.Context, in *BeginProviderDetachObservationRequest, opts ...grpc.CallOption) (*BeginProviderDetachObservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BeginProviderDetachObservationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_BeginProviderDetachObservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetProviderDetachObservation(ctx context.Context, in *GetProviderDetachObservationRequest, opts ...grpc.CallOption) (*GetProviderDetachObservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetProviderDetachObservationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetProviderDetachObservation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1415,6 +1441,10 @@ type OpenShellServer interface {
 	InvokeProviderDetachWitness(context.Context, *InvokeProviderDetachWitnessRequest) (*InvokeProviderDetachWitnessResponse, error)
 	// Read the original invocation only; never reserves, arms, refreshes or sends.
 	GetProviderDetachWitnessInvocation(context.Context, *GetProviderDetachWitnessInvocationRequest) (*GetProviderDetachWitnessInvocationResponse, error)
+	// Optional ordinary observer metadata only; no input, detach or model operation.
+	BeginProviderDetachObservation(context.Context, *BeginProviderDetachObservationRequest) (*BeginProviderDetachObservationResponse, error)
+	// Optional ordinary observer metadata only; no input, detach or model operation.
+	GetProviderDetachObservation(context.Context, *GetProviderDetachObservationRequest) (*GetProviderDetachObservationResponse, error)
 	// Closed read-only resolve/recover/observe queries; never redispatches mutation.
 	GetConditionalProviderDetachState(context.Context, *GetConditionalProviderDetachStateRequest) (*GetConditionalProviderDetachStateResponse, error)
 	DetachSandboxProvider(context.Context, *DetachSandboxProviderRequest) (*DetachSandboxProviderResponse, error)
@@ -1674,6 +1704,12 @@ func (UnimplementedOpenShellServer) InvokeProviderDetachWitness(context.Context,
 }
 func (UnimplementedOpenShellServer) GetProviderDetachWitnessInvocation(context.Context, *GetProviderDetachWitnessInvocationRequest) (*GetProviderDetachWitnessInvocationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProviderDetachWitnessInvocation not implemented")
+}
+func (UnimplementedOpenShellServer) BeginProviderDetachObservation(context.Context, *BeginProviderDetachObservationRequest) (*BeginProviderDetachObservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginProviderDetachObservation not implemented")
+}
+func (UnimplementedOpenShellServer) GetProviderDetachObservation(context.Context, *GetProviderDetachObservationRequest) (*GetProviderDetachObservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetProviderDetachObservation not implemented")
 }
 func (UnimplementedOpenShellServer) GetConditionalProviderDetachState(context.Context, *GetConditionalProviderDetachStateRequest) (*GetConditionalProviderDetachStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetConditionalProviderDetachState not implemented")
@@ -2244,6 +2280,42 @@ func _OpenShell_GetProviderDetachWitnessInvocation_Handler(srv interface{}, ctx 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).GetProviderDetachWitnessInvocation(ctx, req.(*GetProviderDetachWitnessInvocationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_BeginProviderDetachObservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginProviderDetachObservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).BeginProviderDetachObservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_BeginProviderDetachObservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).BeginProviderDetachObservation(ctx, req.(*BeginProviderDetachObservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetProviderDetachObservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetProviderDetachObservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetProviderDetachObservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetProviderDetachObservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetProviderDetachObservation(ctx, req.(*GetProviderDetachObservationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3614,6 +3686,14 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetProviderDetachWitnessInvocation",
 			Handler:    _OpenShell_GetProviderDetachWitnessInvocation_Handler,
+		},
+		{
+			MethodName: "BeginProviderDetachObservation",
+			Handler:    _OpenShell_BeginProviderDetachObservation_Handler,
+		},
+		{
+			MethodName: "GetProviderDetachObservation",
+			Handler:    _OpenShell_GetProviderDetachObservation_Handler,
 		},
 		{
 			MethodName: "GetConditionalProviderDetachState",

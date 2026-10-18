@@ -30,6 +30,56 @@ pub const PROVIDER_DETACH_HOLD_OBJECT_TYPE: &str = "provider_detach_hold_v1";
 pub const PROVIDER_DETACH_ACTION_OBJECT_TYPE: &str = "provider_detach_action_v1";
 /// Permanent original witness ownership; not a generic expiring mutation record.
 pub const PROVIDER_DETACH_WITNESS_OBJECT_TYPE: &str = "provider_detach_witness_v1";
+pub const PROVIDER_OBSERVATION_OBJECT_TYPE: &str = "provider_sandbox_mediation_observation_v1";
+pub const LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE: &str = "provider_ordinary_observation_v1";
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrdinaryAdmission {
+    pub schema_version: u32,
+    pub expected_snapshot_protobuf: String,
+    pub request_protobuf: String,
+    pub result_protobuf: String,
+}
+fn ordinary_admission_window(
+    row: &OrdinaryAdmission,
+    q: &openshell_core::proto::ProviderObservationRequestV1,
+    result: &openshell_core::proto::ProviderObservationResultV1,
+) -> PersistenceResult<()> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use openshell_core::provider_credentials::ordinary_observation as obs;
+    use prost::Message;
+    let bad = || PersistenceError::Decode("ordinary original snapshot binding invalid".into());
+    if row.schema_version != 1 || row.expected_snapshot_protobuf.len() > 8192 {
+        return Err(bad());
+    }
+    let bytes = STANDARD
+        .decode(&row.expected_snapshot_protobuf)
+        .map_err(|_| bad())?;
+    let expected = openshell_core::proto::ProviderObservationSnapshotV1::decode(bytes.as_slice())
+        .map_err(|_| bad())?;
+    let window = result.window.as_ref().ok_or_else(bad)?;
+    let installed = window.installed_snapshot.as_ref().ok_or_else(bad)?;
+    if !obs::valid_snapshot(&expected)
+        || window.request.as_ref() != Some(q)
+        || !obs::same_identity(&expected, installed)
+        || installed.current_ingress_sequence != window.ingress_watermark
+        || window.ingress_watermark < expected.current_ingress_sequence
+    {
+        return Err(bad());
+    }
+    Ok(())
+}
+pub fn ordinary_key(q: &openshell_core::proto::ProviderObservationRequestV1) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"openshell.provider-detach.original-observation/v1\n");
+    let authority = q.resource.as_ref().map_or("", |r| r.authority.as_str());
+    for s in [authority, &q.run_id, &q.step_id] {
+        h.update((s.len() as u64).to_be_bytes());
+        h.update(s.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
 
 /// Private, bounded reservation metadata. Approval and live session validation
 /// remain mandatory RPC prerequisites; persistence never creates a grant.
@@ -342,6 +392,64 @@ macro_rules! store_dispatch_traced {
 }
 
 impl Store {
+    pub(crate) async fn claim_ordinary_observation(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+        fence: &ProviderDetachFence,
+        expected: &openshell_core::proto::ProviderObservationSnapshotV1,
+    ) -> PersistenceResult<bool> {
+        match self {
+            Self::Sqlite(store) => store.claim_ordinary_observation(q, fence, expected).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "ordinary observer backend unsupported".into(),
+            )),
+        }
+    }
+    pub(crate) async fn retain_ordinary_result(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+        result: &openshell_core::proto::ProviderObservationResultV1,
+    ) -> PersistenceResult<()> {
+        match self {
+            Self::Sqlite(store) => store.retain_ordinary_result(q, result).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "ordinary observer backend unsupported".into(),
+            )),
+        }
+    }
+    pub(crate) async fn ordinary_history(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+    ) -> PersistenceResult<Option<openshell_core::proto::ProviderObservationResultV1>> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use prost::Message;
+        let Some(row) = self
+            .get(PROVIDER_OBSERVATION_OBJECT_TYPE, &ordinary_key(q))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.payload.len() > 32768 {
+            return Err(PersistenceError::Decode("ordinary row capacity".into()));
+        }
+        let row: OrdinaryAdmission = serde_json::from_slice(&row.payload)
+            .map_err(|_| PersistenceError::Decode("ordinary row invalid".into()))?;
+        if row.request_protobuf != STANDARD.encode(q.encode_to_vec()) {
+            return Err(PersistenceError::Config(
+                "ordinary original conflict".into(),
+            ));
+        }
+        if row.result_protobuf.is_empty() {
+            return Ok(None);
+        }
+        let bytes = STANDARD
+            .decode(&row.result_protobuf)
+            .map_err(|_| PersistenceError::Decode("ordinary result invalid".into()))?;
+        let result = openshell_core::proto::ProviderObservationResultV1::decode(bytes.as_slice())
+            .map_err(|_| PersistenceError::Decode("ordinary result invalid".into()))?;
+        ordinary_admission_window(&row, q, &result)?;
+        Ok(Some(result))
+    }
     pub(crate) async fn reject_provider_detach(
         &self,
         action: &openshell_core::proto::ProviderDetachActionV1,

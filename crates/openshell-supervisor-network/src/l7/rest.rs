@@ -208,12 +208,19 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
 
         let byte = match client.read_u8().await {
             Ok(b) => b,
-            Err(e) if buf.is_empty() && is_benign_close(&e) => return Ok(None),
+            Err(e) if buf.is_empty() && is_benign_close(&e) => {
+                openshell_core::provider_credentials::ordinary_observation::request_end_of_stream();
+                return Ok(None);
+            }
             Err(e) if buf.is_empty() && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                openshell_core::provider_credentials::ordinary_observation::request_end_of_stream();
                 return Ok(None); // Clean close before any data
             }
             Err(e) => return Err(miette::miette!("{e}")),
         };
+        if buf.is_empty() {
+            openshell_core::provider_credentials::ordinary_observation::request_ingress();
+        }
         buf.push(byte);
 
         // Check for end of headers -- `ends_with` is sufficient because
@@ -887,7 +894,10 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut observed_upstream = ObservedUpstream { upstream, observer };
+    let ordinary =
+        openshell_core::provider_credentials::ordinary_observation::request_observation();
+    let outcome = async {
+    let mut observed_upstream = ObservedUpstream { upstream, observer, ordinary: ordinary.as_deref() };
     let upstream = &mut observed_upstream;
     ensure_credential_generation_current(options)?;
     let header_end = req
@@ -931,8 +941,33 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let mut rewrite_result =
-        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+    let ordinary_shape = !options.credential_signing.is_sigv4() && !options.request_body_credential_rewrite && options.mcp_request_validation.is_none() && !is_websocket_request;
+    let ordinary_expected = if ordinary_shape { if let (Some(native), Some(policy), Some(credential)) = (ordinary.as_ref(), options.generation_guard, options.credential_generation) {
+        let authorization = std::str::from_utf8(&header_bytes).ok().and_then(|header| {
+            let mut found = None;
+            for line in header.split("\r\n").skip(1).filter(|v| !v.is_empty()) {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("authorization") {
+                    if found.is_some() { return None; }
+                    found = Some(value.trim_matches([' ', '\t']));
+                } else if ["x-api-key", "api-key", "proxy-authorization", "x-auth-token", "x-access-token"].iter().any(|v| name.eq_ignore_ascii_case(v)) || openshell_core::secrets::header_value_contains_reserved_credential_marker(value) { return None; }
+            }
+            found
+        });
+        if policy.ensure_current().is_ok() && credential.ensure_current().is_ok() {
+            if let Some(authorization) = authorization { native.expected(authorization, options.host, options.port, &req.target, policy.captured_generation(), credential.revision).await } else { false }
+        } else { false }
+    } else { false } } else { false };
+    let mut rewrite_result = match rewrite_http_header_block(&header_bytes, options.resolver) {
+        Ok(result) => {
+            if ordinary_expected && let Some(native) = &ordinary { native.rewrite(openshell_core::proto::ProviderObservationRewriteV1::ExpectedMaterialized); }
+            result
+        },
+        Err(error) => {
+            if ordinary_expected && !error.is_endpoint_mismatch() && let Some(native) = &ordinary { native.rewrite(openshell_core::proto::ProviderObservationRewriteV1::ExpectedUnavailable); }
+            return Err(miette::Report::new(error));
+        },
+    };
 
     if let Some(validation) = options.mcp_request_validation {
         // Header credential resolution and hop-by-hop cleanup must finish
@@ -1284,6 +1319,23 @@ where
     .await?;
 
     Ok(outcome)
+    }.await;
+    if let Some(native) = ordinary {
+        if outcome.is_err() {
+            native.relay_failed();
+        }
+        // A policy/resolver change during a response cannot become a successful
+        // current observation even if an earlier write had completed.
+        if ensure_credential_generation_current(options).is_err()
+            || options
+                .generation_guard
+                .is_none_or(|g| g.ensure_current().is_err())
+        {
+            native.rewrite(openshell_core::proto::ProviderObservationRewriteV1::Unsupported);
+        }
+        native.finish().await;
+    }
+    outcome
 }
 
 use openshell_core::secrets::body::{
@@ -1305,6 +1357,8 @@ fn ensure_body_generation_current(options: RelayRequestOptions<'_>) -> Result<()
 struct ObservedUpstream<'a, U> {
     upstream: &'a mut U,
     observer: Option<&'a EndpointObserver>,
+    ordinary:
+        Option<&'a openshell_core::provider_credentials::ordinary_observation::RequestObservation>,
 }
 
 impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
@@ -1314,7 +1368,13 @@ impl<U: AsyncRead + Unpin> AsyncRead for ObservedUpstream<'_, U> {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         let result = std::pin::Pin::new(&mut *this.upstream).poll_read(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Ok(())))
+            && let Some(native) = this.ordinary
+        {
+            native.upstream_read(buf.filled().len() - before);
+        }
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -1332,6 +1392,11 @@ impl<U: AsyncWrite + Unpin> AsyncWrite for ObservedUpstream<'_, U> {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let result = std::pin::Pin::new(&mut *this.upstream).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = result
+            && let Some(native) = this.ordinary
+        {
+            native.upstream_write(n);
+        }
         if matches!(result, std::task::Poll::Ready(Err(_)))
             && let Some(observer) = this.observer
         {
@@ -6494,6 +6559,7 @@ mod tests {
             let mut upstream = ObservedUpstream {
                 upstream: &mut response,
                 observer: Some(&observer),
+                ordinary: None,
             };
             let mut client = Vec::new();
             relay_response(
@@ -10716,5 +10782,353 @@ mod tests {
                 value: "value".to_string(),
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod ordinary_mediation_tests {
+    use super::*;
+    use openshell_core::proto::*;
+    use openshell_core::provider_credentials::{
+        ProviderCredentialState, ordinary_observation as obs,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // Synthetic authenticated-boundary metadata only. These tests exercise the
+    // REAL owned Box handoff, parser, scoped resolver, rewrite and byte/framing
+    // relay. They establish no kernel, TLS, issuer, Arm or model qualification.
+    #[derive(Debug)]
+    struct Boundary {
+        path: obs::OwnedPath,
+        registry: Arc<obs::StreamRegistry>,
+    }
+    #[async_trait::async_trait]
+    impl obs::Boundary for Boundary {
+        async fn path(&self) -> Option<obs::OwnedPath> {
+            Some(self.path.clone())
+        }
+        fn streams(&self) -> Arc<obs::StreamRegistry> {
+            self.registry.clone()
+        }
+    }
+    struct OwnedStream {
+        io: tokio::io::DuplexStream,
+        guard: Option<obs::StreamOwner>,
+    }
+    impl Drop for OwnedStream {
+        fn drop(&mut self) {
+            if let Some(g) = &self.guard {
+                g.revoke();
+            }
+        }
+    }
+    impl AsyncRead for OwnedStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for OwnedStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            b: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.io).poll_write(cx, b)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.io).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+    fn id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+    async fn run_case(
+        unavailable: bool,
+        drift: bool,
+        extra_auth: bool,
+        requests: usize,
+    ) -> ProviderObservationResultV1 {
+        let provider = id();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".into(), "synthetic-only-private-canary".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".into(),
+                StaticCredentialBinding {
+                    credential_identity: format!("{provider}:API_KEY"),
+                    workload_credential_handle: String::new(),
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.native.test".into(),
+                        port: 443,
+                        path: "/v1/**".into(),
+                    }],
+                },
+            )]),
+            vec![],
+        )
+        .unwrap();
+        let reference = state.snapshot().child_env["API_KEY"].clone();
+        let subject = Arc::new(state.capture_static_provider_revocation(&provider).unwrap());
+        if unavailable {
+            state.revoke_static_provider_environment(2);
+        }
+        let engine = crate::opa::OpaEngine::from_strings(
+            include_str!("../../data/sandbox-policy.rego"),
+            include_str!("../../testdata/sandbox-policy.yaml"),
+        )
+        .unwrap();
+        let generation = engine.current_generation();
+        let policy = engine.generation_guard(generation).unwrap();
+        let resource = ProviderDetachResourceV1 {
+            authority: "gateway".into(),
+            workspace: "default".into(),
+            sandbox: "agent".into(),
+            sandbox_id: id(),
+            execution_id: format!("exec-v1:{}", "a".repeat(64)),
+            provider: "model".into(),
+            provider_id: provider,
+        };
+        let path = obs::OwnedPath {
+            boundary_incarnation: id(),
+            execution_id: resource.execution_id.clone(),
+            mediation_path_id: id(),
+        };
+        let registry = obs::StreamRegistry::new();
+        let boundary = Arc::new(Boundary {
+            path: path.clone(),
+            registry: registry.clone(),
+        });
+        assert!(state.install_observation_boundary(boundary.clone()));
+        let mut snapshot = ProviderObservationSnapshotV1 {
+            resource: Some(resource.clone()),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: id(),
+            boundary_incarnation: path.boundary_incarnation,
+            gateway_boot_id: id(),
+            supervisor_instance: id(),
+            supervisor_session: id(),
+            configuration_sha256: "c".repeat(64),
+            policy_generation: generation,
+            resolver_generation: state.revision(),
+            mediation_path_id: path.mediation_path_id,
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            process_writer_attribution: obs::WRITER_UNPROVEN,
+            ..Default::default()
+        };
+        snapshot.mediation_path_receipt_sha256 = obs::path_digest(&snapshot);
+        let now = obs::system_now().unwrap();
+        let mut q = ProviderObservationRequestV1 {
+            resource: Some(resource),
+            run_id: id(),
+            step_id: id(),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: snapshot.source_incarnation.clone(),
+            boundary_incarnation: snapshot.boundary_incarnation.clone(),
+            deadline: Some(obs::timestamp(now + 65000)),
+            phase: ProviderObservationPhaseV1::Baseline as i32,
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            ..Default::default()
+        };
+        q.request_sha256 = obs::request_digest(&q);
+        // Native header-refusal behavior is tested independently of the real
+        // gateway detached authority, which is covered by its actual validators.
+        let observer = obs::Observer::from_boundary(snapshot, boundary)
+            .await
+            .unwrap();
+        assert!(state.install_ordinary_observer(observer.clone()));
+        observer.install(q.clone(), subject, now).unwrap();
+        let (mut client, io) = tokio::io::duplex(4096);
+        let mut stream = Box::new(OwnedStream { io, guard: None });
+        stream.guard = Some(registry.register(&stream, 71, id()).unwrap());
+        let lease = registry.take(&stream, 71).unwrap();
+        assert!(lease.authorized(Some(generation)));
+        for n in 0..requests {
+            let body = if n == 0 {
+                r#"{"stream":true}"#
+            } else {
+                r#"{"stream":false}"#
+            };
+            let extra = if extra_auth {
+                "X-Api-Key: unrelated-dummy\r\n"
+            } else {
+                ""
+            };
+            let raw = format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: api.native.test\r\nAuthorization: Bearer {reference}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            client.write_all(raw.as_bytes()).await.unwrap();
+        }
+        client.shutdown().await.unwrap();
+        let (mut upstream, mut peer) = tokio::io::duplex(4096);
+        let responder = if !unavailable && !drift {
+            Some(tokio::spawn(async move {
+                for _ in 0..requests {
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(peer.read_u8().await.unwrap());
+                    }
+                    let text = std::str::from_utf8(&header).unwrap();
+                    assert!(text.contains("Bearer synthetic-only-private-canary"));
+                    assert!(!text.contains("openshell:resolve:"));
+                    let length = text
+                        .lines()
+                        .find_map(|s| s.strip_prefix("Content-Length: "))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    peer.read_exact(&mut body).await.unwrap();
+                    peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                }
+            }))
+        } else {
+            None
+        };
+        let credential_revision = state.revision();
+        if drift {
+            engine
+                .enter_fail_closed("synthetic controlled generation drift")
+                .unwrap();
+        }
+        obs::on_connection(Some(state.clone()), Some(lease), async {
+            for _ in 0..requests {
+                let request = parse_http_request(&mut stream, &Default::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (resolver, _, revision) = state.resolver_and_body_classifier_for_endpoint(
+                    "api.native.test",
+                    443,
+                    "/v1/messages",
+                );
+                assert_eq!(revision, credential_revision);
+                let result = relay_http_request_with_response_middleware_guarded_observed(
+                    &request,
+                    &mut stream,
+                    &mut upstream,
+                    RelayRequestOptions {
+                        resolver: resolver.as_deref(),
+                        credential_generation: Some(CredentialGenerationGuard::new(
+                            &state, revision,
+                        )),
+                        generation_guard: Some(&policy),
+                        host: "api.native.test",
+                        port: 443,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(result.is_err(), unavailable || drift);
+                if result.is_err() {
+                    return;
+                } // the real handler closes after refusal; unread body is not another header
+            }
+            assert!(
+                parse_http_request(&mut stream, &Default::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        })
+        .await;
+        if let Some(task) = responder {
+            task.await.unwrap();
+        }
+        drop(stream);
+        let result = observer.close(&q.request_sha256, now + 60000).unwrap();
+        let encoded = format!("{result:?}").into_bytes();
+        assert!(
+            !encoded
+                .windows(b"synthetic-only-private-canary".len())
+                .any(|s| s == b"synthetic-only-private-canary")
+        );
+        assert!(
+            !encoded
+                .windows(reference.len())
+                .any(|s| s == reference.as_bytes())
+        );
+        result
+    }
+    #[tokio::test]
+    async fn ordinary_actual_rewrite_accounts_same_connection_stream_and_nonstream_inputs() {
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_case(false, false, false, 2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.state, ProviderObservationStateV1::Terminal as i32);
+        let requests = r
+            .events
+            .iter()
+            .filter(|e| e.attempt_kind == "request")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].native_request_id, requests[1].native_request_id);
+        assert_eq!(
+            requests[0].native_connection_id,
+            requests[1].native_connection_id
+        );
+        assert!(requests.iter().all(|e| e.rewrite
+            == ProviderObservationRewriteV1::ExpectedMaterialized as i32
+            && e.upstream_application_request_bytes > 0
+            && e.http_framing == "complete"));
+    }
+    #[tokio::test]
+    async fn ordinary_actual_expected_reference_refusal_has_zero_upstream_application_bytes() {
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_case(true, false, false, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.state, ProviderObservationStateV1::Terminal as i32);
+        let request = r
+            .events
+            .iter()
+            .find(|e| e.attempt_kind == "request")
+            .unwrap();
+        assert_eq!(
+            request.rewrite,
+            ProviderObservationRewriteV1::ExpectedUnavailable as i32
+        );
+        assert_eq!(request.upstream_application_request_bytes, 0);
+        assert_eq!(request.response_origin, "native_refusal");
+    }
+    #[tokio::test]
+    async fn ordinary_actual_generation_drift_and_alternate_auth_never_qualify() {
+        for (drift, extra) in [(true, false), (false, true)] {
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_case(false, drift, extra, 1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r.state, ProviderObservationStateV1::Unknown as i32);
+        }
     }
 }

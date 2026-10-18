@@ -724,6 +724,8 @@ pub enum Request {
     /// Read image policy without attaching or launching a workload.
     DiscoverPolicy,
     WitnessCapability,
+    /// Read only on the original authenticated boundary; no launch/recovery.
+    ObservationPath,
     WitnessPrepare(WitnessPrepareRequest),
     WitnessPermit(WitnessPermitRequest),
     WitnessFence(WitnessFenceRequest),
@@ -818,6 +820,7 @@ impl fmt::Debug for Request {
         match self {
             Self::DiscoverPolicy => formatter.write_str("DiscoverPolicy"),
             Self::WitnessCapability => formatter.write_str("WitnessCapability"),
+            Self::ObservationPath => formatter.write_str("ObservationPath"),
             Self::WitnessPrepare(_) => formatter.write_str("WitnessPrepare(<metadata>)"),
             Self::WitnessPermit(_) => formatter.write_str("WitnessPermit(<one-shot>)"),
             Self::WitnessFence(_) => formatter.write_str("WitnessFence(<metadata>)"),
@@ -924,6 +927,9 @@ pub struct ResponseEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
+    ObservationPath {
+        path: openshell_core::provider_credentials::ordinary_observation::OwnedPath,
+    },
     WitnessCapability {
         capability: openshell_core::provider_credentials::WitnessBoundaryCapability,
     },

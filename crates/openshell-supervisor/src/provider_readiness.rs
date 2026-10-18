@@ -1750,3 +1750,372 @@ mod tests {
         assert_eq!(boundary.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
+
+/// Ordinary control composes with, but does not enable, the optional fixed ELF.
+/// Every producer of this control is the original authenticated Native backend.
+pub async fn ordinary_observation_control(
+    credentials: ProviderCredentialState,
+    engine: Arc<openshell_supervisor_network::opa::OpaEngine>,
+    tracker: Tracker,
+    fixed: Option<
+        Arc<dyn openshell_supervisor_process::supervisor_session::ProviderWitnessControl>,
+    >,
+) -> Option<Arc<dyn openshell_supervisor_process::supervisor_session::ProviderWitnessControl>> {
+    let Some(boundary) = credentials.observation_boundary() else {
+        return fixed;
+    };
+    if !credentials.provider_detach_attempts_enabled() {
+        return fixed;
+    }
+    let Some(path) = boundary.path().await else {
+        return fixed;
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    Some(Arc::new(OrdinaryControl {
+        credentials,
+        engine,
+        tracker,
+        boundary,
+        path,
+        fixed,
+        accepted: std::sync::Mutex::new(None),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        reports: tx,
+        receiver: std::sync::Mutex::new(Some(rx)),
+    }))
+}
+struct OrdinaryControl {
+    credentials: ProviderCredentialState,
+    engine: Arc<openshell_supervisor_network::opa::OpaEngine>,
+    tracker: Tracker,
+    boundary: Arc<dyn openshell_core::provider_credentials::ordinary_observation::Boundary>,
+    path: openshell_core::provider_credentials::ordinary_observation::OwnedPath,
+    fixed:
+        Option<Arc<dyn openshell_supervisor_process::supervisor_session::ProviderWitnessControl>>,
+    accepted: std::sync::Mutex<Option<(String, String)>>,
+    closed: std::sync::atomic::AtomicBool,
+    reports: tokio::sync::mpsc::Sender<openshell_core::proto::ProviderObservationControlV1>,
+    receiver: std::sync::Mutex<
+        Option<tokio::sync::mpsc::Receiver<openshell_core::proto::ProviderObservationControlV1>>,
+    >,
+}
+fn observation_now() -> Option<i64> {
+    use openshell_core::provider_credentials::ordinary_observation::time_ms;
+    openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+        .ok()
+        .and_then(|t| time_ms(&t))
+}
+impl OrdinaryControl {
+    fn snapshot(
+        &self,
+        resource: Option<openshell_core::proto::ProviderDetachResourceV1>,
+        session: &str,
+    ) -> Option<openshell_core::proto::ProviderObservationSnapshotV1> {
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let accepted = self.accepted.lock().ok()?;
+        let (s, instance) = accepted.as_ref()?;
+        if s != session {
+            return None;
+        }
+        let boot = self.credentials.ordinary_session_identity();
+        if boot.as_ref().is_some_and(|(_, s)| s != session) {
+            return None;
+        }
+        let installed = self.credentials.snapshot();
+        let generation = self.engine.current_generation();
+        let mut snapshot = openshell_core::proto::ProviderObservationSnapshotV1 {
+            resource: resource.or_else(|| {
+                Some(openshell_core::proto::ProviderDetachResourceV1 {
+                    execution_id: self.path.execution_id.clone(),
+                    ..Default::default()
+                })
+            }),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: self
+                .credentials
+                .witness_launch_gate()
+                .snapshot()
+                .source_incarnation,
+            boundary_incarnation: self.path.boundary_incarnation.clone(),
+            gateway_boot_id: boot.map(|(b, _)| b).unwrap_or_default(),
+            supervisor_instance: instance.clone(),
+            supervisor_session: session.into(),
+            configuration_sha256: obs::configuration_digest(
+                &self.tracker.observation(&self.credentials),
+            ),
+            policy_generation: generation,
+            resolver_generation: installed.revision,
+            mediation_path_receipt_sha256: String::new(),
+            current_ingress_sequence: 0,
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            process_writer_attribution: obs::WRITER_UNPROVEN,
+            mediation_path_id: self.path.mediation_path_id.clone(),
+        };
+        snapshot.mediation_path_receipt_sha256 = obs::path_digest(&snapshot);
+        Some(snapshot)
+    }
+    async fn observer(
+        &self,
+        r: &openshell_core::proto::ProviderDetachResourceV1,
+        session: &str,
+    ) -> Option<Arc<openshell_core::provider_credentials::ordinary_observation::Observer>> {
+        use openshell_core::provider_credentials::ordinary_observation::Observer;
+        if self.boundary.path().await? != self.path || r.execution_id != self.path.execution_id {
+            return None;
+        }
+        let ready = self.tracker.observation(&self.credentials);
+        if !ready.credentials_installed
+            || !ready.policy_active
+            || !ready.launch_environment_installed
+            || ready.config_revision == 0
+            || ready.provider_env_revision == 0
+            || ready.process_instance_id.is_empty()
+        {
+            return None;
+        }
+
+        // This selected profile accepts only one retained static provider.
+        // A missing association is not a credential-refusal observation.
+        let subject = self
+            .credentials
+            .capture_static_provider_revocation(&r.provider_id);
+        if subject.is_none() && self.credentials.ordinary_observer().is_none() {
+            return None;
+        }
+        let snapshot = self.snapshot(Some(r.clone()), session)?;
+        if snapshot.gateway_boot_id.is_empty() {
+            return None;
+        }
+        if let Some(old) = self.credentials.ordinary_observer() {
+            return old
+                .update_snapshot(snapshot, observation_now()?)
+                .then_some(old);
+        }
+        let observer = Observer::from_boundary(snapshot, self.boundary.clone()).await?;
+        if !self.credentials.install_ordinary_observer(observer.clone()) {
+            return None;
+        }
+        Some(observer)
+    }
+}
+#[tonic::async_trait]
+impl openshell_supervisor_process::supervisor_session::ProviderWitnessControl for OrdinaryControl {
+    fn capability(
+        &self,
+        session: &str,
+    ) -> Option<openshell_core::proto::ProviderDetachWitnessControlV1> {
+        self.fixed.as_ref()?.capability(session)
+    }
+    async fn invoke(
+        &self,
+        session: &str,
+        request: openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> openshell_core::proto::ProviderDetachWitnessControlV1 {
+        if let Some(fixed) = &self.fixed {
+            return fixed.invoke(session, request).await;
+        }
+        openshell_core::proto::ProviderDetachWitnessControlV1 {
+            state: "unknown".into(),
+            ..Default::default()
+        }
+    }
+    fn disconnect(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(observer) = self.credentials.ordinary_observer() {
+            observer.invalidate();
+        }
+        if let Some(fixed) = &self.fixed {
+            fixed.disconnect();
+        }
+    }
+    fn observations(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<openshell_core::proto::ProviderDetachWitnessControlV1>>
+    {
+        self.fixed.as_ref()?.observations()
+    }
+    fn observation_capability(
+        &self,
+        session: &str,
+        instance: &str,
+    ) -> Option<openshell_core::proto::ProviderObservationSnapshotV1> {
+        let mut accepted = self.accepted.lock().ok()?;
+        if accepted
+            .as_ref()
+            .is_some_and(|(s, i)| s != session || i != instance)
+        {
+            return None;
+        }
+        if accepted.is_none() {
+            *accepted = Some((session.into(), instance.into()));
+        }
+        drop(accepted);
+        self.snapshot(None, session)
+    }
+    fn observation_reports(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<openshell_core::proto::ProviderObservationControlV1>>
+    {
+        self.receiver.lock().ok()?.take()
+    }
+    async fn observation_command(
+        &self,
+        session: &str,
+        command: openshell_core::proto::ProviderObservationControlV1,
+    ) -> Option<openshell_core::proto::ProviderObservationControlV1> {
+        use openshell_core::proto::provider_observation_control_v1::Payload;
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        use prost::Message;
+        if command.encoded_len() > obs::MAX_RESULT {
+            return None;
+        }
+        let payload = match command.payload? {
+            Payload::CurrentRead(read) => {
+                let selector = read.selector.as_ref()?;
+                let resource = match (&selector.original_request, &selector.resource) {
+                    (None, Some(r)) => r,
+                    (Some(q), None) => q.resource.as_ref()?,
+                    _ => return None,
+                };
+                let observer = self.observer(resource, session).await?;
+                Payload::CurrentReply(observer.read(read, observation_now()?).await?)
+            }
+            Payload::InstallRequest(q) => {
+                let observer = self.observer(q.resource.as_ref()?, session).await?;
+                let subject =
+                    if let Some(seal) = &q.installed_arm {
+                        let before = seal
+                            .request
+                            .as_ref()?
+                            .original_action
+                            .as_ref()?
+                            .target
+                            .as_ref()?
+                            .provider_env_revision;
+                        self.credentials.retained_provider_revocation_subject(
+                            &q.resource.as_ref()?.provider_id,
+                            before,
+                        )?
+                    } else {
+                        Arc::new(self.credentials.capture_static_provider_revocation(
+                            &q.resource.as_ref()?.provider_id,
+                        )?)
+                    };
+                let result = observer.install(q.clone(), subject, observation_now()?)?;
+                let end = obs::time_ms(result.window.as_ref()?.capture_end.as_ref()?)?;
+                let remaining = u64::try_from(end.checked_sub(observation_now()?)?).ok()?;
+                let reports = self.reports.clone();
+                let tracker = self.tracker.clone();
+                let credentials = self.credentials.clone();
+                let engine = self.engine.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(remaining)).await;
+                    let Some(now) = observation_now() else {
+                        observer.invalidate();
+                        return;
+                    };
+                    let Some(current) = observer.current(now).await else {
+                        observer.invalidate();
+                        return;
+                    };
+                    let ready = tracker.observation(&credentials);
+                    if !ready.credentials_installed
+                        || !ready.policy_active
+                        || !ready.launch_environment_installed
+                        || current.configuration_sha256 != obs::configuration_digest(&ready)
+                        || current.policy_generation != engine.current_generation()
+                        || current.resolver_generation != credentials.revision()
+                    {
+                        observer.fault_open_windows();
+                    }
+                    if let Some(report) = observer.close(&q.request_sha256, now)
+                        && reports
+                            .try_send(openshell_core::proto::ProviderObservationControlV1 {
+                                payload: Some(Payload::Report(report)),
+                            })
+                            .is_err()
+                    {
+                        observer.invalidate();
+                    }
+                });
+                Payload::Report(result)
+            }
+            _ => return None,
+        };
+        Some(openshell_core::proto::ProviderObservationControlV1 {
+            payload: Some(payload),
+        })
+    }
+}
+
+#[cfg(test)]
+mod ordinary_factory_tests {
+    use super::*;
+    use openshell_core::provider_credentials::ordinary_observation::{
+        Boundary, OwnedPath, StreamRegistry,
+    };
+    #[derive(Debug)]
+    struct Probe {
+        calls: std::sync::atomic::AtomicUsize,
+        path: OwnedPath,
+        streams: Arc<StreamRegistry>,
+    }
+    #[tonic::async_trait]
+    impl Boundary for Probe {
+        async fn path(&self) -> Option<OwnedPath> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(self.path.clone())
+        }
+        fn streams(&self) -> Arc<StreamRegistry> {
+            self.streams.clone()
+        }
+    }
+    #[tokio::test]
+    async fn ordinary_factory_is_independent_of_fixed_elf_and_disabled_by_default() {
+        let credentials = ProviderCredentialState::from_environment(
+            1,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let probe = Arc::new(Probe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            path: OwnedPath {
+                boundary_incarnation: uuid::Uuid::new_v4().to_string(),
+                execution_id: format!("exec-v1:{}", "a".repeat(64)),
+                mediation_path_id: uuid::Uuid::new_v4().to_string(),
+            },
+            streams: StreamRegistry::new(),
+        });
+        assert!(credentials.install_observation_boundary(probe.clone()));
+        let engine = Arc::new(
+            openshell_supervisor_network::opa::OpaEngine::from_strings(
+                include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap(),
+        );
+        assert!(
+            ordinary_observation_control(credentials.clone(), engine.clone(), Tracker::new(), None)
+                .await
+                .is_none()
+        );
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        credentials.enable_provider_detach_attempts();
+        let control = ordinary_observation_control(credentials, engine, Tracker::new(), None)
+            .await
+            .expect("ordinary factory must not require a compiled fixed ELF");
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            control
+                .capability(&uuid::Uuid::new_v4().to_string())
+                .is_none(),
+            "ordinary factory must not enable fixed Invoke"
+        );
+    }
+}

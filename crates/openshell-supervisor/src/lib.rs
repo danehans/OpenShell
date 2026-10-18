@@ -1276,6 +1276,18 @@ async fn run_sandbox_with_backend(
             }
             None => None,
         };
+        let witness_control = match opa_engine.as_ref() {
+            Some(engine) => {
+                provider_readiness::ordinary_observation_control(
+                    provider_credentials.clone(),
+                    engine.clone(),
+                    provider_readiness.clone(),
+                    witness_control,
+                )
+                .await
+            }
+            None => witness_control,
+        };
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),

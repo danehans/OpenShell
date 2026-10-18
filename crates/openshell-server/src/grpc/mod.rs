@@ -10,6 +10,7 @@ pub mod policy;
 pub mod provider;
 pub mod provider_detach;
 pub mod provider_detach_invocation;
+pub mod provider_detach_observation;
 #[cfg(test)]
 pub use provider_detach::{
     action_id_for_digest as provider_detach_action_id_for_digest,
@@ -428,6 +429,20 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<openshell_core::proto::GetProviderDetachWitnessInvocationResponse>, Status>
     {
         provider_detach_invocation::query(&self.state, request).await
+    }
+
+    async fn begin_provider_detach_observation(
+        &self,
+        request: Request<openshell_core::proto::BeginProviderDetachObservationRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginProviderDetachObservationResponse>, Status>
+    {
+        Box::pin(provider_detach_observation::begin(&self.state, request)).await
+    }
+    async fn get_provider_detach_observation(
+        &self,
+        request: Request<openshell_core::proto::GetProviderDetachObservationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderDetachObservationResponse>, Status> {
+        Box::pin(provider_detach_observation::get(&self.state, request)).await
     }
 
     async fn get_conditional_provider_detach_state(

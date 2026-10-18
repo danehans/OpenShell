@@ -194,6 +194,22 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+  // Optional ordinary observer metadata only; no input, detach or model operation.
+  rpc BeginProviderDetachObservation(BeginProviderDetachObservationRequest) returns (BeginProviderDetachObservationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:observe"
+      workspace_role: "user"
+    };
+  }
+  // Optional ordinary observer metadata only; no input, detach or model operation.
+  rpc GetProviderDetachObservation(GetProviderDetachObservationRequest) returns (GetProviderDetachObservationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:observe:read"
+      workspace_role: "user"
+    };
+  }
   // Closed read-only resolve/recover/observe queries; never redispatches mutation.
   rpc GetConditionalProviderDetachState(GetConditionalProviderDetachStateRequest)
       returns (GetConditionalProviderDetachStateResponse) {
@@ -3197,6 +3213,7 @@ message SupervisorMessage {
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
     ProviderDetachWitnessControlV1 provider_detach_witness = 5;
+    ProviderObservationControlV1 provider_detach_observation = 6;
   }
 }
 
@@ -3209,6 +3226,7 @@ message GatewayMessage {
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
     ProviderDetachWitnessRequestV1 provider_detach_witness = 6;
+    ProviderObservationControlV1 provider_detach_observation = 7;
   }
 }
 
@@ -4406,4 +4424,150 @@ message ProviderDetachSupervisorReportV1 {
   google.protobuf.Timestamp installed_time = 6;
   ProviderDetachAttemptResultV1 result = 7;
   ProviderDetachRefusalV1 refusal = 8;
+}
+
+// Optional ordinary traffic observation. This never launches an agent or model.
+enum ProviderObservationPhaseV1 {
+  PROVIDER_OBSERVATION_PHASE_V1_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_PHASE_V1_BASELINE = 1;
+  PROVIDER_OBSERVATION_PHASE_V1_DETACHED = 2;
+}
+enum ProviderObservationStateV1 {
+  PROVIDER_OBSERVATION_STATE_V1_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_STATE_V1_PENDING_INSTALL = 1;
+  PROVIDER_OBSERVATION_STATE_V1_OPEN = 2;
+  PROVIDER_OBSERVATION_STATE_V1_TERMINAL = 3;
+  PROVIDER_OBSERVATION_STATE_V1_UNKNOWN = 4;
+  PROVIDER_OBSERVATION_STATE_V1_EXPIRED = 5;
+}
+enum ProviderObservationRewriteV1 {
+  PROVIDER_OBSERVATION_REWRITE_V1_UNOBSERVED = 0;
+  PROVIDER_OBSERVATION_REWRITE_V1_EXPECTED_MATERIALIZED = 1;
+  PROVIDER_OBSERVATION_REWRITE_V1_EXPECTED_UNAVAILABLE = 2;
+  PROVIDER_OBSERVATION_REWRITE_V1_OTHER_FAILURE = 3;
+  PROVIDER_OBSERVATION_REWRITE_V1_UNSUPPORTED = 4;
+}
+message ProviderObservationRequestV1 {
+  ProviderDetachResourceV1 resource = 1;
+  string run_id = 2;
+  string step_id = 3;
+  string profile_id = 4;
+  string profile_sha256 = 5;
+  string source_incarnation = 6;
+  string boundary_incarnation = 7;
+  google.protobuf.Timestamp deadline = 8;
+  ProviderObservationPhaseV1 phase = 9;
+  ProviderDetachArmSealV1 installed_arm = 10;
+  string baseline_mediation_path_receipt_sha256 = 11;
+  string request_sha256 = 12;
+  string evidence_scope = 13;
+}
+message ProviderObservationSnapshotV1 {
+  ProviderDetachResourceV1 resource = 1;
+  string profile_id = 2;
+  string profile_sha256 = 3;
+  string source_incarnation = 4;
+  string boundary_incarnation = 5;
+  string gateway_boot_id = 6;
+  string supervisor_instance = 7;
+  string supervisor_session = 8;
+  string configuration_sha256 = 9;
+  uint64 policy_generation = 10;
+  uint64 resolver_generation = 11;
+  string mediation_path_receipt_sha256 = 12;
+  uint64 current_ingress_sequence = 13;
+  string evidence_scope = 14;
+  ProviderObservationProcessWriterAttributionV1 process_writer_attribution = 15;
+  string mediation_path_id = 16;
+}
+message ProviderObservationWindowV1 {
+  ProviderObservationRequestV1 request = 1;
+  ProviderObservationSnapshotV1 installed_snapshot = 2;
+  string window_id = 3;
+  uint64 install_sequence = 4;
+  google.protobuf.Timestamp installed_time = 5;
+  uint64 ingress_watermark = 6;
+  string window_sha256 = 7;
+  google.protobuf.Timestamp capture_end = 8;
+}
+message ProviderObservationEventV1 {
+  string native_request_id = 1;
+  string native_connection_id = 2;
+  uint64 ingress_sequence = 3;
+  google.protobuf.Timestamp captured_time = 4;
+  string mediation_stream_receipt_sha256 = 5;
+  string route_class = 6;
+  string request_stream_class = 7;
+  ProviderObservationRewriteV1 rewrite = 8;
+  uint64 upstream_application_request_bytes = 9;
+  string native_response_id = 10;
+  string response_origin = 11;
+  uint64 response_sequence = 12;
+  string http_framing = 13;
+  string client_socket_write = 14;
+  uint64 upstream_response_bytes = 15;
+  google.protobuf.Timestamp closed_time = 16;
+  uint64 policy_generation = 17;
+  uint64 resolver_generation = 18;
+  string attempt_kind = 19;
+}
+message ProviderObservationResultV1 {
+  ProviderObservationWindowV1 window = 1;
+  ProviderObservationStateV1 state = 2;
+  repeated ProviderObservationEventV1 events = 3;
+  google.protobuf.Timestamp closed_time = 4;
+  string terminal_sha256 = 5;
+  ProviderObservationSnapshotV1 current_snapshot = 6;
+  ProviderDetachACKV1 detached_ack = 7;
+  uint64 current_report_sequence = 8;
+  string ack_window_sha256 = 9;
+  string ack_terminal_sha256 = 10;
+  ProviderObservationCurrentReplyV1 current_read = 11;
+}
+message ProviderObservationControlV1 {
+  oneof payload {
+    ProviderObservationRequestV1 install_request = 1;
+    ProviderObservationSnapshotV1 current_snapshot = 2;
+    ProviderObservationResultV1 report = 3;
+    ProviderObservationCurrentReadV1 current_read = 4;
+    ProviderObservationCurrentReplyV1 current_reply = 5;
+  }
+}
+message BeginProviderDetachObservationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderObservationRequestV1 request = 2;
+}
+message BeginProviderDetachObservationResponse {
+  ProviderObservationResultV1 result = 1;
+}
+message GetProviderDetachObservationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderObservationRequestV1 original_request = 2;
+  ProviderDetachResourceV1 resource = 3;
+}
+message GetProviderDetachObservationResponse {
+  ProviderObservationResultV1 result = 1;
+  ProviderObservationSnapshotV1 snapshot = 2;
+  ProviderObservationCurrentReplyV1 current_read = 3;
+}
+message ProviderObservationCurrentReadV1 {
+  GetProviderDetachObservationRequest selector = 1;
+  ProviderObservationSnapshotV1 expected_identity = 2;
+  bytes read_correlation = 3;
+  google.protobuf.Timestamp read_deadline = 4;
+  string window_sha256 = 5;
+  string terminal_sha256 = 6;
+}
+message ProviderObservationCurrentReplyV1 {
+  ProviderObservationCurrentReadV1 original_read = 1;
+  ProviderObservationSnapshotV1 sampled_snapshot = 2;
+  uint32 active_attempts = 3;
+  bool accounting_fault = 4;
+  google.protobuf.Timestamp sampled_time = 5;
+}
+
+// This profile makes no per-process writer assertion. Zero is invalid.
+enum ProviderObservationProcessWriterAttributionV1 {
+  PROVIDER_OBSERVATION_PROCESS_WRITER_ATTRIBUTION_V1_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_PROCESS_WRITER_ATTRIBUTION_V1_PROCESS_WRITER_UNPROVEN = 1;
 }

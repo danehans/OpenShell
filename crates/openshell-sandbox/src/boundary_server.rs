@@ -1365,6 +1365,8 @@ mod linux {
         /// even a delayed first attempt is rejected without retaining its ID.
         exec_requests: Mutex<ExecRequestLedger>,
         replay_ledger: Mutex<ReplayLedger>,
+        observation_incarnation: String,
+        observation_path_id: String,
         network_broker: NetworkBroker,
         workload_launcher:
             openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
@@ -1638,6 +1640,8 @@ mod linux {
                 exec_handles: Mutex::new(std::collections::HashMap::new()),
                 exec_requests: Mutex::new(ExecRequestLedger::default()),
                 replay_ledger: Mutex::new(ReplayLedger::default()),
+                observation_incarnation: uuid::Uuid::new_v4().to_string(),
+                observation_path_id: uuid::Uuid::new_v4().to_string(),
                 network_broker,
                 workload_launcher,
                 qualification,
@@ -1996,6 +2000,7 @@ mod linux {
             let response = match envelope.request {
                 Request::DiscoverPolicy => Self::discover_image_policy(),
                 Request::WitnessCapability => self.witness_control(None, None, None),
+                Request::ObservationPath => self.observation_path(),
                 Request::WitnessPrepare(request) => {
                     self.witness_control(Some(request.binding), None, None)
                 }
@@ -2627,6 +2632,28 @@ mod linux {
                 process_id,
                 provider_env_revision,
                 provider_env_generation: 0,
+            }
+        }
+
+        fn observation_path(&self) -> Response {
+            let state = lock(&self.state);
+            let RuntimeState::Running(process) = &*state else {
+                return guest_error(BoundaryErrorKind::Denied, "original execution unavailable");
+            };
+            if process.has_exited() {
+                return guest_error(BoundaryErrorKind::Denied, "original execution exited");
+            }
+            let execution = openshell_core::traffic_identity::execution_id(
+                &self.config.boundary_id,
+                &self.config.generation,
+                self.config.auth_epoch.get(),
+            );
+            Response::ObservationPath {
+                path: openshell_core::provider_credentials::ordinary_observation::OwnedPath {
+                    boundary_incarnation: self.observation_incarnation.clone(),
+                    execution_id: execution,
+                    mediation_path_id: self.observation_path_id.clone(),
+                },
             }
         }
 

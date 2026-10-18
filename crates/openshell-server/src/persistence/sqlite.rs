@@ -512,6 +512,247 @@ async fn recover_provider_detach_on(
 }
 
 impl SqliteStore {
+    pub(crate) async fn claim_ordinary_observation(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+        fence: &super::ProviderDetachFence,
+        expected: &openshell_core::proto::ProviderObservationSnapshotV1,
+    ) -> PersistenceResult<bool> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use openshell_core::proto::{ProviderObservationPhaseV1, SandboxPhase};
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        let bad = || PersistenceError::Config("ordinary original/current predicate refused".into());
+        if !obs::shape(q)
+            || !obs::valid_snapshot(expected)
+            || expected.resource != q.resource
+            || expected.source_incarnation != q.source_incarnation
+            || expected.boundary_incarnation != q.boundary_incarnation
+            || expected.profile_sha256 != q.profile_sha256
+            || obs::install_budget(q, expected).is_none()
+        {
+            return Err(bad());
+        }
+        let resource = q.resource.as_ref().ok_or_else(bad)?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        if provider_detach_fence_on(&mut tx).await? != *fence {
+            return Err(bad());
+        }
+        let now = current_time_ms();
+        let end = q.deadline.as_ref().and_then(obs::time_ms).ok_or_else(bad)?;
+        if end <= now + 5000 || end - now > 65000 {
+            return Err(bad());
+        }
+        let current: Option<(Vec<u8>,)> = sqlx::query_as("SELECT payload FROM objects WHERE object_type='sandbox' AND id=? AND workspace=? AND name=? AND length(payload)<=16777216")
+            .bind(&resource.sandbox_id).bind(&resource.workspace).bind(&resource.sandbox).fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let sandbox = Sandbox::decode(current.ok_or_else(bad)?.0.as_slice()).map_err(|_| bad())?;
+        let provider: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM objects WHERE object_type='provider' AND workspace=? AND name=?",
+        )
+        .bind(&resource.workspace)
+        .bind(&resource.provider)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        if sandbox.phase() != SandboxPhase::Ready as i32
+            || crate::auth::sandbox_session::sandbox_execution_id(&sandbox)
+                .ok()
+                .as_deref()
+                != Some(resource.execution_id.as_str())
+            || provider.is_none_or(|(id,)| id != resource.provider_id)
+        {
+            return Err(bad());
+        }
+        let secondary = if q.phase == ProviderObservationPhaseV1::Detached as i32 {
+            let seal = q.installed_arm.as_ref().ok_or_else(bad)?;
+            let arm = seal.request.as_ref().ok_or_else(bad)?;
+            let action = arm.original_action.as_ref().ok_or_else(bad)?;
+            let receipt = arm.original_receipt.as_ref().ok_or_else(bad)?;
+            let target = action.target.as_ref().ok_or_else(bad)?;
+            let attempt = arm.attempt.as_ref().ok_or_else(bad)?;
+            crate::grpc::validate_provider_detach_original_action(action).map_err(|_| bad())?;
+            if target.authority != resource.authority
+                || target.workspace != resource.workspace
+                || target.sandbox_id != resource.sandbox_id
+                || target.execution_id != resource.execution_id
+                || target.provider_id != resource.provider_id
+                || receipt.action_id != action.action_id
+                || receipt.target.as_ref() != Some(target)
+                || attempt
+                    .deadline
+                    .as_ref()
+                    .and_then(obs::time_ms)
+                    .is_none_or(|d| end > d)
+                || sandbox
+                    .spec
+                    .as_ref()
+                    .is_none_or(|s| s.providers.contains(&resource.provider))
+            {
+                return Err(bad());
+            }
+            let bytes: Option<(Vec<u8>, i64)> = sqlx::query_as("SELECT payload,resource_version FROM objects WHERE object_type=? AND id=? AND workspace=? AND name=? AND length(payload)<=16384")
+                .bind(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE).bind(&receipt.hold_id).bind(&resource.workspace).bind(format!("{}:{}",resource.sandbox_id,resource.provider)).fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            let (bytes, version) = bytes.ok_or_else(bad)?;
+            let hold = crate::storage_proto::StoredProviderDetachHoldV1::decode(bytes.as_slice())
+                .map_err(|_| bad())?;
+            let original: Option<(Vec<u8>,)> = sqlx::query_as("SELECT payload FROM objects WHERE object_type=? AND id=? AND workspace=? AND length(payload)<=16384")
+                .bind(super::PROVIDER_DETACH_ACTION_OBJECT_TYPE).bind(&action.action_id).bind(&resource.workspace).fetch_optional(&mut *tx).await.map_err(|e|map_db_error(&e))?;
+            let original = crate::storage_proto::StoredProviderDetachActionV1::decode(
+                original.ok_or_else(bad)?.0.as_slice(),
+            )
+            .map_err(|_| bad())?;
+            if original.schema_version != 1
+                || original.original_action.as_ref() != Some(action)
+                || original
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|o| o.state != "applied" || o.receipt.as_ref() != Some(receipt))
+            {
+                return Err(bad());
+            }
+            if hold.schema_version != 1
+                || hold.hold_id != receipt.hold_id
+                || hold.workspace != resource.workspace
+                || hold.sandbox_id != resource.sandbox_id
+                || hold.provider_id != resource.provider_id
+                || hold.provider != resource.provider
+                || hold.native_receipt_id != receipt.native_receipt_id
+                || hold.original_action.as_ref() != Some(action)
+                || hold.original_receipt.as_ref() != Some(receipt)
+                || hold.generation != seal.hold_generation
+                || u64::try_from(version).ok() != Some(seal.row_resource_version)
+            {
+                return Err(bad());
+            }
+            let fixed: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type=? AND json_extract(CAST(payload AS TEXT),'$.binding.action_id')=?")
+                .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE).bind(&action.action_id).fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            if fixed != 0 {
+                return Err(bad());
+            }
+            format!("action:{}", action.action_id)
+        } else {
+            if sandbox
+                .spec
+                .as_ref()
+                .is_none_or(|s| !s.providers.contains(&resource.provider))
+            {
+                return Err(bad());
+            }
+            format!("baseline:{}:{}", q.run_id, q.step_id)
+        };
+        let key = super::ordinary_key(q);
+        // Domain changes cannot reset an original operation or action claim.
+        // Old actor-mode records are never decoded/upgraded as path evidence.
+        let legacy: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type=? AND (id=? OR (workspace=? AND name=?))")
+            .bind(super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE).bind(&key).bind(&resource.workspace).bind(&secondary).fetch_one(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        if legacy != 0 {
+            return Err(bad());
+        }
+        let old: Option<(Vec<u8>,)> = sqlx::query_as("SELECT payload FROM objects WHERE object_type=? AND (id=? OR (workspace=? AND name=?)) AND length(payload)<=32768")
+            .bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE).bind(&key).bind(&resource.workspace).bind(&secondary).fetch_optional(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        let request_protobuf = STANDARD.encode(q.encode_to_vec());
+        if let Some((old,)) = old {
+            let old: super::OrdinaryAdmission = serde_json::from_slice(&old).map_err(|_| bad())?;
+            if old.request_protobuf != request_protobuf {
+                return Err(bad());
+            }
+            return Ok(false); // identical original is query-only, NEVER install again
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type IN (?,?,?)")
+                .bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE)
+                .bind(super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE)
+                .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+        if count >= 4096 {
+            return Err(bad());
+        }
+        let mut admission = super::OrdinaryAdmission {
+            schema_version: 1,
+            expected_snapshot_protobuf: STANDARD.encode(expected.encode_to_vec()),
+            request_protobuf,
+            result_protobuf: String::new(),
+        };
+        // Reserve the complete eventual private row BEFORE committing a claim.
+        // The bound includes duplicated original/snapshot and base64/JSON framing,
+        // not just the public protobuf result's 16 KiB ceiling.
+        let result_bound = obs::install_budget(q, expected).ok_or_else(bad)?;
+        let encoded_bound = result_bound
+            .checked_add(2)
+            .and_then(|n| n.checked_div(3))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(bad)?;
+        admission.result_protobuf = "A".repeat(encoded_bound);
+        if serde_json::to_vec(&admission).map_err(|_| bad())?.len() > 32768 {
+            return Err(bad());
+        }
+        admission.result_protobuf.clear();
+        let payload = serde_json::to_vec(&admission).map_err(|_| bad())?;
+        sqlx::query("INSERT INTO objects(object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?,?)")
+            .bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE).bind(&key).bind(&secondary).bind(&resource.workspace).bind(payload).bind(now).bind(now).execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(true)
+    }
+    pub(crate) async fn retain_ordinary_result(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+        result: &openshell_core::proto::ProviderObservationResultV1,
+    ) -> PersistenceResult<()> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        let bad = || PersistenceError::Config("ordinary terminal binding refused".into());
+        if result.encoded_len() > obs::MAX_RESULT
+            || result.window.as_ref().and_then(|w| w.request.as_ref()) != Some(q)
+            || result.terminal_sha256.is_empty()
+            || result.terminal_sha256 != obs::terminal_digest(result)
+        {
+            return Err(bad());
+        }
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let key = super::ordinary_key(q);
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT payload FROM objects WHERE object_type=? AND id=? AND length(payload)<=32768",
+        )
+        .bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE)
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        let mut row: super::OrdinaryAdmission =
+            serde_json::from_slice(&row.ok_or_else(bad)?.0).map_err(|_| bad())?;
+        super::ordinary_admission_window(&row, q, result)?;
+        let mut immutable = result.clone();
+        immutable.current_snapshot = None;
+        immutable.current_read = None;
+        immutable.detached_ack = None;
+        immutable.current_report_sequence = 0;
+        immutable.ack_window_sha256.clear();
+        immutable.ack_terminal_sha256.clear();
+        let encoded = STANDARD.encode(immutable.encode_to_vec());
+        if row.request_protobuf != STANDARD.encode(q.encode_to_vec())
+            || (!row.result_protobuf.is_empty() && row.result_protobuf != encoded)
+        {
+            return Err(bad());
+        }
+        row.result_protobuf = encoded;
+        let payload = serde_json::to_vec(&row).map_err(|_| bad())?;
+        if payload.len() > 32768 {
+            return Err(bad());
+        }
+        sqlx::query("UPDATE objects SET payload=?,resource_version=resource_version+1,updated_at_ms=? WHERE object_type=? AND id=?").bind(payload).bind(current_time_ms()).bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE).bind(&key).execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     /// D1: all related predicates and the original admission transition share
     /// one write transaction. No launch, transport, session wait or detach occurs.
     pub(crate) async fn reserve_provider_detach_witness(
@@ -663,6 +904,20 @@ impl SqliteStore {
         if now >= binding.deadline_ms {
             return Err(bad());
         }
+        // Ordinary observation and fixed invocation may not both own an action.
+        let ordinary: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM objects WHERE object_type IN (?,?) AND workspace=? AND name=?",
+        )
+        .bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE)
+        .bind(super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE)
+        .bind(&target.workspace)
+        .bind(format!("action:{}", action.action_id))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        if ordinary != 0 {
+            return Err(bad());
+        }
         let id = binding.original_key();
         let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
             "SELECT payload,resource_version FROM objects WHERE object_type=? AND id=? AND length(payload)<=32768")
@@ -689,11 +944,14 @@ impl SqliteStore {
             if claim_dispatch {
                 return Err(bad());
             }
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type=?")
-                .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| map_db_error(&e))?;
+            let count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM objects WHERE object_type IN (?,?,?)")
+                    .bind(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE)
+                    .bind(super::PROVIDER_OBSERVATION_OBJECT_TYPE)
+                    .bind(super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
             if count >= 4096 {
                 return Err(bad());
             }
@@ -1221,7 +1479,10 @@ impl SqliteStore {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1283,7 +1544,10 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1329,7 +1593,10 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1450,7 +1717,10 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1498,7 +1768,10 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1561,7 +1834,10 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<WriteResult> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1622,7 +1898,10 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
         labels: Option<&str>,
         max_count: u64,
     ) -> PersistenceResult<Option<WriteResult>> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1734,7 +2013,10 @@ WHERE "object_type" = ?1 AND "workspace" = ?2 AND "name" = ?3
     }
 
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1759,7 +2041,10 @@ WHERE "object_type" = ?1 AND "id" = ?2
     }
 
     pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1813,7 +2098,10 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1838,7 +2126,10 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
     }
 
     pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -1868,7 +2159,10 @@ WHERE "object_type" = ?1 AND "scope" = ?2
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<bool> {
-        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE {
+        if object_type == super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE
+            || object_type == super::PROVIDER_OBSERVATION_OBJECT_TYPE
+            || object_type == super::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE
+        {
             return Err(PersistenceError::Config(
                 "provider witness requires original native transaction".into(),
             ));
@@ -3025,4 +3319,139 @@ fn row_to_draft_chunk_record(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<
         created_at_ms,
         updated_at_ms,
     )
+}
+
+#[cfg(test)]
+mod ordinary_original_budget_tests {
+    use super::*;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::*;
+    use openshell_core::provider_credentials::ordinary_observation as obs;
+
+    #[tokio::test]
+    async fn ordinary_old_new_fixed_domains_share_original_exclusion_and_capacity() {
+        let state = crate::grpc::test_support::test_server_state_without_provider_profiles().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "ordinary-budget".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                providers: vec!["model".into()],
+                ..Default::default()
+            }),
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Ready as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .unwrap()
+            .write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "model".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        state.store.put_message(&provider).await.unwrap();
+        let resource = ProviderDetachResourceV1 {
+            authority: "gateway".into(),
+            workspace: "default".into(),
+            sandbox: "ordinary-budget".into(),
+            sandbox_id: sandbox.metadata.as_ref().unwrap().id.clone(),
+            execution_id: crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap(),
+            provider: "model".into(),
+            provider_id: provider.metadata.as_ref().unwrap().id.clone(),
+        };
+        let mut q = ProviderObservationRequestV1 {
+            resource: Some(resource.clone()),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            step_id: uuid::Uuid::new_v4().to_string(),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: uuid::Uuid::new_v4().to_string(),
+            boundary_incarnation: uuid::Uuid::new_v4().to_string(),
+            deadline: Some(obs::timestamp(current_time_ms() + 60000)),
+            phase: ProviderObservationPhaseV1::Baseline as i32,
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            ..Default::default()
+        };
+        q.request_sha256 = obs::request_digest(&q);
+        let mut expected = ProviderObservationSnapshotV1 {
+            resource: Some(resource),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: q.source_incarnation.clone(),
+            boundary_incarnation: q.boundary_incarnation.clone(),
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            process_writer_attribution: obs::WRITER_UNPROVEN,
+            mediation_path_id: uuid::Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+        expected.mediation_path_receipt_sha256 = obs::path_digest(&expected);
+        let crate::persistence::Store::Sqlite(store) = &*state.store else {
+            panic!("SQLite fixture")
+        };
+        let fence = state.store.provider_detach_fence().await.unwrap();
+        // Inject historical opaque rows only through the private test pool. The
+        // production CRUD surface cannot create, mutate or delete these kinds.
+        sqlx::query("INSERT INTO objects(object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,0,0)")
+            .bind(crate::persistence::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE).bind(crate::persistence::ordinary_key(&q)).bind(format!("baseline:{}:{}",q.run_id,q.step_id)).bind("default").bind(b"opaque-old-kind".as_slice()).execute(&store.pool).await.unwrap();
+        assert!(
+            store
+                .claim_ordinary_observation(&q, &fence, &expected)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .store
+                .delete(
+                    crate::persistence::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE,
+                    &crate::persistence::ordinary_key(&q)
+                )
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM objects WHERE object_type=?")
+            .bind(crate::persistence::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<4095) INSERT INTO objects(object_type,id,name,workspace,payload,created_at_ms,updated_at_ms) SELECT CASE i%3 WHEN 0 THEN ? WHEN 1 THEN ? ELSE ? END, 'budget-'||i,'budget-'||i,'default',X'00',0,0 FROM n")
+            .bind(crate::persistence::PROVIDER_OBSERVATION_OBJECT_TYPE).bind(crate::persistence::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE).bind(crate::persistence::PROVIDER_DETACH_WITNESS_OBJECT_TYPE).execute(&store.pool).await.unwrap();
+        assert!(
+            store
+                .claim_ordinary_observation(&q, &fence, &expected)
+                .await
+                .is_err()
+        );
+        let claimed: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE id=?")
+            .bind(crate::persistence::ordinary_key(&q))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(claimed, 0);
+        for kind in [
+            crate::persistence::PROVIDER_OBSERVATION_OBJECT_TYPE,
+            crate::persistence::LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE,
+            crate::persistence::PROVIDER_DETACH_WITNESS_OBJECT_TYPE,
+        ] {
+            assert!(
+                state
+                    .store
+                    .delete_all_in_workspace(kind, "default")
+                    .await
+                    .is_err()
+            );
+        }
+    }
 }

@@ -110,3 +110,81 @@ not claim rejection of every raw duplicate or unknown wire field and adds no raw
 request decoder. Lossless descriptor guards separately validate the exact five
 added field declarations and custom authorization options, replay the initial
 witness schema, and retain all older public/durable/private compatibility guards.
+
+## Optional manual sandbox mediation-path observation
+
+The separate ordinary observer records traffic metadata on one original,
+inspected sandbox execution path. It does not run a task or model. Its profile
+is `ordinary-sandbox-mediation-static-bearer-v1`, with evidence scope
+`original-sandbox-mediation-path/v1`. Every snapshot explicitly declares process
+writer attribution **unproven**. This is distinct from the fixed witness above;
+an unsupported writer query is never converted into a successful path proof.
+
+The trusted backend retains each original accepted stream and its authenticated
+connection generation. A private stream-owned lease is taken once before proxy
+wrapping. Stream drop revokes membership before allocation reuse and cancels the
+bridge, including after `RelayReady`. A cookie, TID, header, sandbox name or hash
+cannot supply that membership. Recovery, replacement, dropped setup, missing
+association and accounting overflow leave the original observation unqualified.
+The existing binary, route and policy checks still apply. The boundary's
+`NetworkConnected.policy_generation` placeholder is not policy evidence: actual
+supervisor authorization supplies the generation checked again at rewriting.
+
+Ordinary `Get` has two distinct modes: exact resource discovery, independent of
+any fixed ELF, and recovery of one complete original observation request. After
+an unknown `Begin`, use only the latter; do not rediscover, renew the request or
+repeat `Begin`. Narrow verified OIDC method, immutable resource and workspace
+authority are required. The baseline uses its own original install/read seal.
+Detached observations additionally require the actual original conditional
+action, hold, installed Arm and current ACK. They never fabricate a detach ACK
+for baseline or treat a revoked status, cancellation, policy denial or HTTP 503
+as expected-reference credential refusal.
+
+A fresh correlated read travels on the original supervisor channel. Core
+samples its ingress counter after receiving that read and includes pending
+stream setup and incomplete requests. Gateway checks the original session,
+configuration/readiness, resource, deadlines and known later reports at closing.
+A cached terminal N cannot qualify while N+1 is pending. This is a point-in-time
+read, not proof of quiescence through client receipt.
+
+Every bounded eligible transport and request is accounted for, including
+keepalive, streaming and nonstreaming followups. Capture ends at the fixed
+window deadline, not the first result, error or truncated stream. Native records
+actual expected-reference header rewriting, upstream application bytes, HTTP
+framing and accepted socket writes; it does not infer model completion. Stream
+mode may be `unobserved`; that never filters out the request or establishes an
+SDK retry mechanism. Loss, ambiguity, incomplete work or an exhausted event cap
+makes the whole window unqualified. The protocol's eight-event cap is not a
+retry, token or spending allowance.
+
+The Go SDK validates the distinct profile, digest domains, explicit unproven
+writer status, original request and current closing. The manual example in
+`sdk/go/examples/provider-detach-observe` offers `discover`, `begin`, `query`,
+`consume-input` and `outcome`. Supply explicit TLS CA, private narrow-grant and
+metadata files; there is no credential/environment fallback or automatic retry.
+It records an exclusive, fsynced original ledger before the only `Begin` send.
+A partial or lost write remains consumed and unknown. `consume-input` requires
+the original live open-window ACK, then durably consumes the operator's input
+allowance before the operator supplies input separately. It never supplies that
+input itself. `outcome` records a closed manual outcome without raw prompt,
+response, credential, body hash or a Native model-completion assertion.
+
+The operator must use a separately approved actual run profile and bounded
+operation authority. A profile hash or operator-session label is not approval.
+One trusted operator/session and private local files provide manual custody;
+this is not distributed exclusion or a hostile-host guarantee. Real model access
+before detachment and loss after it remain separate manual observations.
+Subsequent CNI containment, unaffected control and original cleanup require
+independent evidence.
+
+Mediation-path records do **not** prove which process wrote each request, exclude
+cross-sandbox FD delegation, or cover imported host/other-sandbox sockets and
+alternate credentialed routes. Broader sandbox causality requires actual
+configuration evidence for the dedicated sandbox and control: trusted host,
+original runtime/session, no shared control credentials or FD-capable IPC/mounts,
+no imported model sockets and no alternate real credentials or proxies. Quiet
+logs and labels are insufficient. Agent exit cannot bypass original execution
+or phase checks, permit relaunch, or adopt a replacement session. Matching
+runtime/images, actual TLS/reference injection, narrow grants, model/spending
+allocation and live enforcement remain separate qualification gates. The
+synthetic TLS/SSE client trials establish none of those live properties.
