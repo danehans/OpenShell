@@ -25,6 +25,122 @@ pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
 /// Object type string for draft policy chunk records.
 pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 
+/// Native holds are not response records and never expire with response retention.
+pub const PROVIDER_DETACH_HOLD_OBJECT_TYPE: &str = "provider_detach_hold_v1";
+pub const PROVIDER_DETACH_ACTION_OBJECT_TYPE: &str = "provider_detach_action_v1";
+/// Permanent original witness ownership; not a generic expiring mutation record.
+pub const PROVIDER_DETACH_WITNESS_OBJECT_TYPE: &str = "provider_detach_witness_v1";
+pub const PROVIDER_OBSERVATION_OBJECT_TYPE: &str = "provider_sandbox_mediation_observation_v1";
+pub const LEGACY_PROVIDER_OBSERVATION_OBJECT_TYPE: &str = "provider_ordinary_observation_v1";
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrdinaryAdmission {
+    pub schema_version: u32,
+    pub expected_snapshot_protobuf: String,
+    pub request_protobuf: String,
+    pub result_protobuf: String,
+}
+fn ordinary_admission_window(
+    row: &OrdinaryAdmission,
+    q: &openshell_core::proto::ProviderObservationRequestV1,
+    result: &openshell_core::proto::ProviderObservationResultV1,
+) -> PersistenceResult<()> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use openshell_core::provider_credentials::ordinary_observation as obs;
+    use prost::Message;
+    let bad = || PersistenceError::Decode("ordinary original snapshot binding invalid".into());
+    if row.schema_version != 1 || row.expected_snapshot_protobuf.len() > 8192 {
+        return Err(bad());
+    }
+    let bytes = STANDARD
+        .decode(&row.expected_snapshot_protobuf)
+        .map_err(|_| bad())?;
+    let expected = openshell_core::proto::ProviderObservationSnapshotV1::decode(bytes.as_slice())
+        .map_err(|_| bad())?;
+    let window = result.window.as_ref().ok_or_else(bad)?;
+    let installed = window.installed_snapshot.as_ref().ok_or_else(bad)?;
+    if !obs::valid_snapshot(&expected)
+        || window.request.as_ref() != Some(q)
+        || !obs::same_identity(&expected, installed)
+        || installed.current_ingress_sequence != window.ingress_watermark
+        || window.ingress_watermark < expected.current_ingress_sequence
+    {
+        return Err(bad());
+    }
+    Ok(())
+}
+pub fn ordinary_key(q: &openshell_core::proto::ProviderObservationRequestV1) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"openshell.provider-detach.original-observation/v1\n");
+    let authority = q.resource.as_ref().map_or("", |r| r.authority.as_str());
+    for s in [authority, &q.run_id, &q.step_id] {
+        h.update((s.len() as u64).to_be_bytes());
+        h.update(s.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Private, bounded reservation metadata. Approval and live session validation
+/// remain mandatory RPC prerequisites; persistence never creates a grant.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDetachWitnessBinding {
+    pub authority: String,
+    pub run_id: String,
+    pub action_id: String,
+    pub request_sha256: String,
+    pub profile_sha256: String,
+    pub original_action: Vec<u8>,
+    pub original_receipt: Vec<u8>,
+    pub installed_arm: Vec<u8>,
+    pub hold_generation: u64,
+    pub hold_resource_version: u64,
+    pub sandbox_resource_version: u64,
+    pub provider_resource_version: u64,
+    pub deadline_ms: i64,
+}
+
+impl ProviderDetachWitnessBinding {
+    /// Caller identity, attempt UUID and request digest cannot change ownership.
+    pub(crate) fn original_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"openshell.provider-detach.original-witness/v1\n");
+        for value in [&self.authority, &self.run_id, &self.action_id] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        format!("{:x}", hash.finalize())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDetachWitnessAdmission {
+    pub binding: ProviderDetachWitnessBinding,
+    /// Once true, neither a crash nor expiry can make this original sendable.
+    pub dispatch_claimed: bool,
+}
+
+pub struct ProviderDetachWitnessPlan {
+    pub binding: ProviderDetachWitnessBinding,
+    pub fence: ProviderDetachFence,
+}
+
+/// Internal transaction fence; never a grant, public hash or retained workload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderDetachFence(pub(super) [u8; 32]);
+
+/// Prepared metadata from the existing effective-config loader. The native RPC
+/// must acquire lifecycle ownership and bracket both projections with one fence.
+/// This plan alone confers no authority and cannot be submitted over the wire.
+pub struct ProviderDetachCommit {
+    pub action: openshell_core::proto::ProviderDetachActionV1,
+    pub fence: ProviderDetachFence,
+    pub receipt: openshell_core::proto::ProviderDetachReceiptV1,
+}
+
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
 /// Maximum number of object ids sent in one set-based delete statement.
@@ -276,6 +392,180 @@ macro_rules! store_dispatch_traced {
 }
 
 impl Store {
+    pub(crate) async fn claim_ordinary_observation(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+        fence: &ProviderDetachFence,
+        expected: &openshell_core::proto::ProviderObservationSnapshotV1,
+    ) -> PersistenceResult<bool> {
+        match self {
+            Self::Sqlite(store) => store.claim_ordinary_observation(q, fence, expected).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "ordinary observer backend unsupported".into(),
+            )),
+        }
+    }
+    pub(crate) async fn retain_ordinary_result(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+        result: &openshell_core::proto::ProviderObservationResultV1,
+    ) -> PersistenceResult<()> {
+        match self {
+            Self::Sqlite(store) => store.retain_ordinary_result(q, result).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "ordinary observer backend unsupported".into(),
+            )),
+        }
+    }
+    pub(crate) async fn ordinary_history(
+        &self,
+        q: &openshell_core::proto::ProviderObservationRequestV1,
+    ) -> PersistenceResult<Option<openshell_core::proto::ProviderObservationResultV1>> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use prost::Message;
+        let Some(row) = self
+            .get(PROVIDER_OBSERVATION_OBJECT_TYPE, &ordinary_key(q))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.payload.len() > 32768 {
+            return Err(PersistenceError::Decode("ordinary row capacity".into()));
+        }
+        let row: OrdinaryAdmission = serde_json::from_slice(&row.payload)
+            .map_err(|_| PersistenceError::Decode("ordinary row invalid".into()))?;
+        if row.request_protobuf != STANDARD.encode(q.encode_to_vec()) {
+            return Err(PersistenceError::Config(
+                "ordinary original conflict".into(),
+            ));
+        }
+        if row.result_protobuf.is_empty() {
+            return Ok(None);
+        }
+        let bytes = STANDARD
+            .decode(&row.result_protobuf)
+            .map_err(|_| PersistenceError::Decode("ordinary result invalid".into()))?;
+        let result = openshell_core::proto::ProviderObservationResultV1::decode(bytes.as_slice())
+            .map_err(|_| PersistenceError::Decode("ordinary result invalid".into()))?;
+        ordinary_admission_window(&row, q, &result)?;
+        Ok(Some(result))
+    }
+    pub(crate) async fn reject_provider_detach(
+        &self,
+        action: &openshell_core::proto::ProviderDetachActionV1,
+    ) -> PersistenceResult<openshell_core::proto::ProviderDetachOutcomeV1> {
+        match self {
+            Self::Sqlite(store) => store.reject_provider_detach(action).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn provider_detach_fence(&self) -> PersistenceResult<ProviderDetachFence> {
+        match self {
+            Self::Sqlite(store) => store.provider_detach_fence().await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
+    /// Reserve or claim under actual related-row validation in the same `SQLite`
+    /// transaction. A successful first claim alone selects one original sender.
+    pub(crate) async fn reserve_provider_detach_witness(
+        &self,
+        plan: &ProviderDetachWitnessPlan,
+        claim_dispatch: bool,
+    ) -> PersistenceResult<ProviderDetachWitnessAdmission> {
+        match self {
+            Self::Sqlite(store) => {
+                store
+                    .reserve_provider_detach_witness(plan, claim_dispatch)
+                    .await
+            }
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "provider witness backend unsupported".into(),
+            )),
+        }
+    }
+
+    /// Test-only full-binding observation. Production reads use the immutable
+    /// original key and request digest without revalidating mutable row versions.
+    #[cfg(test)]
+    pub(crate) async fn read_provider_detach_witness(
+        &self,
+        binding: &ProviderDetachWitnessBinding,
+    ) -> PersistenceResult<Option<ProviderDetachWitnessAdmission>> {
+        let Some(row) = self
+            .get(PROVIDER_DETACH_WITNESS_OBJECT_TYPE, &binding.original_key())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.payload.len() > 32 * 1024 {
+            return Err(PersistenceError::Decode("provider witness capacity".into()));
+        }
+        let admission: ProviderDetachWitnessAdmission = serde_json::from_slice(&row.payload)
+            .map_err(|_| PersistenceError::Decode("provider witness invalid".into()))?;
+        if admission.binding != *binding {
+            return Err(PersistenceError::Config(
+                "provider witness original conflict".into(),
+            ));
+        }
+        Ok(Some(admission))
+    }
+
+    pub(crate) async fn read_provider_witness_original(
+        &self,
+        original_key: &str,
+        request_sha256: &str,
+    ) -> PersistenceResult<Option<ProviderDetachWitnessAdmission>> {
+        let Some(row) = self
+            .get(PROVIDER_DETACH_WITNESS_OBJECT_TYPE, original_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.payload.len() > 32 * 1024 {
+            return Err(PersistenceError::Decode("provider witness capacity".into()));
+        }
+        let admission: ProviderDetachWitnessAdmission = serde_json::from_slice(&row.payload)
+            .map_err(|_| PersistenceError::Decode("provider witness invalid".into()))?;
+        if admission.binding.original_key() != original_key
+            || admission.binding.request_sha256 != request_sha256
+        {
+            return Err(PersistenceError::Config(
+                "provider witness original conflict".into(),
+            ));
+        }
+        Ok(Some(admission))
+    }
+
+    pub(crate) async fn commit_provider_detach(
+        &self,
+        plan: &ProviderDetachCommit,
+    ) -> PersistenceResult<openshell_core::proto::ProviderDetachOutcomeV1> {
+        match self {
+            Self::Sqlite(store) => store.commit_provider_detach(plan).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn recover_provider_detach(
+        &self,
+        action: &openshell_core::proto::ProviderDetachActionV1,
+    ) -> PersistenceResult<Option<openshell_core::proto::ProviderDetachOutcomeV1>> {
+        match self {
+            Self::Sqlite(store) => store.recover_provider_detach(action).await,
+            Self::Postgres(_) => Err(PersistenceError::Config(
+                "conditional provider detachment backend unsupported".into(),
+            )),
+        }
+    }
+
     /// Returns `true` for single-replica backends (`SQLite`) where no lease
     /// coordination is needed, `false` for multi-replica backends (`Postgres`).
     pub fn is_single_replica(&self) -> bool {

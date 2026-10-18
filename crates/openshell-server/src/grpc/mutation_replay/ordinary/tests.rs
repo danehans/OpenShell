@@ -212,6 +212,7 @@ fn non_member_request<T>(inner: T) -> Request<T> {
         .extensions_mut()
         .insert(Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: "non-member".into(),
                 display_name: None,
                 roles: Vec::new(),

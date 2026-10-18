@@ -289,8 +289,18 @@ where
     C: AsyncWrite + Unpin,
 {
     client.flush().await.into_diagnostic()?;
+    if let Some(native) =
+        openshell_core::provider_credentials::ordinary_observation::request_observation()
+    {
+        native.framing_complete();
+    }
     if close {
         client.shutdown().await.into_diagnostic()?;
+        if let Some(native) =
+            openshell_core::provider_credentials::ordinary_observation::request_observation()
+        {
+            native.close_after_response();
+        }
         Ok(RelayOutcome::Consumed)
     } else {
         Ok(RelayOutcome::Reusable)

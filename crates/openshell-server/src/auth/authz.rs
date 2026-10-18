@@ -142,10 +142,233 @@ impl AuthzPolicy {
     }
 }
 
+/// Additional grant check for the optional exact-provider-detach surface.
+/// Authentication/descriptor/workspace authorization still run independently.
+/// This deliberately refuses broad ordinary-worker credentials, even when they
+/// could administer other sandbox methods. The issuer-attested resource digest
+/// excludes mutable RV/configuration; it is not the full action target digest.
+#[allow(clippy::result_large_err)]
+pub fn check_provider_detach_grant(
+    identity: &Identity,
+    scope_enforcement: bool,
+    write: bool,
+    resource_sha256: &str,
+) -> Result<(), Status> {
+    let digest_valid = resource_sha256.len() == 64
+        && resource_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !scope_enforcement || !digest_valid || identity.subject.is_empty() {
+        return Err(Status::permission_denied(
+            "provider detach grant unavailable",
+        ));
+    }
+    let target_scope = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method_scope = if write {
+        "sandbox:provider-detach"
+    } else {
+        "sandbox:provider-detach:read"
+    };
+    let allowed = [
+        "sandbox:provider-detach",
+        "sandbox:provider-detach:read",
+        "openid",
+        "profile",
+        "email",
+    ];
+    if !identity.scopes.iter().any(|s| s == method_scope)
+        || !identity.scopes.iter().any(|s| s == &target_scope)
+        || identity
+            .scopes
+            .iter()
+            .any(|s| s != &target_scope && !allowed.contains(&s.as_str()))
+    {
+        return Err(Status::permission_denied("provider detach grant mismatch"));
+    }
+    Ok(())
+}
+
+/// Discovery discloses correlation metadata only; it never grants an invocation.
+#[allow(clippy::result_large_err)]
+pub fn check_provider_witness_metadata_grant(
+    identity: &Identity,
+    policy: &AuthzPolicy,
+    resource_sha256: &str,
+) -> Result<(), Status> {
+    let target = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method = "sandbox:provider-detach:witness:read";
+    if identity.provider != super::identity::IdentityProvider::Oidc
+        || !policy.scopes_enabled
+        || policy.admin_role.is_empty()
+        || policy.user_role.is_empty()
+        || (!policy.admin_role.is_empty() && identity.roles.contains(&policy.admin_role))
+        || (!policy.user_role.is_empty() && !identity.roles.contains(&policy.user_role))
+        || resource_sha256.len() != 64
+        || !resource_sha256
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        || !identity.scopes.iter().any(|v| v == method)
+        || !identity.scopes.contains(&target)
+        || identity.scopes.iter().any(|v| v != method && v != &target)
+    {
+        return Err(Status::permission_denied(
+            "witness metadata grant unavailable",
+        ));
+    }
+    Ok(())
+}
+
+/// Closed ordinary observer grant. This never authorizes model or task input.
+#[allow(clippy::result_large_err)]
+pub fn check_ordinary_observation_grant(
+    identity: &Identity,
+    policy: &AuthzPolicy,
+    resource_sha256: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let target = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method = if write {
+        "sandbox:provider-detach:observe"
+    } else {
+        "sandbox:provider-detach:observe:read"
+    };
+    let allowed = [
+        "sandbox:provider-detach:observe",
+        "sandbox:provider-detach:observe:read",
+        "openid",
+        "profile",
+        "email",
+    ];
+    if identity.provider != super::identity::IdentityProvider::Oidc
+        || identity.subject.is_empty()
+        || !policy.scopes_enabled
+        || policy.admin_role.is_empty()
+        || policy.user_role.is_empty()
+        || identity.roles.contains(&policy.admin_role)
+        || !identity.roles.contains(&policy.user_role)
+        || resource_sha256.len() != 64
+        || !resource_sha256
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        || !identity.scopes.contains(&target)
+        || !identity.scopes.iter().any(|s| s == method)
+        || identity
+            .scopes
+            .iter()
+            .any(|s| s != &target && !allowed.contains(&s.as_str()))
+    {
+        return Err(Status::permission_denied(
+            "ordinary observation grant mismatch",
+        ));
+    }
+    Ok(())
+}
+
+/// Closed original witness authority, additional to ordinary method/workspace
+/// authorization. A broad/admin token never substitutes for this approval.
+#[allow(clippy::result_large_err)]
+pub fn check_provider_witness_grant<'a>(
+    identity: &'a Identity,
+    policy: &AuthzPolicy,
+    write: bool,
+    resource_sha256: &str,
+    request_sha256: &str,
+    now_ms: i64,
+) -> Result<&'a super::identity::ProviderDetachWitnessApproval, Status> {
+    let bad = || Status::permission_denied("provider witness approval unavailable");
+    let approval = identity
+        .provider_detach_witness_approval
+        .as_ref()
+        .ok_or_else(bad)?;
+    let target = format!("sandbox:provider-detach:target:{resource_sha256}");
+    let method = if write {
+        "sandbox:provider-detach:witness"
+    } else {
+        "sandbox:provider-detach:witness:read"
+    };
+    let allowed = [
+        "sandbox:provider-detach:witness",
+        "sandbox:provider-detach:witness:read",
+    ];
+    if identity.provider != super::identity::IdentityProvider::Oidc
+        || !policy.scopes_enabled
+        || !approval.valid_shape(&identity.subject)
+        || (!policy.admin_role.is_empty() && identity.roles.contains(&policy.admin_role))
+        || approval.resource_sha256 != resource_sha256
+        || approval.request_sha256 != request_sha256
+        || (write && now_ms >= approval.deadline_unix_ms)
+        || !identity.scopes.iter().any(|s| s == method)
+        || !identity.scopes.contains(&target)
+        || identity
+            .scopes
+            .iter()
+            .any(|s| s != &target && !allowed.contains(&s.as_str()))
+    {
+        return Err(bad());
+    }
+    Ok(approval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::identity::IdentityProvider;
+
+    #[test]
+    fn provider_detach_grant_is_method_and_exact_target_scoped() {
+        let digest = "a".repeat(64);
+        let target = format!("sandbox:provider-detach:target:{digest}");
+        let identity = identity_with_roles_and_scopes(
+            &["openshell-user"],
+            &[
+                "sandbox:provider-detach",
+                "sandbox:provider-detach:read",
+                &target,
+                "openid",
+            ],
+        );
+        assert!(check_provider_detach_grant(&identity, true, true, &digest).is_ok());
+        assert!(check_provider_detach_grant(&identity, true, false, &digest).is_ok());
+        assert!(check_provider_detach_grant(&identity, false, true, &digest).is_err());
+        assert!(check_provider_detach_grant(&identity, true, true, &"b".repeat(64)).is_err());
+        for invalid in ["", "A", &"A".repeat(64), &"a".repeat(63)] {
+            assert!(check_provider_detach_grant(&identity, true, true, invalid).is_err());
+        }
+        let read_only =
+            identity_with_roles_and_scopes(&[], &["sandbox:provider-detach:read", &target]);
+        assert!(check_provider_detach_grant(&read_only, true, false, &digest).is_ok());
+        assert!(check_provider_detach_grant(&read_only, true, true, &digest).is_err());
+    }
+
+    #[test]
+    fn provider_detach_rejects_broad_or_unbound_grants() {
+        let digest = "a".repeat(64);
+        let target = format!("sandbox:provider-detach:target:{digest}");
+        for extra in [
+            "openshell:all",
+            "sandbox:write",
+            "sandbox:read",
+            "provider:write",
+            "sandbox:provider-detach:target:other",
+        ] {
+            let identity =
+                identity_with_roles_and_scopes(&[], &["sandbox:provider-detach", &target, extra]);
+            assert!(check_provider_detach_grant(&identity, true, true, &digest).is_err());
+        }
+        for scopes in [
+            vec!["openshell:all"],
+            vec!["sandbox:provider-detach"],
+            vec![target.as_str()],
+            vec![],
+        ] {
+            let identity = identity_with_roles_and_scopes(&[], &scopes);
+            assert!(check_provider_detach_grant(&identity, true, true, &digest).is_err());
+        }
+        let mut identity =
+            identity_with_roles_and_scopes(&[], &["sandbox:provider-detach", &target]);
+        identity.subject.clear();
+        assert!(check_provider_detach_grant(&identity, true, true, &digest).is_err());
+    }
 
     fn default_policy() -> AuthzPolicy {
         AuthzPolicy {
@@ -165,6 +388,7 @@ mod tests {
 
     fn identity_with_roles(roles: &[&str]) -> Identity {
         Identity {
+            provider_detach_witness_approval: None,
             subject: "test-user".to_string(),
             display_name: None,
             roles: roles.iter().map(|r| (*r).to_string()).collect(),
@@ -175,6 +399,7 @@ mod tests {
 
     fn identity_with_roles_and_scopes(roles: &[&str], scopes: &[&str]) -> Identity {
         Identity {
+            provider_detach_witness_approval: None,
             subject: "test-user".to_string(),
             display_name: None,
             roles: roles.iter().map(|r| (*r).to_string()).collect(),

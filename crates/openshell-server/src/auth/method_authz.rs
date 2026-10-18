@@ -198,4 +198,39 @@ mod tests {
             assert!(!is_sandbox_callable(path));
         }
     }
+    #[test]
+    fn conditional_provider_detach_requires_narrow_user_methods() {
+        for (method, scope) in [
+            ("ArmProviderDetachAttempt", "sandbox:provider-detach"),
+            (
+                "ReserveProviderDetachWitness",
+                "sandbox:provider-detach:witness",
+            ),
+            (
+                "InvokeProviderDetachWitness",
+                "sandbox:provider-detach:witness",
+            ),
+            (
+                "GetProviderDetachWitnessInvocation",
+                "sandbox:provider-detach:witness:read",
+            ),
+            (
+                "ConditionalDetachSandboxProvider",
+                "sandbox:provider-detach",
+            ),
+            (
+                "GetConditionalProviderDetachState",
+                "sandbox:provider-detach:read",
+            ),
+        ] {
+            let path = format!("/openshell.v1.OpenShell/{method}");
+            let entry = lookup(&path).unwrap();
+            assert_eq!(entry.auth_mode, AuthMode::Bearer);
+            assert_eq!(entry.scope.as_deref(), Some(scope));
+            assert_eq!(entry.workspace_role.as_deref(), Some("user"));
+            assert!(!is_sandbox_callable(&path));
+            assert!(!is_peer_callable(&path));
+            assert!(!is_unauthenticated(&path));
+        }
+    }
 }

@@ -8,6 +8,227 @@ use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
 
+// Storage-only fixtures: these do not authenticate an approval or authorize a
+// runtime send. The RPC/source/boundary gates remain independent prerequisites.
+async fn provider_witness_storage_fixture() -> (Store, super::ProviderDetachWitnessPlan) {
+    use openshell_core::proto::{
+        ProviderDetachArmRequestV1, ProviderDetachArmSealV1, ProviderDetachAttemptV1,
+    };
+    let (store, detach) = provider_detach_commit_fixture().await;
+    let result = store.commit_provider_detach(&detach).await.unwrap();
+    assert_eq!(result.state, "applied");
+    let now = super::current_time_ms();
+    let deadline = now + 60_000;
+    let arm = ProviderDetachArmSealV1 {
+        request: Some(ProviderDetachArmRequestV1 {
+            original_action: Some(detach.action.clone()),
+            original_receipt: Some(detach.receipt.clone()),
+            attempt: Some(ProviderDetachAttemptV1 {
+                deadline: openshell_core::time::timestamp_from_millis(deadline).ok(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        hold_generation: 1,
+        row_resource_version: 1,
+        install_sequence: 42,
+        installed_time: openshell_core::time::timestamp_from_millis(now).ok(),
+        ..Default::default()
+    };
+    let target = detach.action.target.as_ref().unwrap();
+    let sandbox = store
+        .get("sandbox", &target.sandbox_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let binding = super::ProviderDetachWitnessBinding {
+        authority: target.authority.clone(),
+        run_id: uuid::Uuid::new_v4().to_string(),
+        action_id: detach.action.action_id.clone(),
+        request_sha256: "a".repeat(64),
+        profile_sha256: "b".repeat(64),
+        original_action: detach.action.encode_to_vec(),
+        original_receipt: detach.receipt.encode_to_vec(),
+        installed_arm: arm.encode_to_vec(),
+        hold_generation: 1,
+        hold_resource_version: 1,
+        sandbox_resource_version: sandbox.resource_version,
+        provider_resource_version: 1,
+        deadline_ms: deadline,
+    };
+    let fence = store.provider_detach_fence().await.unwrap();
+    (store, super::ProviderDetachWitnessPlan { binding, fence })
+}
+
+#[tokio::test]
+async fn provider_witness_first_claim_is_permanent_and_duplicates_never_select_sender() {
+    let (store, plan) = provider_witness_storage_fixture().await;
+    assert!(
+        store
+            .reserve_provider_detach_witness(&plan, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .reserve_provider_detach_witness(&plan, false)
+            .await
+            .unwrap()
+            .dispatch_claimed
+    );
+    let (one, two) = tokio::join!(
+        store.reserve_provider_detach_witness(&plan, true),
+        store.reserve_provider_detach_witness(&plan, true),
+    );
+    assert_ne!(one.is_ok(), two.is_ok());
+    // Losing a commit reply supplies only readback of the original, not send
+    // authority. Reading twice or reserving again cannot reset this tombstone.
+    for _ in 0..2 {
+        assert!(
+            store
+                .read_provider_detach_witness(&plan.binding)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_claimed
+        );
+        assert!(
+            store
+                .reserve_provider_detach_witness(&plan, false)
+                .await
+                .unwrap()
+                .dispatch_claimed
+        );
+        assert!(
+            store
+                .reserve_provider_detach_witness(&plan, true)
+                .await
+                .is_err()
+        );
+    }
+    let mut changed = plan.binding.clone();
+    changed.request_sha256 = "c".repeat(64);
+    assert_eq!(changed.original_key(), plan.binding.original_key());
+    assert!(store.read_provider_detach_witness(&changed).await.is_err());
+    let id = plan.binding.original_key();
+    assert!(
+        store
+            .delete(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE, &id)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .put(
+                super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE,
+                &id,
+                &id,
+                "default",
+                b"{}",
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_all_in_workspace(super::PROVIDER_DETACH_WITNESS_OBJECT_TYPE, "default")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn provider_witness_dependency_drift_between_external_read_and_transaction_refuses_both_phases()
+ {
+    for claim in [false, true] {
+        let (store, plan) = provider_witness_storage_fixture().await;
+        if claim {
+            store
+                .reserve_provider_detach_witness(&plan, false)
+                .await
+                .unwrap();
+        }
+        // A real DB dependency changes after the external fence was captured,
+        // before the reserve/claim transaction begins.
+        store
+            .put(
+                "gateway_settings",
+                "changed",
+                "changed",
+                "",
+                b"changed",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reserve_provider_detach_witness(&plan, claim)
+                .await
+                .is_err()
+        );
+        let original = store
+            .read_provider_detach_witness(&plan.binding)
+            .await
+            .unwrap();
+        assert_eq!(
+            original.map(|v| v.dispatch_claimed),
+            if claim { Some(false) } else { None }
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_witness_actual_provider_replacement_refuses_even_with_refreshed_external_fence() {
+    let (store, mut plan) = provider_witness_storage_fixture().await;
+    store
+        .reserve_provider_detach_witness(&plan, false)
+        .await
+        .unwrap();
+    let action = openshell_core::proto::ProviderDetachActionV1::decode(
+        plan.binding.original_action.as_slice(),
+    )
+    .unwrap();
+    let target = action.target.unwrap();
+    store.delete("provider", &target.provider_id).await.unwrap();
+    let replacement = openshell_core::proto::Provider {
+        metadata: Some(ProtoObjectMeta {
+            id: "replacement".into(),
+            name: target.provider.clone(),
+            workspace: target.workspace.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store
+        .put(
+            "provider",
+            "replacement",
+            &target.provider,
+            &target.workspace,
+            &replacement.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    plan.fence = store.provider_detach_fence().await.unwrap();
+    assert!(
+        store
+            .reserve_provider_detach_witness(&plan, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .read_provider_detach_witness(&plan.binding)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_claimed
+    );
+}
+
 /// A failed store call must be visible as a failure in the trace, not as a
 /// span that merely happened to return nothing.
 #[tokio::test]
@@ -2981,5 +3202,1085 @@ async fn store_operations_export_spans_with_parents() {
         test_exporter::attribute(child, "object_type").as_deref(),
         Some("sandbox"),
         "the store span records what it queried"
+    );
+}
+
+// The native hold is independent of every client-side attach entry point.
+fn provider_held_fixture(attached: bool) -> Sandbox {
+    Sandbox {
+        metadata: Some(ProtoObjectMeta {
+            id: "sandbox-id".into(),
+            name: "agent".into(),
+            workspace: "default".into(),
+            ..Default::default()
+        }),
+        spec: Some(SandboxSpec {
+            providers: if attached {
+                vec!["model".into(), "other".into()]
+            } else {
+                vec!["other".into()]
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn provider_hold_record() -> crate::storage_proto::StoredProviderDetachHoldV1 {
+    let target = openshell_core::proto::ProviderDetachTargetV1 {
+        authority: "gateway-fixture".into(),
+        workspace: "default".into(),
+        sandbox: "agent".into(),
+        sandbox_id: "sandbox-id".into(),
+        execution_id: format!("exec-v1:{}", "a".repeat(64)),
+        sandbox_resource_version: 1,
+        provider: "model".into(),
+        provider_id: "provider-original".into(),
+        provider_resource_version: 17,
+        attachment_epoch: "epoch-original".into(),
+        configuration_fingerprint: "config-fingerprint".into(),
+        configuration_instance: "config-original".into(),
+        config_revision: 8,
+        provider_env_revision: 2,
+        native_policy_hash: "b".repeat(64),
+        native_policy_version: 3,
+    };
+    let target_sha256 = crate::grpc::provider_detach_target_digest(&target).unwrap();
+    let original_intent = openshell_core::proto::ProviderDetachOriginalIntentV1 {
+        schema_version: 1,
+        target: Some(openshell_core::proto::ProviderDetachSourceTargetV1 {
+            gateway_id: "controller-alias".into(),
+            workspace: target.workspace.clone(),
+            sandbox: target.sandbox.clone(),
+            sandbox_id: target.sandbox_id.clone(),
+            execution_id: target.execution_id.clone(),
+            runtime_handle: String::new(),
+        }),
+        event_id: "event-original".into(),
+        policy_revision: "rules-original".into(),
+        policy_hash: "c".repeat(64),
+        rule_id: "rule-original".into(),
+        detach: Some(openshell_core::proto::ProviderDetachIntentV1 {
+            schema_version: 1,
+            profile_id: "profile-original".into(),
+            violation_sha256: "e".repeat(64),
+            target: Some(target.clone()),
+            target_sha256: target_sha256.clone(),
+        }),
+    };
+    let intent_sha256 =
+        crate::grpc::provider_detach_original_intent_digest(&original_intent).unwrap();
+    let action_id = crate::grpc::provider_detach_action_id_for_digest(&intent_sha256).unwrap();
+    let action = openshell_core::proto::ProviderDetachActionV1 {
+        schema_version: 1,
+        action_id: action_id.clone(),
+        profile_id: "profile-original".into(),
+        event_id: "event-original".into(),
+        intent_sha256,
+        original_intent: Some(original_intent),
+        target: Some(target),
+        target_sha256: target_sha256.clone(),
+    };
+    let receipt = openshell_core::proto::ProviderDetachReceiptV1 {
+        action_id: action.action_id.clone(),
+        intent_sha256: action.intent_sha256.clone(),
+        target_sha256: action.target_sha256.clone(),
+        target: action.target.clone(),
+        before_attachment_epoch: "epoch-original".into(),
+        after_attachment_epoch: "epoch-detached".into(),
+        native_receipt_id: "receipt-original".into(),
+        hold_id: "hold-id".into(),
+        config_revision: 9,
+        provider_env_revision: 3,
+        configuration_instance: "config-detached".into(),
+        native_policy_hash: "d".repeat(64),
+        native_policy_version: 4,
+        recorded_time: Some(prost_types::Timestamp {
+            seconds: 1000,
+            nanos: 0,
+        }),
+    };
+    crate::storage_proto::StoredProviderDetachHoldV1 {
+        schema_version: 1,
+        sandbox_id: "sandbox-id".into(),
+        workspace: "default".into(),
+        provider: "model".into(),
+        provider_id: "provider-original".into(),
+        action_id,
+        target_sha256,
+        hold_id: "hold-id".into(),
+        generation: 1,
+        original_action: Some(action),
+        original_receipt: Some(receipt),
+        native_receipt_id: "receipt-original".into(),
+        created_time: Some(prost_types::Timestamp {
+            seconds: 1000,
+            nanos: 0,
+        }),
+    }
+}
+
+async fn seed_provider_hold(store: &Store) {
+    let held = provider_hold_record();
+    store
+        .put(
+            super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+            "hold-id",
+            "sandbox-id:model",
+            "default",
+            &held.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn provider_detach_hold_fences_all_sandbox_write_entries() {
+    use super::WriteCondition;
+    let store = test_store().await;
+    store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(false).encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    seed_provider_hold(&store).await;
+    let raw = provider_held_fixture(true).encode_to_vec();
+    let mut errors = Vec::new();
+    errors.push(
+        store
+            .put("sandbox", "sandbox-id", "agent", "default", &raw, None)
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .put_if(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &raw,
+                None,
+                WriteCondition::Unconditional,
+            )
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .put_if(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &raw,
+                None,
+                WriteCondition::MatchResourceVersion(1),
+            )
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .put_if(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &raw,
+                None,
+                WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .put_scoped(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                "scope",
+                &raw,
+                None,
+            )
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .create_scoped(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                "scope",
+                &raw,
+                None,
+            )
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .create_relaxed("sandbox", "sandbox-id", "agent", "default", &raw, None)
+            .await
+            .unwrap_err(),
+    );
+    errors.push(
+        store
+            .create_if_workspace_count_below(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &raw,
+                None,
+                100,
+            )
+            .await
+            .unwrap_err(),
+    );
+    for error in errors {
+        assert!(
+            error.to_string().contains("provider attachment held"),
+            "{error}"
+        );
+    }
+    let current = store
+        .get_message::<Sandbox>("sandbox-id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.spec.unwrap().providers, ["other"]);
+    assert_eq!(current.metadata.unwrap().resource_version, 1);
+}
+
+#[tokio::test]
+async fn provider_detach_hold_survives_outcome_retention_and_sandbox_rewrite() {
+    use super::WriteCondition;
+    let store = test_store().await;
+    store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(false).encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    seed_provider_hold(&store).await;
+    // A status/policy write preserving detached membership is still allowed.
+    let raw = provider_held_fixture(false).encode_to_vec();
+    assert_eq!(
+        store
+            .put_if(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &raw,
+                None,
+                WriteCondition::MatchResourceVersion(1)
+            )
+            .await
+            .unwrap()
+            .resource_version,
+        2
+    );
+    store
+        .put(
+            "provider_detach_action_v1",
+            "action",
+            "action",
+            "default",
+            b"metadata-only",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .delete("provider_detach_action_v1", "action")
+        .await
+        .unwrap();
+    let retained = store
+        .get(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "hold-id")
+        .await
+        .unwrap()
+        .unwrap();
+    let retained =
+        crate::storage_proto::StoredProviderDetachHoldV1::decode(retained.payload.as_slice())
+            .unwrap();
+    assert_eq!(retained, provider_hold_record());
+    assert_eq!(
+        retained
+            .original_action
+            .unwrap()
+            .target
+            .unwrap()
+            .execution_id,
+        format!("exec-v1:{}", "a".repeat(64))
+    );
+    let error = store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(true).encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider attachment held"));
+    // Even reusing the immutable ID after deletion cannot restore that attachment.
+    store.delete("sandbox", "sandbox-id").await.unwrap();
+    let error = store
+        .put_if(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(true).encode_to_vec(),
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("provider attachment held"));
+}
+
+#[tokio::test]
+async fn provider_detach_hold_rejects_name_upsert_identity_substitution() {
+    let store = test_store().await;
+    store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(false).encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    seed_provider_hold(&store).await;
+    let mut replacement = provider_held_fixture(true);
+    replacement.metadata.as_mut().unwrap().id = "replacement-id".into();
+    assert!(
+        store
+            .put(
+                "sandbox",
+                "replacement-id",
+                "agent",
+                "default",
+                &replacement.encode_to_vec(),
+                None
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed")
+    );
+    // Other sandbox IDs/names are outside this hold.
+    replacement.metadata.as_mut().unwrap().name = "other-agent".into();
+    store
+        .put(
+            "sandbox",
+            "replacement-id",
+            "other-agent",
+            "default",
+            &replacement.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn provider_detach_hold_invalid_payload_fails_closed() {
+    let store = test_store().await;
+    store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(false).encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+            "hold-id",
+            "sandbox-id:model",
+            "default",
+            b"invalid",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .put(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &provider_held_fixture(true).encode_to_vec(),
+                None
+            )
+            .await
+            .is_err()
+    );
+}
+
+// Historical/partial records and altered generations never become exemptions.
+#[tokio::test]
+async fn provider_detach_hold_missing_or_rebound_provenance_fails_closed() {
+    for case in 0..10 {
+        let store = test_store().await;
+        let mut hold = provider_hold_record();
+        match case {
+            0 => hold.original_action = None,
+            1 => hold.generation = 0,
+            2 => hold.hold_id = "another-hold".into(),
+            3 => hold.original_action.as_mut().unwrap().action_id = "other-action".into(),
+            4 => {
+                hold.original_action
+                    .as_mut()
+                    .unwrap()
+                    .target
+                    .as_mut()
+                    .unwrap()
+                    .execution_id = "other-exec".into()
+            }
+            5 => hold.original_action.as_mut().unwrap().intent_sha256.clear(),
+            6 => hold.native_receipt_id.clear(),
+            7 => hold.schema_version = 2,
+            8 => hold.original_receipt = None,
+            9 => hold.original_receipt.as_mut().unwrap().hold_id = "other-hold".into(),
+            _ => unreachable!(),
+        }
+        store
+            .put(
+                super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+                "hold-id",
+                "sandbox-id:model",
+                "default",
+                &hold.encode_to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .put(
+                    "sandbox",
+                    "sandbox-id",
+                    "agent",
+                    "default",
+                    &provider_held_fixture(false).encode_to_vec(),
+                    None
+                )
+                .await
+                .is_err(),
+            "case {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_detach_hold_generation_cannot_be_replaced_or_cleared() {
+    let store = test_store().await;
+    seed_provider_hold(&store).await;
+    let before = store
+        .get(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "hold-id")
+        .await
+        .unwrap()
+        .unwrap();
+    seed_provider_hold(&store).await; // Exact replay preserves original version.
+    let mut changed = provider_hold_record();
+    changed.original_action.as_mut().unwrap().intent_sha256 = "d".repeat(64);
+    assert!(
+        store
+            .put(
+                super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+                "hold-id",
+                "sandbox-id:model",
+                "default",
+                &changed.encode_to_vec(),
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .put(
+                super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+                "new-hold-id",
+                "sandbox-id:model",
+                "default",
+                &provider_hold_record().encode_to_vec(),
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "hold-id")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_many(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, &["hold-id".into()])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .put_if(
+                super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+                "hold-id",
+                "sandbox-id:model",
+                "default",
+                &changed.encode_to_vec(),
+                None,
+                super::WriteCondition::MatchResourceVersion(1)
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_if(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "hold-id", 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_all_in_workspace(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "default")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_by_scope(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "sandbox-id")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .delete_by_name(
+                super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+                "default",
+                "sandbox-id:model"
+            )
+            .await
+            .is_err()
+    );
+    let after = store
+        .get(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "hold-id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.payload, after.payload);
+    assert_eq!(before.resource_version, after.resource_version);
+}
+
+// Storage qualification only: effective policy/grant/lifecycle ownership remain
+// RPC prerequisites. No fake configuration is accepted as a native live proof.
+async fn provider_detach_commit_fixture() -> (Store, super::ProviderDetachCommit) {
+    let store = test_store().await;
+    let mut sandbox = provider_held_fixture(true);
+    sandbox.set_phase(openshell_core::proto::SandboxPhase::Ready as i32);
+    sandbox.spec.as_mut().unwrap().provider_attachment_epoch = "epoch-original".into();
+    let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+    identity.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+    let execution = crate::auth::sandbox_session::sandbox_execution_id(&sandbox).unwrap();
+    store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &sandbox.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    let provider = openshell_core::proto::Provider {
+        metadata: Some(ProtoObjectMeta {
+            id: "provider-original".into(),
+            name: "model".into(),
+            workspace: "default".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store
+        .put(
+            "provider",
+            "provider-original",
+            "model",
+            "default",
+            &provider.encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    let held = provider_hold_record();
+    let mut action = held.original_action.unwrap();
+    action.target.as_mut().unwrap().execution_id = execution.clone();
+    action.target.as_mut().unwrap().provider_resource_version = 1;
+    let original = action.original_intent.as_mut().unwrap();
+    original.target.as_mut().unwrap().execution_id = execution;
+    original.detach.as_mut().unwrap().target = action.target.clone();
+    action.target_sha256 =
+        crate::grpc::provider_detach_target_digest(action.target.as_ref().unwrap()).unwrap();
+    original.detach.as_mut().unwrap().target_sha256 = action.target_sha256.clone();
+    action.intent_sha256 = crate::grpc::provider_detach_original_intent_digest(original).unwrap();
+    action.action_id =
+        crate::grpc::provider_detach_action_id_for_digest(&action.intent_sha256).unwrap();
+    let mut receipt = held.original_receipt.unwrap();
+    receipt.action_id = action.action_id.clone();
+    receipt.intent_sha256 = action.intent_sha256.clone();
+    receipt.target_sha256 = action.target_sha256.clone();
+    receipt.target = action.target.clone();
+    receipt.after_attachment_epoch = uuid::Uuid::new_v4().to_string();
+    receipt.hold_id = uuid::Uuid::new_v4().to_string();
+    receipt.native_receipt_id = uuid::Uuid::new_v4().to_string();
+    let fence = store.provider_detach_fence().await.unwrap();
+    (
+        store,
+        super::ProviderDetachCommit {
+            action,
+            fence,
+            receipt,
+        },
+    )
+}
+
+#[tokio::test]
+async fn provider_detach_atomic_commit_lost_ack_recovers_without_current_lookup_or_reapply() {
+    let (store, plan) = provider_detach_commit_fixture().await;
+    assert!(
+        store
+            .recover_provider_detach(&plan.action)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The caller loses the response AFTER the actual durable transaction.
+    let original = store.commit_provider_detach(&plan).await.unwrap();
+    assert_eq!(original.state, "applied");
+    let sandbox = store
+        .get_message::<Sandbox>("sandbox-id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sandbox.metadata.as_ref().unwrap().resource_version, 2);
+    assert_eq!(
+        sandbox.phase(),
+        openshell_core::proto::SandboxPhase::Ready as i32
+    );
+    assert_eq!(sandbox.spec.as_ref().unwrap().providers, vec!["other"]);
+    assert_eq!(
+        sandbox.spec.as_ref().unwrap().provider_attachment_epoch,
+        plan.receipt.after_attachment_epoch
+    );
+    let hold = store
+        .get(
+            super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+            &plan.receipt.hold_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let hold =
+        crate::storage_proto::StoredProviderDetachHoldV1::decode(hold.payload.as_slice()).unwrap();
+    assert_eq!(hold.original_action.as_ref(), Some(&plan.action));
+    assert_eq!(hold.original_receipt.as_ref(), Some(&plan.receipt));
+    // Outcome pruning cannot erase the hold-pinned original effect lineage.
+    store
+        .delete(
+            super::PROVIDER_DETACH_ACTION_OBJECT_TYPE,
+            &plan.action.action_id,
+        )
+        .await
+        .unwrap();
+    store.delete("sandbox", "sandbox-id").await.unwrap();
+    store.delete("provider", "provider-original").await.unwrap();
+    assert_eq!(
+        store.recover_provider_detach(&plan.action).await.unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(store.commit_provider_detach(&plan).await.unwrap(), original);
+    assert!(store.get("sandbox", "sandbox-id").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn provider_detach_atomic_dependency_drift_records_stable_no_effect() {
+    let (store, mut plan) = provider_detach_commit_fixture().await;
+    let before = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+    // Raw put preserves RV but changes actual config dependency bytes.
+    store
+        .put(
+            "gateway_settings",
+            "global-setting",
+            "global",
+            "",
+            b"changed-dependency",
+            None,
+        )
+        .await
+        .unwrap();
+    let outcome = store.commit_provider_detach(&plan).await.unwrap();
+    assert_eq!(outcome.state, "rejected_no_effect");
+    assert!(outcome.receipt.is_none());
+    assert_eq!(
+        store
+            .get("sandbox", "sandbox-id")
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        before.payload
+    );
+    assert!(
+        store
+            .list(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "default", 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .delete("gateway_settings", "global-setting")
+        .await
+        .unwrap();
+    plan.fence = store.provider_detach_fence().await.unwrap();
+    assert_eq!(store.commit_provider_detach(&plan).await.unwrap(), outcome);
+    assert_eq!(
+        store.recover_provider_detach(&plan.action).await.unwrap(),
+        Some(outcome)
+    );
+}
+
+#[tokio::test]
+async fn provider_detach_atomic_hold_insert_failure_rolls_back_sandbox_and_outcome() {
+    let (store, plan) = provider_detach_commit_fixture().await;
+    let before = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+    // ID collision occurs AFTER the transaction attempts its Sandbox update.
+    store
+        .put(
+            "unrelated",
+            &plan.receipt.hold_id,
+            "collision",
+            "default",
+            b"preserve",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(store.commit_provider_detach(&plan).await.is_err());
+    let after = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+    assert_eq!(after.payload, before.payload);
+    assert_eq!(after.resource_version, before.resource_version);
+    assert!(
+        store
+            .recover_provider_detach(&plan.action)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "default", 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get("unrelated", &plan.receipt.hold_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"preserve"
+    );
+}
+
+#[tokio::test]
+async fn provider_detach_atomic_competing_actions_preserve_one_original_hold() {
+    let (store, plan) = provider_detach_commit_fixture().await;
+    let mut other_action = plan.action.clone();
+    other_action.original_intent.as_mut().unwrap().rule_id = "another-rule".into();
+    other_action.intent_sha256 = crate::grpc::provider_detach_original_intent_digest(
+        other_action.original_intent.as_ref().unwrap(),
+    )
+    .unwrap();
+    other_action.action_id =
+        crate::grpc::provider_detach_action_id_for_digest(&other_action.intent_sha256).unwrap();
+    let mut other_receipt = plan.receipt.clone();
+    other_receipt.action_id = other_action.action_id.clone();
+    other_receipt.intent_sha256 = other_action.intent_sha256.clone();
+    other_receipt.hold_id = uuid::Uuid::new_v4().to_string();
+    other_receipt.native_receipt_id = uuid::Uuid::new_v4().to_string();
+    other_receipt.after_attachment_epoch = uuid::Uuid::new_v4().to_string();
+    let other = super::ProviderDetachCommit {
+        action: other_action,
+        fence: plan.fence.clone(),
+        receipt: other_receipt,
+    };
+    let (one, two) = tokio::join!(
+        store.commit_provider_detach(&plan),
+        store.commit_provider_detach(&other)
+    );
+    let results = [one.unwrap(), two.unwrap()];
+    assert_eq!(results.iter().filter(|r| r.state == "applied").count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r.state == "rejected_no_effect")
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .list(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "default", 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .get("sandbox", "sandbox-id")
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version,
+        2
+    );
+}
+
+#[tokio::test]
+async fn provider_detach_hold_rechecks_triggered_payload_before_committing_cas_conflict() {
+    let temporary = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}",
+        temporary.path().join("held-cas.db").display()
+    );
+    let store = Store::connect(&url).await.unwrap();
+    let raw = provider_held_fixture(false).encode_to_vec();
+    store
+        .put("sandbox", "sandbox-id", "agent", "default", &raw, None)
+        .await
+        .unwrap();
+    seed_provider_hold(&store).await;
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE conflict_marker (id TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE conflict_restore (payload BLOB NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO conflict_restore(payload) VALUES(?)")
+        .bind(provider_held_fixture(true).encode_to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER restore_during_cas BEFORE UPDATE OF payload ON objects WHEN OLD.object_type='sandbox' BEGIN INSERT INTO conflict_marker(id) VALUES(OLD.id); UPDATE objects SET payload=(SELECT payload FROM conflict_restore LIMIT 1),resource_version=resource_version+1 WHERE id=OLD.id; SELECT RAISE(IGNORE); END")
+        .execute(&pool).await.unwrap();
+    assert!(
+        store
+            .put_if(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &raw,
+                None,
+                super::WriteCondition::MatchResourceVersion(1)
+            )
+            .await
+            .is_err()
+    );
+    let after = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+    assert_eq!(after.payload, raw);
+    assert_eq!(after.resource_version, 1);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM conflict_marker")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "unsafe trigger side effects must roll back");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn provider_detach_atomic_capacity_refuses_before_creating_unreadable_hold_set() {
+    let (store, plan) = provider_detach_commit_fixture().await;
+    let before = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+    for index in 0..32 {
+        let mut hold = provider_hold_record();
+        let name = format!("previous-provider-{index}");
+        let id = format!("previous-hold-{index}");
+        hold.provider = name.clone();
+        hold.hold_id = id.clone();
+        let action = hold.original_action.as_mut().unwrap();
+        action.target.as_mut().unwrap().provider = name.clone();
+        let target_hash =
+            crate::grpc::provider_detach_target_digest(action.target.as_ref().unwrap()).unwrap();
+        action.target_sha256 = target_hash.clone();
+        hold.target_sha256 = target_hash.clone();
+        let intent = action.original_intent.as_mut().unwrap();
+        intent.detach.as_mut().unwrap().target = action.target.clone();
+        intent.detach.as_mut().unwrap().target_sha256 = target_hash.clone();
+        action.intent_sha256 = crate::grpc::provider_detach_original_intent_digest(intent).unwrap();
+        action.action_id =
+            crate::grpc::provider_detach_action_id_for_digest(&action.intent_sha256).unwrap();
+        hold.action_id = action.action_id.clone();
+        let receipt = hold.original_receipt.as_mut().unwrap();
+        receipt.action_id = action.action_id.clone();
+        receipt.intent_sha256 = action.intent_sha256.clone();
+        receipt.target_sha256 = target_hash;
+        receipt.target = action.target.clone();
+        receipt.hold_id = id.clone();
+        store
+            .put(
+                super::PROVIDER_DETACH_HOLD_OBJECT_TYPE,
+                &id,
+                &format!("sandbox-id:{name}"),
+                "default",
+                &hold.encode_to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let outcome = store.commit_provider_detach(&plan).await.unwrap();
+    assert_eq!(outcome.state, "rejected_no_effect");
+    assert!(outcome.receipt.is_none());
+    let after = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+    assert_eq!(after.payload, before.payload);
+    assert_eq!(after.resource_version, before.resource_version);
+    assert_eq!(
+        store
+            .list(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "default", 100, 0)
+            .await
+            .unwrap()
+            .len(),
+        32
+    );
+}
+
+#[tokio::test]
+async fn provider_detach_hold_cas_binds_actual_row_identity() {
+    for mismatch in 0..8 {
+        let store = test_store().await;
+        store
+            .put(
+                "sandbox",
+                "sandbox-id",
+                "agent",
+                "default",
+                &provider_held_fixture(false).encode_to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        seed_provider_hold(&store).await;
+        let before = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+        let mut restored = provider_held_fixture(true);
+        if mismatch >= 2 {
+            let meta = restored.metadata.as_mut().unwrap();
+            match mismatch {
+                2 => meta.workspace = "other-workspace".into(),
+                3 | 7 => meta.name = "other-name".into(),
+                6 => meta.workspace = "other-workspace".into(),
+                _ => meta.id = "other-id".into(),
+            }
+        }
+        let result = if mismatch >= 5 {
+            store
+                .update_message_cas::<Sandbox, _>("sandbox-id", before.resource_version, |value| {
+                    *value = restored.clone();
+                })
+                .await
+                .map(|_| ())
+        } else {
+            store
+                .put_if(
+                    "sandbox",
+                    "sandbox-id",
+                    if mismatch == 1 { "other-name" } else { "agent" },
+                    if mismatch == 0 {
+                        "other-workspace"
+                    } else {
+                        "default"
+                    },
+                    &restored.encode_to_vec(),
+                    None,
+                    super::WriteCondition::MatchResourceVersion(before.resource_version),
+                )
+                .await
+                .map(|_| ())
+        };
+        assert!(
+            result.is_err(),
+            "mismatched identity case {mismatch} bypassed hold"
+        );
+        let after = store.get("sandbox", "sandbox-id").await.unwrap().unwrap();
+        assert_eq!(before.payload, after.payload);
+        assert_eq!(before.resource_version, after.resource_version);
+        assert_eq!(before.workspace, after.workspace);
+        assert_eq!(before.name, after.name);
+    }
+}
+
+#[tokio::test]
+async fn provider_detach_hold_cannot_rebind_deleted_id_to_another_workspace() {
+    let store = test_store().await;
+    store
+        .put(
+            "sandbox",
+            "sandbox-id",
+            "agent",
+            "default",
+            &provider_held_fixture(false).encode_to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+    seed_provider_hold(&store).await;
+    assert!(store.delete("sandbox", "sandbox-id").await.unwrap());
+    let mut value = provider_held_fixture(true);
+    value.metadata.as_mut().unwrap().workspace = "other-workspace".into();
+    assert!(store.put_message(&value).await.is_err());
+    assert!(store.get("sandbox", "sandbox-id").await.unwrap().is_none());
+    assert!(
+        store
+            .get(super::PROVIDER_DETACH_HOLD_OBJECT_TYPE, "hold-id")
+            .await
+            .unwrap()
+            .is_some()
     );
 }

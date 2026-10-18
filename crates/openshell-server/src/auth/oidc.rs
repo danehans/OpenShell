@@ -501,6 +501,10 @@ fn parse_jwk(key: &JwkKey) -> Result<(String, DecodingKey, Algorithm), SkipReaso
 #[derive(Debug, Deserialize)]
 pub struct OidcClaims {
     pub sub: String,
+    /// Typed before the flattened ordinary claims: duplicate/unknown nested
+    /// approval fields refuse during authenticated JWT decoding.
+    #[serde(default)]
+    pub provider_detach_witness_approval: Option<super::identity::ProviderDetachWitnessApproval>,
     #[serde(default)]
     pub preferred_username: Option<String>,
     #[serde(default)]
@@ -858,12 +862,21 @@ impl JwksCache {
             claims.extract_scopes(&self.config.scopes_claim)
         };
 
+        if claims
+            .provider_detach_witness_approval
+            .as_ref()
+            .is_some_and(|approval| !approval.valid_shape(&claims.sub))
+        {
+            return Err(Status::unauthenticated("provider witness approval invalid"));
+        }
+
         Ok(Identity {
             subject: claims.sub,
             display_name: claims.preferred_username,
             roles: claims.roles,
             scopes,
             provider: IdentityProvider::Oidc,
+            provider_detach_witness_approval: claims.provider_detach_witness_approval.map(Box::new),
         })
     }
 }
@@ -1456,6 +1469,71 @@ mod tests {
         assert_eq!(identity.roles, vec!["openshell-user".to_owned()]);
         assert_eq!(identity.scopes, vec!["sandbox:write".to_owned()]);
         assert_eq!(identity.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn signed_witness_approval_retains_closed_original_only_after_jwt_validation() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut claims = claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600);
+        claims["provider_detach_witness_approval"] = serde_json::json!({
+            "schema":"openshell.provider-detach.witness-approval/v1","subject":"user-42",
+            "run_id":id,"action_id":id,"native_receipt_id":id,"hold_id":id,"attempt_id":id,
+            "installed_arm_sha256":"a".repeat(64),"profile_sha256":"b".repeat(64),"request_sha256":"c".repeat(64),"resource_sha256":"d".repeat(64),
+            "deadline_unix_ms":(now_secs()+30)*1000,"count":1
+        });
+        let original = cache
+            .validate_token(&mint_rs256(&claims, TEST_KID))
+            .await
+            .unwrap();
+        assert_eq!(
+            original.provider_detach_witness_approval.unwrap().run_id,
+            id
+        );
+        for mutation in ["count", "subject", "unknown", "missing"] {
+            let mut altered = claims.clone();
+            let approval = altered["provider_detach_witness_approval"]
+                .as_object_mut()
+                .unwrap();
+            match mutation {
+                "count" => {
+                    approval.insert("count".into(), serde_json::json!(2));
+                }
+                "subject" => {
+                    approval.insert("subject".into(), serde_json::json!("other"));
+                }
+                "unknown" => {
+                    approval.insert("unreviewed_grant".into(), serde_json::json!(true));
+                }
+                _ => {
+                    approval.remove("profile_sha256");
+                }
+            }
+            assert!(
+                cache
+                    .validate_token(&mint_rs256(&altered, TEST_KID))
+                    .await
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        let mut wrong_issuer = claims.clone();
+        wrong_issuer["iss"] = serde_json::json!("https://other.invalid");
+        assert!(
+            cache
+                .validate_token(&mint_rs256(&wrong_issuer, TEST_KID))
+                .await
+                .is_err()
+        );
+        let mut wrong_audience = claims;
+        wrong_audience["aud"] = serde_json::json!("other-audience");
+        assert!(
+            cache
+                .validate_token(&mint_rs256(&wrong_audience, TEST_KID))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

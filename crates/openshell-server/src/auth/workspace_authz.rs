@@ -272,6 +272,7 @@ mod tests {
     fn user_principal(subject: &str, roles: &[&str]) -> Principal {
         Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: subject.to_string(),
                 display_name: None,
                 roles: roles.iter().map(|r| (*r).to_string()).collect(),

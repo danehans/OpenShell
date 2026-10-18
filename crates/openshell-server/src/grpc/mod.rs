@@ -8,6 +8,18 @@ mod auth_rpc;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
+pub mod provider_detach;
+pub mod provider_detach_invocation;
+pub mod provider_detach_observation;
+#[cfg(test)]
+pub use provider_detach::{
+    action_id_for_digest as provider_detach_action_id_for_digest,
+    original_intent_digest as provider_detach_original_intent_digest,
+};
+pub use provider_detach::{
+    target_digest as provider_detach_target_digest,
+    validate_original_action as validate_provider_detach_original_action,
+};
 pub mod provider_readiness;
 mod sandbox;
 pub use sandbox::mint_persisted_authentication;
@@ -380,6 +392,65 @@ impl OpenShell for OpenShellService {
         request: Request<AttachSandboxProviderRequest>,
     ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn conditional_detach_sandbox_provider(
+        &self,
+        request: Request<openshell_core::proto::ConditionalDetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::ConditionalDetachSandboxProviderResponse>, Status>
+    {
+        provider_detach::conditional_detach(&self.state, request).await
+    }
+
+    async fn arm_provider_detach_attempt(
+        &self,
+        request: Request<openshell_core::proto::ArmProviderDetachAttemptRequest>,
+    ) -> Result<Response<openshell_core::proto::ArmProviderDetachAttemptResponse>, Status> {
+        provider_detach::arm_attempt(&self.state, request).await
+    }
+
+    async fn reserve_provider_detach_witness(
+        &self,
+        request: Request<openshell_core::proto::ReserveProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReserveProviderDetachWitnessResponse>, Status> {
+        provider_detach_invocation::reserve(&self.state, request).await
+    }
+
+    async fn invoke_provider_detach_witness(
+        &self,
+        request: Request<openshell_core::proto::InvokeProviderDetachWitnessRequest>,
+    ) -> Result<Response<openshell_core::proto::InvokeProviderDetachWitnessResponse>, Status> {
+        provider_detach_invocation::invoke(&self.state, request).await
+    }
+
+    async fn get_provider_detach_witness_invocation(
+        &self,
+        request: Request<openshell_core::proto::GetProviderDetachWitnessInvocationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderDetachWitnessInvocationResponse>, Status>
+    {
+        provider_detach_invocation::query(&self.state, request).await
+    }
+
+    async fn begin_provider_detach_observation(
+        &self,
+        request: Request<openshell_core::proto::BeginProviderDetachObservationRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginProviderDetachObservationResponse>, Status>
+    {
+        Box::pin(provider_detach_observation::begin(&self.state, request)).await
+    }
+    async fn get_provider_detach_observation(
+        &self,
+        request: Request<openshell_core::proto::GetProviderDetachObservationRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderDetachObservationResponse>, Status> {
+        Box::pin(provider_detach_observation::get(&self.state, request)).await
+    }
+
+    async fn get_conditional_provider_detach_state(
+        &self,
+        request: Request<openshell_core::proto::GetConditionalProviderDetachStateRequest>,
+    ) -> Result<Response<openshell_core::proto::GetConditionalProviderDetachStateResponse>, Status>
+    {
+        provider_detach::read_state(&self.state, request).await
     }
 
     async fn detach_sandbox_provider(
@@ -1004,6 +1075,7 @@ pub mod test_support {
         let mut req = Request::new(inner);
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: "dev-user".to_string(),
                 display_name: None,
                 roles: vec!["openshell-admin".to_string(), "openshell-user".to_string()],

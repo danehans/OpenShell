@@ -25,6 +25,124 @@ use openshell_isolation_interface::contract::{
     BoundarySignal, BoundaryTerminal, ExecSession, ExecSpec,
 };
 
+/// This feature is disabled unless the reviewed build embeds the actual
+/// immutable static Linux artifact digest. Runtime environment cannot select it.
+#[cfg(target_os = "linux")]
+pub(crate) fn fixed_witness_profile() -> Option<String> {
+    openshell_core::provider_credentials::fixed_provider_witness_profile()
+}
+
+#[cfg(target_os = "linux")]
+fn immutable_witness_artifact() -> Result<std::fs::File, BackendError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let bad = || BackendError::Unavailable("fixed witness immutable artifact unavailable".into());
+    fixed_witness_profile().ok_or_else(bad)?;
+    let mut original = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/opt/openshell/provider-detach-witness-v1")
+        .map_err(|_| bad())?;
+    let before = original.metadata().map_err(|_| bad())?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != 0
+        || before.mode() & 0o022 != 0
+        || before.len() > 8 * 1024 * 1024
+    {
+        return Err(bad());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).map_err(|_| bad())?);
+    std::io::Read::by_ref(&mut original)
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| bad())?;
+    let after = original.metadata().map_err(|_| bad())?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || bytes.len() as u64 != before.len()
+        || format!("{:x}", Sha256::digest(&bytes))
+            != openshell_core::provider_credentials::fixed_provider_witness_artifact_sha256()
+                .unwrap_or("")
+        || !static_native_elf(&bytes)
+    {
+        return Err(bad());
+    }
+    // A retained sealed copy is what exec consumes; never hash then re-open a
+    // mutable path. No script/interpreter/dynamic-loader expansion is admitted.
+    #[allow(unsafe_code)]
+    let raw = unsafe {
+        libc::memfd_create(
+            c"openshell-fixed-witness".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw < 0 {
+        return Err(bad());
+    }
+    #[allow(unsafe_code)]
+    let mut sealed = unsafe { std::fs::File::from_raw_fd(raw) };
+    sealed.write_all(&bytes).map_err(|_| bad())?;
+    sealed.seek(SeekFrom::Start(0)).map_err(|_| bad())?;
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::fcntl(
+            raw,
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL,
+        )
+    };
+    if result < 0 {
+        return Err(bad());
+    }
+    Ok(sealed)
+}
+
+#[cfg(target_os = "linux")]
+fn static_native_elf(bytes: &[u8]) -> bool {
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 || bytes[5] != 1 {
+        return false;
+    }
+    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    if machine
+        != if cfg!(target_arch = "aarch64") {
+            183
+        } else if cfg!(target_arch = "x86_64") {
+            62
+        } else {
+            return false;
+        }
+    {
+        return false;
+    }
+    let offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+    let size = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as u64;
+    let count = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as u64;
+    if size < 56 || count == 0 || count > 128 {
+        return false;
+    }
+    let Some(end) = count.checked_mul(size).and_then(|v| offset.checked_add(v)) else {
+        return false;
+    };
+    if end > bytes.len() as u64 {
+        return false;
+    }
+    for i in 0..count {
+        let o = (offset + i * size) as usize;
+        if u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) == 3 {
+            return false;
+        }
+    }
+    true
+}
+
 /// The sandbox executor. Every spawn reuses the same admitted policy and
 /// execution-environment controls while taking a fresh provider credential
 /// snapshot.
@@ -63,6 +181,99 @@ impl LocalBoundaryExec {
             #[cfg(target_os = "linux")]
             launcher,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fixed_witness_artifact_available(&self) -> bool {
+        immutable_witness_artifact().is_ok()
+    }
+
+    /// Exactly one compiled immutable profile; callers cannot supply command,
+    /// environment, stdin, workdir, PTY, helper or provider-secret material.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spawn_fixed_witness(&self, deadline_ms: i64) -> Result<(), BackendError> {
+        let artifact = immutable_witness_artifact()?;
+        let mut command = Command::new(format!("/proc/self/fd/{}", artifact.as_raw_fd()));
+        command
+            .arg("--provider-detach-benign-witness-v1")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let prepared = self.prepare_sandbox(None)?;
+        let child_hardening =
+            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|_| {
+                    BackendError::Unavailable("fixed witness hardening unavailable".into())
+                })?;
+        crate::pty::install_dedicated_process_group(&mut command);
+        crate::pty::install_pre_exec_no_pty(
+            &mut command,
+            self.policy.clone(),
+            None,
+            prepared,
+            child_hardening,
+        )
+        .map_err(|_| BackendError::Unavailable("fixed witness confinement unavailable".into()))?;
+        let mut registry = crate::managed_children::lock();
+        let child = self
+            .launcher
+            .execute(move || {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)?
+                    .as_millis();
+                if i128::try_from(now).unwrap_or(i128::MAX) >= i128::from(deadline_ms) {
+                    return Err(std::io::Error::other("original witness expired"));
+                }
+                let _keep_original = artifact;
+                command.spawn()
+            })
+            .map_err(|_| BackendError::Unavailable("fixed witness launch unavailable".into()))?
+            .map_err(|_| {
+                BackendError::Unavailable("fixed witness original start unknown".into())
+            })?;
+        let pid = child.id();
+        let terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal_lock = Arc::new(std::sync::Mutex::new(()));
+        if let Err(error) =
+            self.runtime
+                .register_process_group(pid, terminal.clone(), signal_lock.clone())
+        {
+            let mut child = child;
+            let _ = killpg(
+                Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX)),
+                Signal::SIGKILL,
+            );
+            let _ = child.wait();
+            return Err(error);
+        }
+        let managed = registry.register(pid);
+        drop(registry);
+        let process = Arc::new(LocalExecProcess::new(
+            child,
+            pid,
+            self.runtime.clone(),
+            terminal,
+            signal_lock,
+            managed,
+        ));
+        tokio::spawn(async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(u128::MAX, |d| d.as_millis());
+            let remaining =
+                u64::try_from(i128::from(deadline_ms) - i128::try_from(now).unwrap_or(i128::MAX))
+                    .unwrap_or(0);
+            if tokio::time::timeout(std::time::Duration::from_millis(remaining), process.wait())
+                .await
+                .is_err()
+            {
+                let _ = process.signal(BoundarySignal::Kill).await;
+                let _ = process.wait().await;
+            }
+        });
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

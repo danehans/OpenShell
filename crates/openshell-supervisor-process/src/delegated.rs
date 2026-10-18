@@ -87,6 +87,7 @@ pub async fn start_boundary_access(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    witness_control: Option<Arc<dyn crate::supervisor_session::ProviderWitnessControl>>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
@@ -166,6 +167,7 @@ pub async fn start_boundary_access(
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
                     session_id_updates: supervisor_session_updates,
+                    witness_control,
                 },
             );
             // Session establishment retries through gateway restarts. The

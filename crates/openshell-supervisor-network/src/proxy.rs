@@ -67,6 +67,7 @@ type AcceptedProxyConnection = (
 );
 
 struct TransparentOpen {
+    observation: Option<openshell_core::provider_credentials::ordinary_observation::PathLease>,
     destination: SocketAddr,
     authorization: Option<(EgressDecision, destination::UpstreamConnector)>,
 }
@@ -429,6 +430,19 @@ impl ProxyHandle {
                             accepts.push(async move { source.accept_tcp().await }.boxed());
                             match pending {
                                 Ok(connection) => {
+                                    let observation = if let Some(boundary) = provider_credentials.as_ref().and_then(ProviderCredentialState::observation_boundary) {
+                                        let streams = boundary.streams();
+                                        let lease = streams.take(&connection.stream, connection.socket.socket_cookie);
+                                        if lease.is_none() && streams.observing() {
+                                            // An active original may not continue an unassociated setup.
+                                            // Drop the real boxed owner BEFORE route evaluation; its Drop
+                                            // cancels the bridge/decision and releases the original permit.
+                                            streams.invalidate();
+                                            drop(connection);
+                                            continue;
+                                        }
+                                        lease
+                                    } else { None };
                                     let tx = preauthorized_tx.clone();
                                     let dns_store = policy_dns_store.clone();
                                     let opa = opa_engine.clone();
@@ -438,7 +452,7 @@ impl ProxyHandle {
                                     let dtx = denial_tx.clone();
                                     let has_policy_local = policy_local_ctx.is_some();
                                     tokio::spawn(async move {
-                                        if let Some(connection) = preauthorize_transparent_open(
+                                        if let Some(connection) = preauthorize_transparent_open_observed(
                                             connection,
                                             dns_store.as_ref(),
                                             &opa,
@@ -447,6 +461,7 @@ impl ProxyHandle {
                                             trusted_gateway,
                                             has_policy_local,
                                             dtx.as_ref(),
+                                            observation,
                                         )
                                         .await
                                         {
@@ -511,9 +526,13 @@ impl ProxyHandle {
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
+                        let observation = transparent_destination
+                            .as_ref()
+                            .and_then(|v| v.observation.clone());
+                        let observation_credentials = credentials.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
-                            if let Err(err) = handle_mediated_connection(
+                            if let Err(err) = openshell_core::provider_credentials::ordinary_observation::on_connection(observation_credentials, observation, handle_mediated_connection(
                                 tokio::io::BufReader::new(stream),
                                 supplied_identity,
                                 socket_addrs,
@@ -534,7 +553,7 @@ impl ProxyHandle {
                                 dtx,
                                 atx,
                                 endpoint_observations,
-                            )
+                            ))
                             .await
                             {
                                 ocsf_emit!(build_proxy_connection_error_event(
@@ -586,6 +605,7 @@ impl ProxyHandle {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn preauthorize_transparent_open(
     connection: PendingTcpOpen,
@@ -596,6 +616,32 @@ async fn preauthorize_transparent_open(
     trusted_host_gateway: Option<IpAddr>,
     has_policy_local: bool,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+) -> Option<AcceptedProxyConnection> {
+    preauthorize_transparent_open_observed(
+        connection,
+        policy_dns_store,
+        opa_engine,
+        identity_cache,
+        backend_host_gateway,
+        trusted_host_gateway,
+        has_policy_local,
+        denial_tx,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preauthorize_transparent_open_observed(
+    connection: PendingTcpOpen,
+    policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
+    opa_engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    backend_host_gateway: Option<IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
+    has_policy_local: bool,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    observation: Option<openshell_core::provider_credentials::ordinary_observation::PathLease>,
 ) -> Option<AcceptedProxyConnection> {
     let PendingTcpOpen {
         stream,
@@ -634,6 +680,7 @@ async fn preauthorize_transparent_open(
             Some(binary_identity),
             None,
             Some(TransparentOpen {
+                observation: observation.clone(),
                 destination,
                 authorization: None,
             }),
@@ -683,6 +730,7 @@ async fn preauthorize_transparent_open(
             Some(binary_identity),
             None,
             Some(TransparentOpen {
+                observation: observation.clone(),
                 destination,
                 authorization: None,
             }),
@@ -835,6 +883,13 @@ async fn preauthorize_transparent_open(
             return None;
         }
     };
+    if let Some(lease) = &observation {
+        // A stale/unknown authorization poisons evidence while preserving the
+        // independently enforced normal policy outcome.
+        let generation = (opa_engine.current_generation() == decision.policy_generation)
+            .then_some(decision.policy_generation);
+        let _ = lease.authorized(generation);
+    }
     if completion.send(TcpOpenDecision::RelayReady).is_err() {
         return None;
     }
@@ -843,6 +898,7 @@ async fn preauthorize_transparent_open(
         Some(binary_identity),
         None,
         Some(TransparentOpen {
+            observation: observation.clone(),
             destination,
             authorization: Some((decision, connector)),
         }),
@@ -2381,14 +2437,15 @@ fn virtual_connect_stream(
     let (handler, bridge) = tokio::io::duplex(64 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
     let (mut workload_read, mut workload_write) = tokio::io::split(workload);
-    tokio::spawn(async move {
+    let request_bridge = tokio::spawn(async move {
         let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
         if bridge_write.write_all(request.as_bytes()).await.is_ok() {
             let _ = tokio::io::copy(&mut workload_read, &mut bridge_write).await;
         }
         let _ = bridge_write.shutdown().await;
     });
-    tokio::spawn(async move {
+    let (response_finished_tx, response_finished) = tokio::sync::oneshot::channel();
+    let response_bridge = tokio::spawn(async move {
         let mut header = Vec::with_capacity(256);
         let mut byte = [0_u8; 1];
         while header.len() < MAX_HEADER_BYTES {
@@ -2406,8 +2463,69 @@ fn virtual_connect_stream(
         }
         let _ = tokio::io::copy(&mut bridge_read, &mut workload_write).await;
         let _ = workload_write.shutdown().await;
+        let _ = response_finished_tx.send(());
     });
-    Box::new(handler)
+    Box::new(VirtualConnectStream {
+        stream: handler,
+        response_finished,
+        bridges: [
+            request_bridge.abort_handle(),
+            response_bridge.abort_handle(),
+        ],
+    })
+}
+
+// Own both helper tasks. Dropping a wrapped/TLS connection must cancel the
+// original stream even if its workload peer never supplies EOF.
+struct VirtualConnectStream {
+    stream: tokio::io::DuplexStream,
+    response_finished: tokio::sync::oneshot::Receiver<()>,
+    bridges: [tokio::task::AbortHandle; 2],
+}
+impl Drop for VirtualConnectStream {
+    fn drop(&mut self) {
+        for task in &self.bridges {
+            task.abort();
+        }
+    }
+}
+impl TokioAsyncRead for VirtualConnectStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+impl TokioAsyncWrite for VirtualConnectStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match std::pin::Pin::new(&mut self.stream).poll_shutdown(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                // Normal shutdown drains bytes accepted by the virtual stream
+                // before Drop aborts its tasks. Cancellation still drops/aborts
+                // immediately, without waiting for a workload to provide EOF.
+                Future::poll(std::pin::Pin::new(&mut self.response_finished), cx).map(|_| Ok(()))
+            }
+            other => other,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7547,6 +7665,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 None,
                 None,
                 transparent.then(|| TransparentOpen {
+                    observation: None,
                     destination: openshell_core::google_cloud::METADATA_LOOPBACK_ADDR
                         .parse()
                         .unwrap(),
@@ -8002,6 +8121,36 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn ordinary_virtual_connect_normal_shutdown_drains_before_drop_cancels() {
+        let (stream, mut workload) = tokio::io::duplex(1024);
+        let mut virtual_stream =
+            virtual_connect_stream(Box::new(stream), "example.test:443".into());
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(virtual_stream.read_u8().await.unwrap());
+        }
+        assert!(header.starts_with(b"CONNECT example.test:443 "));
+        virtual_stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\npreserved-response")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), virtual_stream.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(virtual_stream);
+        let mut delivered = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            workload.read_to_end(&mut delivered),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(delivered, b"preserved-response");
+    }
+
+    #[tokio::test]
     async fn mediated_connect_keeps_workload_bytes_read_with_the_synthesized_header() {
         let Some(upstream_ip) = non_loopback_test_ipv4() else {
             eprintln!("skipping: no routable non-loopback IPv4 test address");
@@ -8089,7 +8238,7 @@ network_policies:
             .await
             .unwrap();
         workload.shutdown().await.unwrap();
-        let handler = tokio::spawn(handle_mediated_connection(
+        let mut handler = tokio::spawn(handle_mediated_connection(
             tokio::io::BufReader::new(stream),
             supplied_identity,
             socket_addrs,
@@ -8111,10 +8260,10 @@ network_policies:
             None,
             None,
         ));
-        let request = tokio::time::timeout(std::time::Duration::from_secs(5), request_rx)
-            .await
-            .expect("upstream never received the workload's request")
-            .unwrap();
+        let request = tokio::select! {
+            result = &mut handler => panic!("handler ended before forwarding workload request: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), request_rx) => result.expect("upstream never received the workload's request").unwrap(),
+        };
         assert!(
             request.starts_with(b"GET /ping HTTP/1.1\r\n"),
             "upstream received {:?} instead of the workload's request",

@@ -16,11 +16,41 @@ const RUNTIME_FROZEN: u8 = 1;
 const RUNTIME_TERMINATED: u8 = 2;
 const RUNTIME_ENFORCEMENT_LOST: u8 = 3;
 
+use openshell_core::provider_credentials::{
+    WitnessCommittedPermit, WitnessOperation, WitnessSourceFence,
+};
+
+struct WitnessTicket {
+    operation: WitnessOperation,
+    consumed: bool,
+}
+struct WitnessBoundaryLedger {
+    incarnation: String,
+    source: Option<(String, String)>,
+    fence_epoch: u64,
+    disabled: bool,
+    last_time: i64,
+    originals: HashMap<String, WitnessTicket>,
+}
+impl WitnessBoundaryLedger {
+    fn new() -> Self {
+        Self {
+            incarnation: uuid::Uuid::new_v4().to_string(),
+            source: None,
+            fence_epoch: 0,
+            disabled: false,
+            last_time: 0,
+            originals: HashMap::new(),
+        }
+    }
+}
+
 /// Shared liveness and child-process ownership for one active boundary.
 pub struct BoundaryRuntimeState {
     state: AtomicU8,
     process_groups: Mutex<HashMap<u32, RegisteredProcessGroup>>,
     exclusive_pid_namespace: bool,
+    witness: Mutex<WitnessBoundaryLedger>,
 }
 
 impl BoundaryRuntimeState {
@@ -30,6 +60,7 @@ impl BoundaryRuntimeState {
             state: AtomicU8::new(RUNTIME_ACTIVE),
             process_groups: Mutex::new(HashMap::new()),
             exclusive_pid_namespace: false,
+            witness: Mutex::new(WitnessBoundaryLedger::new()),
         })
     }
 
@@ -40,7 +71,168 @@ impl BoundaryRuntimeState {
             state: AtomicU8::new(RUNTIME_ACTIVE),
             process_groups: Mutex::new(HashMap::new()),
             exclusive_pid_namespace: true,
+            witness: Mutex::new(WitnessBoundaryLedger::new()),
         })
+    }
+
+    pub fn witness_incarnation(&self) -> Option<String> {
+        let ledger = self.witness.lock().ok()?;
+        (!ledger.disabled && self.is_active()).then(|| ledger.incarnation.clone())
+    }
+    /// PREPARE is metadata-only. It cannot start any process and never evicts
+    /// original entries, including after their immutable deadlines expire.
+    pub fn prepare_witness(
+        &self,
+        mut operation: WitnessOperation,
+        now: i64,
+        profile: &str,
+        execution: &str,
+    ) -> Option<WitnessOperation> {
+        let mut ledger = self.witness.lock().ok()?;
+        ledger.last_time = ledger.last_time.max(now);
+        if ledger.disabled
+            || !self.is_active()
+            || operation.boundary_incarnation != ledger.incarnation
+            || operation.profile_sha256 != profile
+            || operation.execution_id != execution
+            || !operation.prepared_ticket.is_empty()
+            || operation.deadline_unix_ms <= ledger.last_time
+            || operation.prepared_source_epoch == 0
+            || operation.prepared_source_epoch <= ledger.fence_epoch
+            || operation.arm_request.len() > 8192
+            || ledger.originals.len() >= 16
+            || ledger.originals.contains_key(&operation.original_key)
+        {
+            return None;
+        }
+        let uuid =
+            |s: &str| uuid::Uuid::parse_str(s).is_ok_and(|v| !v.is_nil() && v.to_string() == s);
+        let digest = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !uuid(&operation.prepared_source_incarnation)
+            || !uuid(&operation.supervisor_session)
+            || [
+                &operation.original_key,
+                &operation.request_sha256,
+                &operation.profile_sha256,
+                &operation.installed_arm_sha256,
+            ]
+            .into_iter()
+            .any(|v| !digest(v))
+        {
+            return None;
+        }
+        let source = (
+            operation.prepared_source_incarnation.clone(),
+            operation.supervisor_session.clone(),
+        );
+        match &ledger.source {
+            Some(original) if original != &source => return None,
+            None => ledger.source = Some(source),
+            _ => {}
+        }
+        operation.prepared_ticket = uuid::Uuid::new_v4().to_string();
+        ledger.originals.insert(
+            operation.original_key.clone(),
+            WitnessTicket {
+                operation: operation.clone(),
+                consumed: false,
+            },
+        );
+        Some(operation)
+    }
+    /// The local linearization gate covers final checks, consumption, actual
+    /// nonPTY spawn AND registration. Any failure consumes this original.
+    pub fn consume_witness_with(
+        &self,
+        permit: &WitnessCommittedPermit,
+        now: i64,
+        profile: &str,
+        execution: &str,
+        spawn_and_register: impl FnOnce() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let bad = || BackendError::Unavailable("witness original refused or unknown".into());
+        let mut ledger = self.witness.lock().map_err(|_| bad())?;
+        ledger.last_time = ledger.last_time.max(now);
+        let op = &permit.operation;
+        if ledger.disabled
+            || !self.is_active()
+            || op.boundary_incarnation != ledger.incarnation
+            || op.profile_sha256 != profile
+            || op.execution_id != execution
+            || op.deadline_unix_ms <= ledger.last_time
+            || permit.source_incarnation != op.prepared_source_incarnation
+            || permit.source_epoch != op.prepared_source_epoch
+            || permit.source_epoch <= ledger.fence_epoch
+            || !uuid::Uuid::parse_str(&permit.permit_id)
+                .is_ok_and(|id| !id.is_nil() && id.to_string() == permit.permit_id)
+        {
+            return Err(bad());
+        }
+        let ticket = ledger.originals.get_mut(&op.original_key).ok_or_else(bad)?;
+        if ticket.consumed || ticket.operation != *op {
+            return Err(bad());
+        }
+        ticket.consumed = true;
+        spawn_and_register()
+    }
+    /// Notification received under the SAME gate as consumption/spawn. A sent
+    /// signal is not quiescence; final process observation remains separate.
+    pub fn fence_witness(&self, fence: &WitnessSourceFence) -> Result<bool, BackendError> {
+        let mut ledger = self
+            .witness
+            .lock()
+            .map_err(|_| BackendError::Unavailable("witness gate poisoned".into()))?;
+        if ledger
+            .source
+            .as_ref()
+            .is_none_or(|s| s.0 != fence.source_incarnation)
+        {
+            return Err(BackendError::Unavailable(
+                "witness source incarnation unavailable".into(),
+            ));
+        }
+        ledger.fence_epoch = ledger.fence_epoch.max(fence.epoch);
+        if fence.disabled {
+            ledger.disabled = true;
+        }
+        for ticket in ledger.originals.values_mut() {
+            if ticket.operation.prepared_source_epoch <= fence.epoch {
+                ticket.consumed = true;
+            }
+        }
+        // Owned processes include the witness and canonical workload. Existing
+        // conservative lifecycle freeze is used; never guess a PID by name.
+        self.state.store(RUNTIME_FROZEN, Ordering::Release);
+        self.signal_registered_processes(nix::sys::signal::Signal::SIGSTOP);
+        Ok(false)
+    }
+    pub fn with_witness_configuration_change<T>(
+        &self,
+        change: impl FnOnce() -> T,
+    ) -> Result<T, BackendError> {
+        let mut ledger = self
+            .witness
+            .lock()
+            .map_err(|_| BackendError::Unavailable("witness configuration gate poisoned".into()))?;
+        if !ledger.originals.is_empty() {
+            ledger.disabled = true;
+            for ticket in ledger.originals.values_mut() {
+                ticket.consumed = true;
+            }
+        }
+        Ok(change())
+    }
+    pub fn invalidate_witness(&self) {
+        if let Ok(mut ledger) = self.witness.lock() {
+            ledger.disabled = true;
+            for ticket in ledger.originals.values_mut() {
+                ticket.consumed = true;
+            }
+        }
     }
 
     #[must_use]
@@ -111,6 +303,14 @@ impl BoundaryRuntimeState {
 
     /// End the boundary and terminate every registered workload process group.
     pub fn deactivate(&self) {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         let previous = self.state.swap(RUNTIME_TERMINATED, Ordering::AcqRel);
         if matches!(previous, RUNTIME_ACTIVE | RUNTIME_FROZEN) {
             self.signal_registered_processes(nix::sys::signal::Signal::SIGCONT);
@@ -124,6 +324,14 @@ impl BoundaryRuntimeState {
     /// process groups include the canonical workload and every sandbox exec.
     #[must_use]
     pub fn freeze(&self) -> bool {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         if self
             .state
             .compare_exchange(
@@ -144,6 +352,14 @@ impl BoundaryRuntimeState {
     /// authenticated, attached, and reconfirmed the boundary.
     #[must_use]
     pub fn resume(&self) -> bool {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         if self
             .state
             .compare_exchange(
@@ -165,6 +381,14 @@ impl BoundaryRuntimeState {
     /// ordinary shutdown handlers.
     #[must_use]
     pub fn begin_enforcement_loss_termination(&self) -> bool {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         if self
             .state
             .compare_exchange(
@@ -185,6 +409,14 @@ impl BoundaryRuntimeState {
     /// Begin an authenticated, graceful boundary shutdown.
     #[must_use]
     pub fn begin_termination(&self) -> bool {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         loop {
             let state = self.state.load(Ordering::Acquire);
             if !matches!(state, RUNTIME_ACTIVE | RUNTIME_FROZEN) {
@@ -209,6 +441,14 @@ impl BoundaryRuntimeState {
 
     /// Force all remaining owned process groups to exit.
     pub fn force_kill(&self) {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         self.signal_registered_processes(nix::sys::signal::Signal::SIGCONT);
         self.signal_registered_processes(nix::sys::signal::Signal::SIGKILL);
     }
@@ -226,6 +466,14 @@ impl BoundaryRuntimeState {
     /// transition. A concurrent normal teardown cannot later be reclassified
     /// as enforcement loss.
     pub fn deactivate_for_enforcement_loss(&self) -> bool {
+        let mut witness = self
+            .witness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        witness.disabled = true;
+        for ticket in witness.originals.values_mut() {
+            ticket.consumed = true;
+        }
         loop {
             let state = self.state.load(Ordering::Acquire);
             if !matches!(state, RUNTIME_ACTIVE | RUNTIME_FROZEN) {
@@ -241,7 +489,8 @@ impl BoundaryRuntimeState {
                 )
                 .is_ok()
             {
-                self.force_kill();
+                self.signal_registered_processes(nix::sys::signal::Signal::SIGCONT);
+                self.signal_registered_processes(nix::sys::signal::Signal::SIGKILL);
                 return true;
             }
         }
@@ -398,6 +647,214 @@ impl BoundaryLoopbackConnector for LocalLoopbackConnector {
 
 #[cfg(test)]
 mod tests {
+    fn witness_operation(runtime: &BoundaryRuntimeState) -> WitnessOperation {
+        WitnessOperation {
+            prepared_source_incarnation: uuid::Uuid::new_v4().to_string(),
+            prepared_source_epoch: 1,
+            original_key: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+            profile_sha256: "c".repeat(64),
+            installed_arm_sha256: "d".repeat(64),
+            boundary_incarnation: runtime.witness_incarnation().unwrap(),
+            prepared_ticket: String::new(),
+            supervisor_session: uuid::Uuid::new_v4().to_string(),
+            execution_id: format!("exec-v1:{}", "e".repeat(64)),
+            deadline_unix_ms: 2000,
+            arm_request: vec![],
+        }
+    }
+    #[test]
+    fn witness_prepare_has_zero_effect_and_restart_rejects_first_seen_old_packet() {
+        let runtime = BoundaryRuntimeState::new();
+        let op = witness_operation(&runtime);
+        let prepared = runtime
+            .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+            .unwrap();
+        assert_eq!(runtime.registered_process_group_count(), 0);
+        assert!(
+            runtime
+                .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+                .is_none()
+        );
+        let restarted = BoundaryRuntimeState::new();
+        assert_ne!(
+            restarted.witness_incarnation(),
+            runtime.witness_incarnation()
+        );
+        assert!(
+            restarted
+                .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+                .is_none()
+        );
+        assert!(
+            runtime
+                .prepare_witness(prepared, 1000, &op.profile_sha256, &op.execution_id)
+                .is_none()
+        );
+    }
+    #[test]
+    fn witness_permit_consumes_once_and_fence_before_spawn_prevents_callback() {
+        use openshell_core::provider_credentials::{WitnessCommittedPermit, WitnessSourceFence};
+        let runtime = BoundaryRuntimeState::new();
+        let op = witness_operation(&runtime);
+        let prepared = runtime
+            .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+            .unwrap();
+        let permit = WitnessCommittedPermit {
+            source_incarnation: prepared.prepared_source_incarnation.clone(),
+            source_epoch: 1,
+            permit_id: uuid::Uuid::new_v4().to_string(),
+            operation: prepared,
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        runtime
+            .fence_witness(&WitnessSourceFence {
+                source_incarnation: permit.source_incarnation.clone(),
+                epoch: 2,
+                disabled: false,
+            })
+            .unwrap();
+        assert!(
+            runtime
+                .consume_witness_with(&permit, 1000, &op.profile_sha256, &op.execution_id, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn witness_local_gate_serializes_spawn_registration_before_fence() {
+        use openshell_core::provider_credentials::{WitnessCommittedPermit, WitnessSourceFence};
+        let runtime = BoundaryRuntimeState::new();
+        let op = witness_operation(&runtime);
+        let prepared = runtime
+            .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+            .unwrap();
+        let permit = WitnessCommittedPermit {
+            source_incarnation: prepared.prepared_source_incarnation.clone(),
+            source_epoch: 1,
+            permit_id: uuid::Uuid::new_v4().to_string(),
+            operation: prepared,
+        };
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child = {
+            let runtime = runtime.clone();
+            let permit = permit.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                runtime.consume_witness_with(
+                    &permit,
+                    1000,
+                    &permit.operation.profile_sha256,
+                    &permit.operation.execution_id,
+                    || {
+                        entered.wait();
+                        release.wait();
+                        tx.send("registered-original").unwrap();
+                        Ok(())
+                    },
+                )
+            })
+        };
+        entered.wait();
+        let (fence_tx, fence_rx) = std::sync::mpsc::channel();
+        let fence = {
+            let runtime = runtime.clone();
+            let nonce = permit.source_incarnation.clone();
+            std::thread::spawn(move || {
+                let result = runtime.fence_witness(&WitnessSourceFence {
+                    source_incarnation: nonce,
+                    epoch: 2,
+                    disabled: false,
+                });
+                fence_tx.send(result).unwrap();
+            })
+        };
+        assert!(fence_rx.try_recv().is_err());
+        release.wait();
+        assert!(child.join().unwrap().is_ok());
+        assert_eq!(rx.recv().unwrap(), "registered-original");
+        assert!(!fence_rx.recv().unwrap().unwrap());
+        fence.join().unwrap();
+        assert!(
+            runtime
+                .consume_witness_with(
+                    &permit,
+                    1000,
+                    &op.profile_sha256,
+                    &op.execution_id,
+                    || panic!("duplicate child")
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn witness_partial_spawn_failure_deadline_and_capacity_never_reopen() {
+        use WitnessCommittedPermit;
+        let runtime = BoundaryRuntimeState::new();
+        let op = witness_operation(&runtime);
+        let prepared = runtime
+            .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+            .unwrap();
+        let permit = WitnessCommittedPermit {
+            source_incarnation: prepared.prepared_source_incarnation.clone(),
+            source_epoch: 1,
+            permit_id: uuid::Uuid::new_v4().to_string(),
+            operation: prepared,
+        };
+        assert!(
+            runtime
+                .consume_witness_with(&permit, 1000, &op.profile_sha256, &op.execution_id, || Err(
+                    BackendError::Unavailable("synthetic lost spawn ACK".into())
+                ))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .consume_witness_with(
+                    &permit,
+                    1000,
+                    &op.profile_sha256,
+                    &op.execution_id,
+                    || panic!("replayed partial start")
+                )
+                .is_err()
+        );
+        let expired = BoundaryRuntimeState::new();
+        let op = witness_operation(&expired);
+        assert!(
+            expired
+                .prepare_witness(op.clone(), 2000, &op.profile_sha256, &op.execution_id)
+                .is_none()
+        );
+        assert!(
+            expired
+                .prepare_witness(op.clone(), 1000, &op.profile_sha256, &op.execution_id)
+                .is_none()
+        );
+        let full = BoundaryRuntimeState::new();
+        let op = witness_operation(&full);
+        for n in 0..16 {
+            let mut next = op.clone();
+            next.original_key = format!("{n:064x}");
+            assert!(
+                full.prepare_witness(next, 1000, &op.profile_sha256, &op.execution_id)
+                    .is_some()
+            );
+        }
+        let mut last = op.clone();
+        last.original_key = "f".repeat(64);
+        assert!(
+            full.prepare_witness(last, 1000, &op.profile_sha256, &op.execution_id)
+                .is_none()
+        );
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

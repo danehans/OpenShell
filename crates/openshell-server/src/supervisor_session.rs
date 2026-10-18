@@ -276,6 +276,28 @@ impl PeerRouteCache {
 // ---------------------------------------------------------------------------
 
 /// A live supervisor session handle.
+#[derive(Default)]
+struct OrdinarySession {
+    originals: HashMap<
+        String,
+        (
+            openshell_core::proto::ProviderObservationRequestV1,
+            openshell_core::proto::ProviderObservationSnapshotV1,
+        ),
+    >,
+    capability: Option<openshell_core::proto::ProviderObservationSnapshotV1>,
+    reports: HashMap<String, openshell_core::proto::ProviderObservationResultV1>,
+    issued: std::collections::HashSet<Vec<u8>>,
+    current_ingress_seen: u64,
+    reads: HashMap<
+        Vec<u8>,
+        (
+            openshell_core::proto::ProviderObservationCurrentReadV1,
+            oneshot::Sender<openshell_core::proto::ProviderObservationCurrentReplyV1>,
+        ),
+    >,
+}
+
 struct LiveSession {
     #[allow(dead_code)]
     sandbox_id: String,
@@ -304,6 +326,9 @@ struct LiveSession {
     /// Installation evidence belongs to this connection and is never restored
     /// from persistence or inherited by a replacement supervisor session.
     provider_readiness: Option<ProviderReadinessEvidence>,
+    witness_capability: Option<openshell_core::proto::ProviderDetachWitnessControlV1>,
+    witness_originals: HashMap<String, openshell_core::proto::ProviderDetachWitnessControlV1>,
+    ordinary: OrdinarySession,
     #[allow(dead_code)]
     connected_at: Instant,
     /// This session's share of `openshell_server_supervisor_sessions`, released when the entry
@@ -334,6 +359,9 @@ type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>
 pub struct SupervisorSessionRegistry {
     /// `sandbox_id` -> live session handle.
     sessions: Mutex<HashMap<String, LiveSession>>,
+    // Always take sessions before this lock; no await/DB/network under either.
+    // Records outlive removed sessions until their immutable original deadline.
+    provider_detach_attempts: Mutex<crate::grpc::provider_detach::ProviderDetachAttempts>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
     /// Read guards cover owner publication through final cleanup, even after
@@ -431,6 +459,9 @@ impl SupervisorSessionRegistry {
                 endpoint_status_initialized: false,
                 endpoint_report_cursor: None,
                 provider_readiness: None,
+                witness_capability: None,
+                witness_originals: HashMap::new(),
+                ordinary: OrdinarySession::default(),
                 connected_at: Instant::now(),
                 _gauge_slot: GaugeSlot::supervisor_session(),
             },
@@ -604,7 +635,747 @@ impl SupervisorSessionRegistry {
                 "provider readiness requires the current sandbox instance",
             ));
         }
-        evidence.accept(observation)
+        let mut candidate = evidence.clone();
+        candidate.accept(observation)?;
+        let mut attempts = self
+            .provider_detach_attempts
+            .lock()
+            .map_err(|_| Status::unavailable("provider attempt state unavailable"))?;
+        attempts.accept_report(
+            sandbox_id,
+            &candidate,
+            &openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                .map_err(|_| Status::internal("attempt clock unavailable"))?,
+        )?;
+        *evidence = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn ordinary_snapshot(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+    ) -> Result<openshell_core::proto::ProviderObservationSnapshotV1, Status> {
+        let boot = self
+            .provider_detach_attempts
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary boot unavailable"))?
+            .boot_id
+            .clone();
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+        let session = sessions
+            .get(&resource.sandbox_id)
+            .filter(|s| s.endpoint_status_initialized)
+            .ok_or_else(|| Status::failed_precondition("ordinary session unavailable"))?;
+        let mut cap = session
+            .ordinary
+            .capability
+            .clone()
+            .ok_or_else(|| Status::unimplemented("ordinary Native control unsupported"))?;
+        if cap.supervisor_session != session.session_id
+            || cap
+                .resource
+                .as_ref()
+                .is_none_or(|r| r.execution_id != resource.execution_id)
+        {
+            return Err(Status::failed_precondition("ordinary actor changed"));
+        }
+        cap.gateway_boot_id = boot;
+        cap.resource = Some(resource.clone());
+        // The gateway supplies its authenticated immutable selector; the Core
+        // must independently return this exact full resource via fresh F1 read.
+        cap.mediation_path_receipt_sha256 =
+            openshell_core::provider_credentials::ordinary_observation::path_digest(&cap);
+        Ok(cap)
+    }
+    pub(crate) fn ordinary_send_once(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+        expected: &openshell_core::proto::ProviderObservationSnapshotV1,
+        request: openshell_core::proto::ProviderObservationRequestV1,
+    ) -> Result<(), Status> {
+        use openshell_core::proto::{
+            GatewayMessage, ProviderObservationControlV1, gateway_message,
+            provider_observation_control_v1::Payload,
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+        let session = sessions
+            .get_mut(&resource.sandbox_id)
+            .filter(|s| {
+                s.session_id == expected.supervisor_session && s.endpoint_status_initialized
+            })
+            .ok_or_else(|| Status::failed_precondition("ordinary original session changed"))?;
+        if session.ordinary.reports.len() >= 16
+            || session
+                .ordinary
+                .reports
+                .contains_key(&request.request_sha256)
+        {
+            return Err(Status::failed_precondition(
+                "ordinary original not sendable",
+            ));
+        }
+        // Record delivery uncertainty before the only send; failure cannot reopen it.
+        session.ordinary.originals.insert(
+            request.request_sha256.clone(),
+            (request.clone(), expected.clone()),
+        );
+        session.ordinary.reports.insert(
+            request.request_sha256.clone(),
+            openshell_core::proto::ProviderObservationResultV1 {
+                state: openshell_core::proto::ProviderObservationStateV1::PendingInstall as i32,
+                ..Default::default()
+            },
+        );
+        session
+            .tx
+            .try_send(GatewayMessage {
+                payload: Some(gateway_message::Payload::ProviderDetachObservation(
+                    ProviderObservationControlV1 {
+                        payload: Some(Payload::InstallRequest(request)),
+                    },
+                )),
+            })
+            .map_err(|_| Status::unavailable("ordinary original delivery unknown"))
+    }
+    pub(crate) fn ordinary_result(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+        request: &openshell_core::proto::ProviderObservationRequestV1,
+    ) -> Option<openshell_core::proto::ProviderObservationResultV1> {
+        let sessions = self.sessions.lock().ok()?;
+        let s = sessions.get(&resource.sandbox_id)?;
+        let result = s.ordinary.reports.get(&request.request_sha256)?;
+        (result.window.as_ref()?.request.as_ref() == Some(request)).then(|| result.clone())
+    }
+    pub(crate) async fn ordinary_read(
+        &self,
+        selector: openshell_core::proto::GetProviderDetachObservationRequest,
+        expected: openshell_core::proto::ProviderObservationSnapshotV1,
+        result: Option<&openshell_core::proto::ProviderObservationResultV1>,
+    ) -> Result<openshell_core::proto::ProviderObservationCurrentReplyV1, Status> {
+        use openshell_core::proto::{
+            GatewayMessage, ProviderObservationControlV1, ProviderObservationCurrentReadV1,
+            gateway_message, provider_observation_control_v1,
+        };
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        use prost::Message;
+        let now = crate::persistence::current_time_ms();
+        let deadline = selector
+            .original_request
+            .as_ref()
+            .and_then(|q| q.deadline.as_ref())
+            .and_then(obs::time_ms)
+            .unwrap_or_else(|| now.saturating_add(2000))
+            .min(now.saturating_add(2000));
+        if !obs::valid_snapshot(&expected) {
+            return Err(Status::failed_precondition("ordinary path profile invalid"));
+        }
+        if deadline <= now {
+            return Err(Status::deadline_exceeded("ordinary read expired"));
+        }
+        let resource = expected
+            .resource
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("ordinary read resource absent"))?;
+        let correlation = Uuid::new_v4().as_bytes().to_vec();
+        let read = ProviderObservationCurrentReadV1 {
+            selector: Some(selector),
+            expected_identity: Some(expected.clone()),
+            read_correlation: correlation.clone(),
+            read_deadline: Some(obs::timestamp(deadline)),
+            window_sha256: result
+                .and_then(|r| r.window.as_ref())
+                .map(|w| w.window_sha256.clone())
+                .unwrap_or_default(),
+            terminal_sha256: result
+                .map(|r| r.terminal_sha256.clone())
+                .unwrap_or_default(),
+        };
+        if read.encoded_len() > obs::MAX_READ {
+            return Err(Status::resource_exhausted("ordinary read capacity"));
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+            if sessions
+                .values()
+                .map(|s| s.ordinary.reads.len())
+                .sum::<usize>()
+                >= 16
+            {
+                return Err(Status::resource_exhausted("ordinary read capacity"));
+            }
+            let session = sessions
+                .get_mut(&resource.sandbox_id)
+                .filter(|s| {
+                    s.endpoint_status_initialized && s.session_id == expected.supervisor_session
+                })
+                .ok_or_else(|| Status::failed_precondition("ordinary session changed"))?;
+            if !session.ordinary.reads.is_empty()
+                || session.ordinary.issued.len() >= 4096
+                || !session.ordinary.issued.insert(correlation.clone())
+            {
+                return Err(Status::resource_exhausted(
+                    "ordinary original read capacity",
+                ));
+            }
+            session
+                .ordinary
+                .reads
+                .insert(correlation.clone(), (read.clone(), tx));
+            if session
+                .tx
+                .try_send(GatewayMessage {
+                    payload: Some(gateway_message::Payload::ProviderDetachObservation(
+                        ProviderObservationControlV1 {
+                            payload: Some(provider_observation_control_v1::Payload::CurrentRead(
+                                read,
+                            )),
+                        },
+                    )),
+                })
+                .is_err()
+            {
+                session.ordinary.reads.remove(&correlation);
+                return Err(Status::unavailable("ordinary read unknown"));
+            }
+        }
+        let received = tokio::time::timeout(
+            Duration::from_millis(u64::try_from(deadline - now).unwrap_or(0)),
+            rx,
+        )
+        .await;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("ordinary registry unavailable"))?;
+        let session = sessions
+            .get_mut(&resource.sandbox_id)
+            .filter(|s| {
+                s.session_id == expected.supervisor_session && s.endpoint_status_initialized
+            })
+            .ok_or_else(|| Status::failed_precondition("ordinary session changed"))?;
+        session.ordinary.reads.remove(&correlation);
+        if crate::persistence::current_time_ms() >= deadline {
+            return Err(Status::deadline_exceeded("ordinary read expired"));
+        }
+        let reply = received
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| Status::unavailable("ordinary read unknown"))?;
+        // Closing peer check occurs after the source sample and await. DB and
+        // original Arm closing checks additionally occur at the RPC boundary.
+        if reply.sampled_snapshot.as_ref().is_none_or(|s| {
+            !obs::valid_snapshot(s)
+                || s.resource != expected.resource
+                || s.supervisor_session != expected.supervisor_session
+                || s.mediation_path_receipt_sha256 != expected.mediation_path_receipt_sha256
+                || s.current_ingress_sequence < expected.current_ingress_sequence
+                || s.current_ingress_sequence < session.ordinary.current_ingress_seen
+        }) {
+            return Err(Status::failed_precondition("ordinary closing path changed"));
+        }
+        Ok(reply)
+    }
+    pub(crate) fn ordinary_closing(
+        &self,
+        resource: &openshell_core::proto::ProviderDetachResourceV1,
+        snapshot: &openshell_core::proto::ProviderObservationSnapshotV1,
+    ) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        sessions.get(&resource.sandbox_id).is_some_and(|s| {
+            s.endpoint_status_initialized
+                && s.session_id == snapshot.supervisor_session
+                && s.ordinary.capability.as_ref().is_some_and(|c| {
+                    c.mediation_path_id == snapshot.mediation_path_id
+                        && c.source_incarnation == snapshot.source_incarnation
+                        && c.boundary_incarnation == snapshot.boundary_incarnation
+                })
+                && s.ordinary.current_ingress_seen <= snapshot.current_ingress_sequence
+        })
+    }
+    fn record_ordinary(
+        &self,
+        sandbox: &str,
+        session_id: &str,
+        command: openshell_core::proto::ProviderObservationControlV1,
+    ) -> bool {
+        use openshell_core::proto::provider_observation_control_v1::Payload;
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        use prost::Message;
+        if command.encoded_len() > obs::MAX_RESULT {
+            return false;
+        }
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions
+            .get_mut(sandbox)
+            .filter(|s| s.session_id == session_id && s.endpoint_status_initialized)
+        else {
+            return false;
+        };
+        match command.payload {
+            Some(Payload::CurrentSnapshot(snapshot)) => {
+                if snapshot.supervisor_session != session_id
+                    || snapshot.profile_id != obs::PROFILE
+                    || snapshot.profile_sha256 != obs::profile_digest()
+                    || !obs::valid_snapshot(&snapshot)
+                    || session.ordinary.capability.is_some()
+                {
+                    return false;
+                }
+                session.ordinary.capability = Some(snapshot);
+                true
+            }
+            Some(Payload::Report(result)) => {
+                let Some(q) = result.window.as_ref().and_then(|w| w.request.as_ref()) else {
+                    return false;
+                };
+                let Some((original, expected)) = session.ordinary.originals.get(&q.request_sha256)
+                else {
+                    return false;
+                };
+                if original != q
+                    || result.window.as_ref().is_none_or(|w| {
+                        w.installed_snapshot.as_ref().is_none_or(|s| {
+                            !obs::same_identity(expected, s)
+                                || s.current_ingress_sequence != w.ingress_watermark
+                                || w.ingress_watermark < expected.current_ingress_sequence
+                        })
+                    })
+                {
+                    return false;
+                }
+                let Some(old) = session.ordinary.reports.get_mut(&q.request_sha256) else {
+                    return false;
+                };
+                if !obs::shape(q)
+                    || q.resource.as_ref().is_none_or(|r| r.sandbox_id != sandbox)
+                    || result.window.as_ref().is_none_or(|w| {
+                        w.installed_snapshot.as_ref().is_none_or(|s| {
+                            s.supervisor_session != session_id || !obs::valid_snapshot(s)
+                        })
+                    })
+                {
+                    return false;
+                }
+                if !result.terminal_sha256.is_empty()
+                    && obs::terminal_digest(&result) != result.terminal_sha256
+                {
+                    return false;
+                }
+                if !old.terminal_sha256.is_empty() && old != &result {
+                    return false;
+                }
+                session.ordinary.current_ingress_seen = session.ordinary.current_ingress_seen.max(
+                    result
+                        .events
+                        .iter()
+                        .map(|e| e.ingress_sequence)
+                        .max()
+                        .unwrap_or(0),
+                );
+                *old = result;
+                true
+            }
+            Some(Payload::CurrentReply(reply)) => {
+                let Some(read) = reply.original_read.as_ref() else {
+                    return false;
+                };
+                let Some((pending, sender)) = session.ordinary.reads.remove(&read.read_correlation)
+                else {
+                    return false;
+                };
+                if &pending != read
+                    || read
+                        .read_deadline
+                        .as_ref()
+                        .and_then(obs::time_ms)
+                        .is_none_or(|end| crate::persistence::current_time_ms() >= end)
+                    || reply.encoded_len() > obs::MAX_READ
+                    || reply.sampled_snapshot.as_ref().is_none_or(|s| {
+                        s.supervisor_session != session_id
+                            || !obs::valid_snapshot(s)
+                            || s.resource
+                                != pending
+                                    .expected_identity
+                                    .as_ref()
+                                    .and_then(|p| p.resource.clone())
+                            || s.current_ingress_sequence < session.ordinary.current_ingress_seen
+                    })
+                {
+                    return false;
+                }
+                session.ordinary.current_ingress_seen = session.ordinary.current_ingress_seen.max(
+                    reply
+                        .sampled_snapshot
+                        .as_ref()
+                        .map_or(0, |s| s.current_ingress_sequence),
+                );
+                let _ = sender.send(reply);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn witness_session<'a>(
+        sessions: &'a HashMap<String, LiveSession>,
+        sandbox_id: &str,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> Result<&'a LiveSession, Status> {
+        let attempt = q
+            .installed_arm
+            .as_ref()
+            .and_then(|s| s.request.as_ref())
+            .and_then(|r| r.attempt.as_ref())
+            .ok_or_else(|| Status::invalid_argument("witness attempt absent"))?;
+        let session = sessions
+            .get(sandbox_id)
+            .filter(|s| {
+                s.endpoint_status_initialized
+                    && s.session_id == attempt.supervisor_session
+                    && s.provider_readiness
+                        .as_ref()
+                        .is_some_and(|e| e.belongs_to_instance(&attempt.supervisor_instance))
+            })
+            .ok_or_else(|| Status::failed_precondition("witness current session unavailable"))?;
+        let cap = session
+            .witness_capability
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("witness transport unsupported"))?;
+        if cap.source_incarnation != q.source_incarnation
+            || cap.boundary_incarnation != q.boundary_incarnation
+            || cap.profile_sha256 != q.profile_sha256
+            || cap.execution_id != attempt.execution_id
+            || cap.state != "capability"
+        {
+            return Err(Status::failed_precondition("witness capability changed"));
+        }
+        Ok(session)
+    }
+
+    pub(crate) fn check_provider_witness_capability(
+        &self,
+        sandbox_id: &str,
+        _attempt: &openshell_core::proto::ProviderDetachAttemptV1,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> Result<(), Status> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("witness session unavailable"))?;
+        Self::witness_session(&sessions, sandbox_id, q).map(|_| ())
+    }
+
+    /// Clone only immutable metadata from the current initialized authenticated
+    /// connection. No send, adoption, renewal or durable write occurs here.
+    pub(crate) fn provider_witness_metadata(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        expected_profile: &str,
+    ) -> Result<
+        (
+            String,
+            openshell_core::proto::ProviderDetachWitnessControlV1,
+        ),
+        Status,
+    > {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("witness session unavailable"))?;
+        let session = sessions
+            .get(sandbox_id)
+            .filter(|s| s.endpoint_status_initialized)
+            .ok_or_else(|| Status::failed_precondition("witness current session unavailable"))?;
+        let cap = session
+            .witness_capability
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("witness transport unsupported"))?;
+        let uuid = |v: &str| Uuid::parse_str(v).is_ok_and(|id| !id.is_nil() && id.to_string() == v);
+        if !uuid(&session.session_id)
+            || !uuid(&cap.source_incarnation)
+            || !uuid(&cap.boundary_incarnation)
+            || cap.execution_id != execution_id
+            || cap.profile_sha256 != expected_profile
+            || expected_profile.len() != 64
+            || !expected_profile
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || cap.state != "capability"
+            || !cap.original_key.is_empty()
+            || !cap.request_sha256.is_empty()
+        {
+            return Err(Status::failed_precondition("witness capability changed"));
+        }
+        Ok((session.session_id.clone(), cap.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn witness_metadata_fixture(
+        &self,
+        sandbox: &str,
+        session: &str,
+        cap: Option<openshell_core::proto::ProviderDetachWitnessControlV1>,
+        initialized: bool,
+    ) -> mpsc::Receiver<GatewayMessage> {
+        let (tx, rx) = mpsc::channel(4);
+        let (shutdown, _) = oneshot::channel();
+        self.register(sandbox.into(), session.into(), tx, shutdown);
+        let mut sessions = self.sessions.lock().unwrap();
+        let entry = sessions.get_mut(sandbox).unwrap();
+        entry.endpoint_status_initialized = initialized;
+        entry.provider_readiness = Some(
+            ProviderReadinessEvidence::from_hello(&SupervisorHello {
+                sandbox_id: sandbox.into(),
+                instance_id: session.into(),
+                supports_provider_readiness: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        entry.witness_capability = cap;
+        rx
+    }
+    #[cfg(test)]
+    pub(crate) fn poison_witness_metadata_fixture(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.sessions.lock().unwrap();
+            panic!("synthetic registry poison")
+        }));
+    }
+
+    /// No replay queue: mark the original before the single non-awaiting send.
+    /// Failure retains this original as unknown until this session disappears;
+    /// the permanent `SQLite` claim remains authoritative across disappearance.
+    pub(crate) fn send_provider_witness_once(
+        &self,
+        sandbox_id: &str,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> Result<(), Status> {
+        let key = crate::grpc::provider_detach_invocation::original_key(q)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("witness session unavailable"))?;
+        Self::witness_session(&sessions, sandbox_id, q)?;
+        let session = sessions.get_mut(sandbox_id).unwrap();
+        if session.witness_originals.len() >= 16 || session.witness_originals.contains_key(&key) {
+            return Err(Status::resource_exhausted(
+                "witness original unavailable; read only",
+            ));
+        }
+        session.witness_originals.insert(
+            key.clone(),
+            openshell_core::proto::ProviderDetachWitnessControlV1 {
+                original_key: key,
+                request_sha256: q.request_sha256.clone(),
+                source_incarnation: q.source_incarnation.clone(),
+                boundary_incarnation: q.boundary_incarnation.clone(),
+                profile_sha256: q.profile_sha256.clone(),
+                state: "unknown".into(),
+                execution_id: q
+                    .installed_arm
+                    .as_ref()
+                    .and_then(|s| s.request.as_ref())
+                    .and_then(|a| a.attempt.as_ref())
+                    .unwrap()
+                    .execution_id
+                    .clone(),
+            },
+        );
+        session
+            .tx
+            .try_send(GatewayMessage {
+                payload: Some(gateway_message::Payload::ProviderDetachWitness(q.clone())),
+            })
+            .map_err(|_| Status::unavailable("witness original dispatch unknown"))
+    }
+
+    fn record_provider_witness(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        control: openshell_core::proto::ProviderDetachWitnessControlV1,
+    ) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions
+            .get_mut(sandbox_id)
+            .filter(|s| s.session_id == session_id && s.endpoint_status_initialized)
+        else {
+            return false;
+        };
+        let uuid = |s: &str| Uuid::parse_str(s).is_ok_and(|u| !u.is_nil() && u.to_string() == s);
+        let hash = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        };
+        if !uuid(&control.source_incarnation)
+            || !uuid(&control.boundary_incarnation)
+            || !hash(&control.profile_sha256)
+            || !control
+                .execution_id
+                .strip_prefix("exec-v1:")
+                .is_some_and(hash)
+        {
+            return false;
+        }
+        if control.state == "capability" {
+            if !control.original_key.is_empty() || !control.request_sha256.is_empty() {
+                return false;
+            }
+            return if let Some(original) = &session.witness_capability {
+                original == &control
+            } else {
+                session.witness_capability = Some(control);
+                true
+            };
+        }
+        let Some(original) = session.witness_originals.get_mut(&control.original_key) else {
+            return false;
+        };
+        if original.request_sha256 != control.request_sha256
+            || original.source_incarnation != control.source_incarnation
+            || original.boundary_incarnation != control.boundary_incarnation
+            || original.execution_id != control.execution_id
+            || original.profile_sha256 != control.profile_sha256
+            || !matches!(
+                control.state.as_str(),
+                "unknown" | "source-invalidated" | "cancel-pending" | "boundary-quiesced"
+            )
+        {
+            return false;
+        }
+        // Observations may only advance toward cancellation/quiescence, never
+        // erase an already observed fence or manufacture native refusal proof.
+        let rank = |v: &str| match v {
+            "source-invalidated" => 1,
+            "cancel-pending" => 2,
+            "boundary-quiesced" => 3,
+            _ => 0,
+        };
+        if rank(&control.state) < rank(&original.state) {
+            return true;
+        }
+        *original = control;
+        true
+    }
+
+    pub(crate) fn observe_provider_witness(
+        &self,
+        q: &openshell_core::proto::ProviderDetachWitnessRequestV1,
+        result: &mut openshell_core::proto::ProviderDetachWitnessInvocationV1,
+    ) {
+        let Some(target) = q
+            .installed_arm
+            .as_ref()
+            .and_then(|s| s.request.as_ref())
+            .and_then(|r| r.original_action.as_ref())
+            .and_then(|a| a.target.as_ref())
+        else {
+            return;
+        };
+        let Ok(sessions) = self.sessions.lock() else {
+            return;
+        };
+        let Ok(session) = Self::witness_session(&sessions, &target.sandbox_id, q) else {
+            return;
+        };
+        let Some(obs) = session
+            .witness_originals
+            .get(&result.original_key)
+            .filter(|v| v.request_sha256 == q.request_sha256)
+        else {
+            return;
+        };
+        result.source_invalidated = matches!(
+            obs.state.as_str(),
+            "source-invalidated" | "cancel-pending" | "boundary-quiesced"
+        );
+        result.boundary_cancel_pending = matches!(obs.state.as_str(), "cancel-pending");
+        result.boundary_quiesced = obs.state == "boundary-quiesced";
+        // No process/cancellation observation establishes credential refusal.
+    }
+
+    /// One bounded native metadata transition under the current authenticated
+    /// session boundary. Closure cannot retain either registry lock.
+    pub(crate) fn with_provider_detach_attempts<R>(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        active_instance_id: &str,
+        operation: impl FnOnce(
+            &ProviderReadinessEvidence,
+            &mut crate::grpc::provider_detach::ProviderDetachAttempts,
+        ) -> Result<R, Status>,
+    ) -> Result<R, Status> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Status::unavailable("supervisor session state unavailable"))?;
+        let evidence = sessions
+            .get(sandbox_id)
+            .filter(|s| s.session_id == session_id && s.endpoint_status_initialized)
+            .and_then(|s| s.provider_readiness.as_ref())
+            .filter(|e| e.belongs_to_instance(active_instance_id))
+            .ok_or_else(|| {
+                Status::permission_denied("attempt requires current initialized supervisor session")
+            })?;
+        let mut attempts = self
+            .provider_detach_attempts
+            .lock()
+            .map_err(|_| Status::unavailable("provider attempt state unavailable"))?;
+        operation(evidence, &mut attempts)
+    }
+
+    pub(crate) fn provider_detach_report_reply(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        active_instance_id: &str,
+    ) -> Result<
+        (
+            String,
+            Option<openshell_core::proto::ProviderDetachArmSealV1>,
+            Option<openshell_core::proto::ProviderDetachArmSealV1>,
+        ),
+        Status,
+    > {
+        self.with_provider_detach_attempts(
+            sandbox_id,
+            session_id,
+            active_instance_id,
+            |evidence, attempts| {
+                let now =
+                    openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
+                        .map_err(|_| Status::internal("attempt clock unavailable"))?;
+                let pending = attempts.accept_report(sandbox_id, evidence, &now)?;
+                let installed = evidence
+                    .provider_detach_snapshot()
+                    .and_then(|(_, obs, _)| obs.provider_detach)
+                    .and_then(|m| {
+                        attempts.installed_for(sandbox_id, session_id, &m.attempt_id, &now)
+                    });
+                Ok((attempts.boot_id.clone(), pending, installed))
+            },
+        )
     }
 
     /// Snapshot installation evidence from the current initialized session.
@@ -2127,7 +2898,7 @@ async fn establish_supervisor_session(
             .ok(),
         })),
     };
-    if tx.send(accepted).await.is_err() {
+    if Box::pin(tx.send(accepted)).await.is_err() {
         // Only evict ourselves — a faster reconnect may already have
         // superseded this registration.
         state
@@ -2181,7 +2952,7 @@ async fn establish_supervisor_session(
     tokio::spawn(async move {
         let _session_lifetime = session_lifetime;
         let mut owner_guard = owner_guard;
-        run_session_loop(
+        Box::pin(run_session_loop(
             &state_clone,
             &sandbox_id_clone,
             &session_id,
@@ -2189,7 +2960,7 @@ async fn establish_supervisor_session(
             &mut inbound,
             shutdown_rx,
             &mut owner_guard,
-        )
+        ))
         .await;
         let terminal_finalized = state_clone
             .supervisor_sessions
@@ -2329,7 +3100,7 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        if !handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard).await {
+                        if !Box::pin(handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard)).await {
                             break;
                         }
                     }
@@ -2365,7 +3136,7 @@ async fn run_session_loop(
                         openshell_core::proto::GatewayHeartbeat {},
                     )),
                 };
-                if tx.send(hb).await.is_err() {
+                if Box::pin(tx.send(hb)).await.is_err() {
                     info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: outbound channel closed");
                     break;
                 }
@@ -2382,6 +3153,16 @@ async fn handle_supervisor_message(
     owner_guard: &mut OwnerGuard,
 ) -> bool {
     match msg.payload {
+        Some(supervisor_message::Payload::ProviderDetachObservation(control)) => {
+            return state
+                .supervisor_sessions
+                .record_ordinary(sandbox_id, session_id, control);
+        }
+        Some(supervisor_message::Payload::ProviderDetachWitness(control)) => {
+            return state
+                .supervisor_sessions
+                .record_provider_witness(sandbox_id, session_id, control);
+        }
         Some(supervisor_message::Payload::Heartbeat(_)) => {
             let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
             match tokio::time::timeout(OWNER_RENEW_TIMEOUT, owner_index.renew(owner_guard)).await {
@@ -2799,6 +3580,7 @@ mod tests {
     fn user_principal(subject: &str) -> Principal {
         Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: subject.to_string(),
                 display_name: None,
                 roles: vec![],
@@ -4557,5 +5339,627 @@ mod tests {
         let channels = cache.channels.lock().unwrap();
         assert!(!channels.contains_key("http://10.0.0.1:8080"));
         assert!(channels.contains_key("http://10.0.0.2:8080"));
+    }
+    fn attempt_registry_fixture() -> (
+        SupervisorSessionRegistry,
+        openshell_core::proto::ProviderDetachArmRequestV1,
+        ProviderReadinessObservation,
+    ) {
+        use openshell_core::proto::*;
+        let registry = SupervisorSessionRegistry::new();
+        let boot = registry
+            .provider_detach_attempts
+            .lock()
+            .unwrap()
+            .boot_id
+            .clone();
+        let now =
+            openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap();
+        let q = crate::grpc::provider_detach::registry_arm_fixture(&boot, now);
+        let a = q.attempt.as_ref().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register(
+            a.sandbox_id.clone(),
+            a.supervisor_session.clone(),
+            tx,
+            make_shutdown(),
+        );
+        assert!(
+            registry.initialize_endpoint_status_authority(&a.sandbox_id, &a.supervisor_session)
+        );
+        let hello = SupervisorHello {
+            sandbox_id: a.sandbox_id.clone(),
+            instance_id: a.supervisor_instance.clone(),
+            supports_provider_readiness: true,
+            ..Default::default()
+        };
+        registry
+            .initialize_provider_readiness(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                ProviderReadinessEvidence::from_hello(&hello).unwrap(),
+            )
+            .unwrap();
+        let obs = ProviderReadinessObservation {
+            session_id: a.supervisor_session.clone(),
+            sequence: 10,
+            attachment_epoch: a.attachment_epoch.clone(),
+            provider_env_revision: a.provider_env_revision,
+            config_revision: a.config_revision,
+            policy_hash: a.native_policy_hash.clone(),
+            credentials_installed: true,
+            policy_active: true,
+            launch_environment_installed: true,
+            process_instance_id: "99999999-9999-4999-8999-999999999999".into(),
+            provider_detach: Some(ProviderDetachSupervisorReportV1 {
+                supported: true,
+                gateway_boot_id: boot,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        registry
+            .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+            .unwrap();
+        (registry, q, obs)
+    }
+    fn attempt_now() -> prost_types::Timestamp {
+        openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now()).unwrap()
+    }
+    #[test]
+    fn provider_detach_registry_requires_causal_delivery_install_and_keeps_original_terminal() {
+        let (registry, q, mut obs) = attempt_registry_fixture();
+        let a = q.attempt.as_ref().unwrap();
+        let initial = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+            )
+            .unwrap();
+        assert_eq!(initial.state, 1);
+        // A guessed install sequence without exact prior delivery is refused.
+        obs.sequence = 11;
+        obs.provider_detach = Some(openshell_core::proto::ProviderDetachSupervisorReportV1 {
+            supported: true,
+            gateway_boot_id: a.gateway_boot_id.clone(),
+            attempt_id: q.attempt_id.clone(),
+            request_sha256: q.request_sha256.clone(),
+            install_sequence: 11,
+            installed_time: Some(attempt_now()),
+            ..Default::default()
+        });
+        assert!(
+            registry
+                .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+                .is_err()
+        );
+        // Acceptance refusal left the original report10 and reservation intact.
+        let (_, pending, installed) = registry
+            .provider_detach_report_reply(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+            )
+            .unwrap();
+        assert!(installed.is_none());
+        assert_eq!(pending.unwrap().request.as_ref(), Some(&q));
+        obs.provider_detach.as_mut().unwrap().installed_time = Some(attempt_now());
+        registry
+            .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+            .unwrap();
+        let (_, pending, installed) = registry
+            .provider_detach_report_reply(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+            )
+            .unwrap();
+        assert!(pending.is_none());
+        let installed = installed.unwrap();
+        assert_eq!(installed.install_sequence, 11);
+        obs.sequence = 12;
+        obs.provider_detach.as_mut().unwrap().result = 3;
+        registry
+            .accept_provider_readiness(&a.sandbox_id, &a.supervisor_instance, obs.clone())
+            .unwrap();
+        let terminal = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.query(&q, &attempt_now()),
+            )
+            .unwrap();
+        assert_eq!(terminal.state, 4);
+        assert_eq!(terminal.result, 3);
+        assert!(terminal.proof.is_none());
+        let duplicate = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+            )
+            .unwrap();
+        assert_eq!(duplicate, terminal);
+        let mut changed = q.clone();
+        changed
+            .original_receipt
+            .as_mut()
+            .unwrap()
+            .configuration_instance = "other".into();
+        assert!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&changed, 1, 9, &attempt_now())
+                )
+                .is_err()
+        );
+        let expiry = a.deadline.unwrap();
+        let expired = registry
+            .with_provider_detach_attempts(
+                &a.sandbox_id,
+                &a.supervisor_session,
+                &a.supervisor_instance,
+                |_, ledger| ledger.query(&q, &expiry),
+            )
+            .unwrap();
+        assert_eq!(expired.state, 5);
+        assert!(expired.seal.is_none());
+        assert!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&q, 1, 9, &expiry)
+                )
+                .is_err()
+        );
+        registry.remove(&a.sandbox_id);
+        assert!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.query(&q, &attempt_now())
+                )
+                .is_err()
+        );
+        // Removal cannot free an unexpired terminal/tombstone slot.
+        assert_eq!(
+            registry
+                .provider_detach_attempts
+                .lock()
+                .unwrap()
+                .query(&q, &attempt_now())
+                .unwrap(),
+            terminal
+        );
+    }
+    fn fresh_attempt_from_original(
+        q: &openshell_core::proto::ProviderDetachArmRequestV1,
+        capture: u64,
+    ) -> openshell_core::proto::ProviderDetachArmRequestV1 {
+        let mut q = q.clone();
+        let a = q.attempt.as_mut().unwrap();
+        a.dispatcher_decision_id = Uuid::new_v4().to_string();
+        a.arm_capture_sequence = capture;
+        q.request_sha256 = crate::grpc::provider_detach::attempt_digest(a).unwrap();
+        q.attempt_id =
+            crate::grpc::provider_detach::action_id_for_digest(&q.request_sha256).unwrap();
+        q
+    }
+    #[test]
+    fn provider_detach_registry_counts_unexpired_terminal_records_and_preserves_duplicates() {
+        let (registry, base, mut obs) = attempt_registry_fixture();
+        let identity = base.attempt.as_ref().unwrap();
+        let mut originals = Vec::new();
+        for _ in 0..16 {
+            let q = fresh_attempt_from_original(&base, obs.sequence);
+            registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+                )
+                .unwrap();
+            let (_, pending, _) = registry
+                .provider_detach_report_reply(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                )
+                .unwrap();
+            assert_eq!(pending.unwrap().request.as_ref(), Some(&q));
+            obs.sequence += 1;
+            let installed = attempt_now();
+            obs.provider_detach = Some(openshell_core::proto::ProviderDetachSupervisorReportV1 {
+                supported: true,
+                gateway_boot_id: identity.gateway_boot_id.clone(),
+                attempt_id: q.attempt_id.clone(),
+                request_sha256: q.request_sha256.clone(),
+                install_sequence: obs.sequence,
+                installed_time: Some(installed),
+                ..Default::default()
+            });
+            registry
+                .accept_provider_readiness(
+                    &identity.sandbox_id,
+                    &identity.supervisor_instance,
+                    obs.clone(),
+                )
+                .unwrap();
+            obs.sequence += 1;
+            obs.provider_detach.as_mut().unwrap().result = 3;
+            registry
+                .accept_provider_readiness(
+                    &identity.sandbox_id,
+                    &identity.supervisor_instance,
+                    obs.clone(),
+                )
+                .unwrap();
+            originals.push(q);
+        }
+        let seventeenth = fresh_attempt_from_original(&base, obs.sequence);
+        assert_eq!(
+            registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(&seventeenth, 1, 9, &attempt_now())
+                )
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        for q in &originals {
+            let old = registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.query(q, &attempt_now()),
+                )
+                .unwrap();
+            assert_eq!(old.state, 4);
+            let duplicate = registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(q, 1, 9, &attempt_now()),
+                )
+                .unwrap();
+            assert_eq!(duplicate, old);
+        }
+        let expiry = identity.deadline.unwrap();
+        let mut fresh = fresh_attempt_from_original(&base, obs.sequence);
+        let a = fresh.attempt.as_mut().unwrap();
+        a.not_before = Some(expiry);
+        a.deadline = Some(prost_types::Timestamp {
+            seconds: expiry.seconds + 20,
+            nanos: expiry.nanos,
+        });
+        fresh.request_sha256 = crate::grpc::provider_detach::attempt_digest(a).unwrap();
+        fresh.attempt_id =
+            crate::grpc::provider_detach::action_id_for_digest(&fresh.request_sha256).unwrap();
+        assert_eq!(
+            registry
+                .with_provider_detach_attempts(
+                    &identity.sandbox_id,
+                    &identity.supervisor_session,
+                    &identity.supervisor_instance,
+                    |_, ledger| ledger.admit(&fresh, 1, 9, &expiry)
+                )
+                .unwrap()
+                .state,
+            1
+        );
+    }
+    #[test]
+    fn provider_detach_registry_duplicate_race_has_one_original_and_old_boot_cannot_rearm() {
+        let (registry, q, _) = attempt_registry_fixture();
+        let registry = Arc::new(registry);
+        let q = Arc::new(q);
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let registry = Arc::clone(&registry);
+            let q = Arc::clone(&q);
+            workers.push(std::thread::spawn(move || {
+                let a = q.attempt.as_ref().unwrap();
+                registry
+                    .with_provider_detach_attempts(
+                        &a.sandbox_id,
+                        &a.supervisor_session,
+                        &a.supervisor_instance,
+                        |_, ledger| ledger.admit(&q, 1, 9, &attempt_now()),
+                    )
+                    .unwrap()
+            }));
+        }
+        let original = workers.remove(0).join().unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), original);
+        }
+        let a = q.attempt.as_ref().unwrap();
+        let competing = fresh_attempt_from_original(&q, 10);
+        assert_eq!(
+            registry
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&competing, 1, 9, &attempt_now())
+                )
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let (restarted, _, _) = attempt_registry_fixture();
+        assert!(
+            restarted
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.admit(&q, 1, 9, &attempt_now())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            restarted
+                .with_provider_detach_attempts(
+                    &a.sandbox_id,
+                    &a.supervisor_session,
+                    &a.supervisor_instance,
+                    |_, ledger| ledger.query(&q, &attempt_now())
+                )
+                .unwrap()
+                .state,
+            6
+        );
+    }
+}
+
+#[cfg(test)]
+mod ordinary_barrier_tests {
+    use super::*;
+    use openshell_core::proto::*;
+    use openshell_core::provider_credentials::ordinary_observation as obs;
+    fn fixture() -> (
+        Arc<SupervisorSessionRegistry>,
+        ProviderObservationSnapshotV1,
+        mpsc::Receiver<GatewayMessage>,
+    ) {
+        let registry = Arc::new(SupervisorSessionRegistry::new());
+        let (tx, rx) = mpsc::channel(4);
+        let (shutdown, _) = oneshot::channel();
+        let sandbox = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        registry.register(sandbox.clone(), session.clone(), tx, shutdown);
+        registry
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&sandbox)
+            .unwrap()
+            .endpoint_status_initialized = true;
+        let mut snapshot = ProviderObservationSnapshotV1 {
+            resource: Some(ProviderDetachResourceV1 {
+                sandbox_id: sandbox,
+                execution_id: format!("exec-v1:{}", "a".repeat(64)),
+                ..Default::default()
+            }),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            source_incarnation: Uuid::new_v4().to_string(),
+            boundary_incarnation: Uuid::new_v4().to_string(),
+            gateway_boot_id: Uuid::new_v4().to_string(),
+            supervisor_instance: Uuid::new_v4().to_string(),
+            supervisor_session: session,
+            mediation_path_receipt_sha256: String::new(),
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            process_writer_attribution: obs::WRITER_UNPROVEN,
+            mediation_path_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+        snapshot.mediation_path_receipt_sha256 = obs::path_digest(&snapshot);
+        assert!(registry.record_ordinary(
+            &snapshot.resource.as_ref().unwrap().sandbox_id,
+            &snapshot.supervisor_session,
+            ProviderObservationControlV1 {
+                payload: Some(provider_observation_control_v1::Payload::CurrentSnapshot(
+                    snapshot.clone()
+                ))
+            }
+        ));
+        (registry, snapshot, rx)
+    }
+    #[tokio::test]
+    async fn ordinary_original_install_report_cannot_adopt_new_configuration() {
+        let (registry, expected, mut rx) = fixture();
+        let resource = expected.resource.clone().unwrap();
+        let mut q = ProviderObservationRequestV1 {
+            resource: Some(resource.clone()),
+            run_id: Uuid::new_v4().to_string(),
+            step_id: Uuid::new_v4().to_string(),
+            profile_id: obs::PROFILE.into(),
+            profile_sha256: obs::profile_digest(),
+            evidence_scope: obs::EVIDENCE_SCOPE.into(),
+            source_incarnation: expected.source_incarnation.clone(),
+            boundary_incarnation: expected.boundary_incarnation.clone(),
+            deadline: Some(obs::timestamp(
+                crate::persistence::current_time_ms() + 60000,
+            )),
+            phase: ProviderObservationPhaseV1::Baseline as i32,
+            ..Default::default()
+        };
+        q.request_sha256 = obs::request_digest(&q);
+        registry
+            .ordinary_send_once(&resource, &expected, q.clone())
+            .unwrap();
+        assert!(rx.recv().await.is_some());
+        assert!(
+            registry
+                .ordinary_send_once(&resource, &expected, q.clone())
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+        let mut report = ProviderObservationResultV1 {
+            state: ProviderObservationStateV1::Open as i32,
+            window: Some(ProviderObservationWindowV1 {
+                request: Some(q.clone()),
+                installed_snapshot: Some(expected.clone()),
+                ingress_watermark: expected.current_ingress_sequence,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        report
+            .window
+            .as_mut()
+            .unwrap()
+            .installed_snapshot
+            .as_mut()
+            .unwrap()
+            .policy_generation += 1;
+        let command = |r| ProviderObservationControlV1 {
+            payload: Some(provider_observation_control_v1::Payload::Report(r)),
+        };
+        assert!(!registry.record_ordinary(
+            &resource.sandbox_id,
+            &expected.supervisor_session,
+            command(report.clone())
+        ));
+        report.window.as_mut().unwrap().installed_snapshot = Some(expected.clone());
+        assert!(registry.record_ordinary(
+            &resource.sandbox_id,
+            &expected.supervisor_session,
+            command(report.clone())
+        ));
+        assert_eq!(registry.ordinary_result(&resource, &q), Some(report));
+    }
+    #[tokio::test]
+    async fn ordinary_barrier_is_one_explicit_read_and_preserves_fresh_counter() {
+        let (registry, expected, mut rx) = fixture();
+        let resource = expected.resource.as_ref().unwrap().clone();
+        let selector = GetProviderDetachObservationRequest {
+            resource: Some(resource.clone()),
+            ..Default::default()
+        };
+        let waiter = registry.ordinary_read(selector, expected.clone(), None);
+        let peer = async {
+            let message = rx.recv().await.unwrap();
+            let Some(gateway_message::Payload::ProviderDetachObservation(command)) =
+                message.payload
+            else {
+                panic!("wrong channel")
+            };
+            let Some(provider_observation_control_v1::Payload::CurrentRead(read)) = command.payload
+            else {
+                panic!("read became install")
+            };
+            let mut sampled = expected.clone();
+            sampled.current_ingress_sequence = 2; // N+1 report deliberately absent
+            assert!(registry.record_ordinary(
+                &resource.sandbox_id,
+                &expected.supervisor_session,
+                ProviderObservationControlV1 {
+                    payload: Some(provider_observation_control_v1::Payload::CurrentReply(
+                        ProviderObservationCurrentReplyV1 {
+                            original_read: Some(read.clone()),
+                            sampled_snapshot: Some(sampled),
+                            sampled_time: Some(obs::timestamp(
+                                crate::persistence::current_time_ms()
+                            )),
+                            ..Default::default()
+                        }
+                    ))
+                }
+            ));
+            assert!(!registry.record_ordinary(
+                &resource.sandbox_id,
+                &expected.supervisor_session,
+                ProviderObservationControlV1 {
+                    payload: Some(provider_observation_control_v1::Payload::CurrentReply(
+                        ProviderObservationCurrentReplyV1 {
+                            original_read: Some(read),
+                            ..Default::default()
+                        }
+                    ))
+                }
+            ));
+        };
+        let (reply, ()) = tokio::join!(waiter, peer);
+        assert_eq!(
+            reply
+                .unwrap()
+                .sampled_snapshot
+                .unwrap()
+                .current_ingress_sequence,
+            2
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn ordinary_barrier_wrong_reply_and_session_replacement_fail() {
+        for replace in [false, true] {
+            let (registry, expected, mut rx) = fixture();
+            let resource = expected.resource.as_ref().unwrap().clone();
+            let selector = GetProviderDetachObservationRequest {
+                resource: Some(resource.clone()),
+                ..Default::default()
+            };
+            let waiter = registry.ordinary_read(selector, expected.clone(), None);
+            let peer = async {
+                let message = rx.recv().await.unwrap();
+                let Some(gateway_message::Payload::ProviderDetachObservation(command)) =
+                    message.payload
+                else {
+                    panic!()
+                };
+                let Some(provider_observation_control_v1::Payload::CurrentRead(mut read)) =
+                    command.payload
+                else {
+                    panic!()
+                };
+                if replace {
+                    let (tx, _) = mpsc::channel(1);
+                    let (shutdown, _) = oneshot::channel();
+                    registry.register(
+                        resource.sandbox_id.clone(),
+                        Uuid::new_v4().to_string(),
+                        tx,
+                        shutdown,
+                    );
+                } else {
+                    read.terminal_sha256 = "stale".into();
+                    assert!(!registry.record_ordinary(
+                        &resource.sandbox_id,
+                        &expected.supervisor_session,
+                        ProviderObservationControlV1 {
+                            payload: Some(provider_observation_control_v1::Payload::CurrentReply(
+                                ProviderObservationCurrentReplyV1 {
+                                    original_read: Some(read),
+                                    sampled_snapshot: Some(expected.clone()),
+                                    ..Default::default()
+                                }
+                            ))
+                        }
+                    ));
+                }
+            };
+            let (reply, ()) = tokio::join!(waiter, peer);
+            assert!(reply.is_err());
+        }
     }
 }

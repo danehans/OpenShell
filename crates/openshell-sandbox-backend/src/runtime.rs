@@ -437,6 +437,28 @@ impl ReadyBoundary for RemoteReady {
         else {
             return Err(unexpected_response("started", &response));
         };
+        // Installed only after the original Native agent starts. The weak
+        // adapter cannot prolong/adopt a lost boundary or expose generic Exec.
+        let original_credential = BoundaryCredential::capture(&self.client.sandbox_bearer).ok();
+        let original_connection = self.client.grpc_channel.lock().await.clone();
+        if let (Some(credential), Some(connection)) = (original_credential, original_connection)
+            && credential.epoch == connection.credential_epoch
+            && credential.fingerprint == connection.bearer_fingerprint
+            && connection.generation != 0
+            && !connection.transport.is_aborted()
+        {
+            if self.provider_credentials.provider_detach_attempts_enabled() {
+                let ordinary = Arc::new(OrdinaryBoundary { pin: NativeWitnessBoundary::pin(&self.client, &connection), streams: openshell_core::provider_credentials::ordinary_observation::StreamRegistry::new() });
+                if self.client.observation.set(ordinary.clone()).is_ok() {
+                    let _ = self
+                        .provider_credentials
+                        .install_observation_boundary(ordinary);
+                }
+            }
+            let _ = self.provider_credentials.install_witness_boundary(Arc::new(
+                NativeWitnessBoundary::pin(&self.client, &connection),
+            ));
+        }
         let process = Arc::new(RemoteProcess {
             client: self.client.clone(),
             process_id,
@@ -613,6 +635,291 @@ async fn pump_process_responses(
     };
     if let Some(completion) = completion {
         let _ = completion.send(status);
+    }
+}
+
+struct NativeWitnessBoundary {
+    client: std::sync::Weak<BoundaryClient>,
+    original_generation: u64,
+    original_epoch: openshell_core::jwt::CredentialEpoch,
+    original_bearer_fingerprint: [u8; 32],
+    original_transport: std::sync::Weak<TransportAbort>,
+}
+impl std::fmt::Debug for NativeWitnessBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeWitnessBoundary(<original-authenticated-connection>)")
+    }
+}
+
+impl std::fmt::Debug for BoundaryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BoundaryClient(<authenticated>)")
+    }
+}
+impl NativeWitnessBoundary {
+    fn pin(client: &Arc<BoundaryClient>, original: &CachedGrpcChannel) -> Self {
+        Self {
+            client: Arc::downgrade(client),
+            original_generation: original.generation,
+            original_epoch: original.credential_epoch,
+            original_bearer_fingerprint: original.bearer_fingerprint,
+            original_transport: Arc::downgrade(&original.transport),
+        }
+    }
+    fn matches_original(&self, current: &CachedGrpcChannel) -> bool {
+        current.generation == self.original_generation
+            && current.credential_epoch == self.original_epoch
+            && current.bearer_fingerprint == self.original_bearer_fingerprint
+            && std::sync::Weak::ptr_eq(
+                &self.original_transport,
+                &Arc::downgrade(&current.transport),
+            )
+            && !current.transport.is_aborted()
+    }
+    async fn once(&self, request: Request, deadline_ms: Option<i64>) -> Option<Response> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        let millis = match deadline_ms {
+            Some(d) => u64::try_from(i128::from(d) - i128::try_from(now).ok()?)
+                .ok()?
+                .min(5000),
+            None => 5000,
+        };
+        if millis == 0 {
+            return None;
+        }
+        // One total deadline includes cache-lock waits and closing checks. Never
+        // enter ordinary connection renewal, attach, confirm or recovery paths.
+        tokio::time::timeout(Duration::from_millis(millis), async {
+            let client = self.client.upgrade()?;
+            let credential = BoundaryCredential::capture(&client.sandbox_bearer).ok()?;
+            if credential.epoch != self.original_epoch
+                || credential.fingerprint != self.original_bearer_fingerprint
+            {
+                return None;
+            }
+            let channel = {
+                let cache = client.grpc_channel.lock().await;
+                let original = cache.as_ref().filter(|v| self.matches_original(v))?;
+                original.channel.clone()
+            };
+            if let Some(deadline) = deadline_ms {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis();
+                if i128::try_from(now).ok()? >= i128::from(deadline) {
+                    return None;
+                }
+            }
+            let envelope = BoundaryClient::prepare_request(request).ok()?;
+            let response = client
+                .exchange_on_channel(channel, &envelope, &credential)
+                .await
+                .ok()?;
+            let closing = BoundaryCredential::capture(&client.sandbox_bearer).ok()?;
+            if closing.epoch != self.original_epoch
+                || closing.fingerprint != self.original_bearer_fingerprint
+            {
+                return None;
+            }
+            if !client
+                .grpc_channel
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|v| self.matches_original(v))
+            {
+                return None;
+            }
+            Some(response)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+#[async_trait]
+impl openshell_core::provider_credentials::ProviderWitnessBoundary for NativeWitnessBoundary {
+    async fn capability(
+        &self,
+    ) -> Option<openshell_core::provider_credentials::WitnessBoundaryCapability> {
+        match self.once(Request::WitnessCapability, None).await? {
+            Response::WitnessCapability { capability } => Some(capability),
+            _ => None,
+        }
+    }
+    async fn prepare(
+        &self,
+        operation: openshell_core::provider_credentials::WitnessOperation,
+    ) -> Option<openshell_core::provider_credentials::WitnessOperation> {
+        let deadline = operation.deadline_unix_ms;
+        match self
+            .once(
+                Request::WitnessPrepare(crate::boundary_protocol::WitnessPrepareRequest {
+                    binding: operation,
+                }),
+                Some(deadline),
+            )
+            .await?
+        {
+            Response::WitnessPrepared { operation } => Some(operation),
+            _ => None,
+        }
+    }
+    async fn permit(
+        &self,
+        permit: openshell_core::provider_credentials::WitnessCommittedPermit,
+    ) -> bool {
+        let deadline = permit.operation.deadline_unix_ms;
+        matches!(
+            self.once(
+                Request::WitnessPermit(crate::boundary_protocol::WitnessPermitRequest { permit }),
+                Some(deadline)
+            )
+            .await,
+            Some(Response::WitnessPermitConsumed)
+        )
+    }
+    async fn fence(&self, fence: openshell_core::provider_credentials::WitnessSourceFence) -> bool {
+        matches!(
+            self.once(
+                Request::WitnessFence(crate::boundary_protocol::WitnessFenceRequest { fence }),
+                None
+            )
+            .await,
+            Some(Response::WitnessFenceObserved { quiesced: true })
+        )
+    }
+}
+
+struct OrdinaryBoundary {
+    pin: NativeWitnessBoundary,
+    streams: Arc<openshell_core::provider_credentials::ordinary_observation::StreamRegistry>,
+}
+impl std::fmt::Debug for OrdinaryBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OrdinaryBoundary(<original-path>)")
+    }
+}
+impl OrdinaryBoundary {
+    async fn current(
+        &self,
+    ) -> Option<(Arc<BoundaryClient>, CachedGrpcChannel, BoundaryCredential)> {
+        if !self.streams.is_live() {
+            return None;
+        }
+        let client = self.pin.client.upgrade()?;
+        let credential = BoundaryCredential::capture(&client.sandbox_bearer).ok()?;
+        if credential.epoch != self.pin.original_epoch
+            || credential.fingerprint != self.pin.original_bearer_fingerprint
+        {
+            self.streams.invalidate();
+            return None;
+        }
+        let original = client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .filter(|c| self.pin.matches_original(c))
+            .cloned();
+        let Some(original) = original else {
+            self.streams.invalidate();
+            return None;
+        };
+        Some((client, original, credential))
+    }
+    async fn accept(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
+        let unavailable = || BackendError::Unavailable("original mediation path lost".into());
+        let (client, original, credential) = self.current().await.ok_or_else(unavailable)?;
+        let exchange = client.exchange_stream_on_channel(original.channel, request, &credential);
+        tokio::pin!(exchange);
+        // No lock held across wait. Credential or physical-connection loss
+        // cancels this original exchange; never recover or resend its envelope.
+        loop {
+            tokio::select! {
+                result = &mut exchange => {
+                    let result = result?;
+                    self.current().await.ok_or_else(unavailable)?;
+                    return Ok(result);
+                },
+                () = tokio::time::sleep(Duration::from_millis(100)) => { self.current().await.ok_or_else(unavailable)?; },
+            }
+        }
+    }
+}
+#[async_trait]
+impl openshell_core::provider_credentials::ordinary_observation::Boundary for OrdinaryBoundary {
+    async fn path(
+        &self,
+    ) -> Option<openshell_core::provider_credentials::ordinary_observation::OwnedPath> {
+        self.current().await?;
+        let Some(Response::ObservationPath { path }) =
+            self.pin.once(Request::ObservationPath, None).await
+        else {
+            self.streams.invalidate();
+            return None;
+        };
+        self.current().await?;
+        Some(path)
+    }
+    fn streams(
+        &self,
+    ) -> Arc<openshell_core::provider_credentials::ordinary_observation::StreamRegistry> {
+        self.streams.clone()
+    }
+}
+
+// The registered Box itself owns revocation and bridge cancellation. An Arc in
+// the membership registry cannot keep this allocation live or authorize reuse.
+struct ObservedNetworkStream {
+    stream: tokio::io::DuplexStream,
+    owner: Option<openshell_core::provider_credentials::ordinary_observation::StreamOwner>,
+    bridge: tokio::task::JoinHandle<()>,
+}
+impl Drop for ObservedNetworkStream {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.revoke();
+        }
+        self.bridge.abort(); // also cancels after RelayReady, not just before it
+    }
+}
+impl tokio::io::AsyncRead for ObservedNetworkStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for ObservedNetworkStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -883,7 +1190,40 @@ impl NetworkMediationSource for RemoteNetworkMediation {
         // the interrupted pending open; a retry never replays its decision.
         // Pending accepts and live relays each hold a stream until the relay ends.
         let permit = self.client.acquire_network_stream().await;
-        let (stream, response) = self.client.call_wait_stream(Request::AcceptNetwork).await?;
+        let candidate_observation = self.client.observation.get().cloned();
+        let mut original_observation = None;
+        let mut original_accept_id = None;
+        let (stream, response) = if let Some(original) = candidate_observation {
+            if !original.streams.is_live() && !original.streams.observing() {
+                // No live original observation can adopt this legacy recovery.
+                self.client.call_wait_stream(Request::AcceptNetwork).await?
+            } else {
+                let envelope = BoundaryClient::prepare_request(Request::AcceptNetwork)?;
+                match original.accept(&envelope).await {
+                    Ok(result) => {
+                        original_accept_id = Some(envelope.request_id.clone());
+                        original_observation = Some(original);
+                        result
+                    }
+                    Err(BackendError::Unavailable(message))
+                        if is_transport_unavailable(&message) && !original.streams.observing() =>
+                    {
+                        original.streams.invalidate();
+                        // Before an original window (or after every original
+                        // deadline), preserve the pre-existing normal network
+                        // recovery. These streams are NEVER registered as the
+                        // lost original path and no source identity is renewed.
+                        self.client.call_wait_stream(Request::AcceptNetwork).await?
+                    }
+                    Err(error) => {
+                        original.streams.invalidate();
+                        return Err(error);
+                    }
+                }
+            }
+        } else {
+            self.client.call_wait_stream(Request::AcceptNetwork).await?
+        };
         let Response::NetworkConnected {
             identity,
             destination,
@@ -896,12 +1236,51 @@ impl NetworkMediationSource for RemoteNetworkMediation {
         };
         let (decision, completion) = tokio::sync::oneshot::channel();
         let (proxy_stream, transport_stream) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(async move {
-            complete_network_open(stream, transport_stream, completion).await;
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<
+            openshell_core::provider_credentials::ordinary_observation::StreamCompletion,
+        >();
+        let bridge = tokio::spawn(async move {
+            let completion_guard = finished_rx.await.ok();
+            let clean = complete_network_open(stream, transport_stream, completion).await;
+            if clean && let Some(guard) = completion_guard {
+                guard.complete();
+            }
             drop(permit);
         });
+        let boxed: BoundaryDuplexStream = if let Some(original) = original_observation {
+            let mut owner = Box::new(ObservedNetworkStream {
+                stream: proxy_stream,
+                owner: None,
+                bridge,
+            });
+            let guard = original.streams.register(
+                &owner,
+                socket.socket_cookie,
+                original_accept_id.unwrap_or_default(),
+            );
+            let Some(guard) = guard else {
+                original.streams.invalidate();
+                drop(owner);
+                return Err(BackendError::Unavailable(
+                    "original stream registration refused".into(),
+                ));
+            };
+            let completion = guard.completion();
+            owner.owner = Some(guard);
+            let _ = finished_tx.send(completion);
+            owner
+        } else {
+            // Legacy traffic still owns/cancels its bridge, but has no registry
+            // membership and cannot be accepted as observation evidence.
+            drop(finished_tx);
+            Box::new(ObservedNetworkStream {
+                stream: proxy_stream,
+                owner: None,
+                bridge,
+            })
+        };
         Ok(PendingTcpOpen {
-            stream: Box::new(proxy_stream),
+            stream: boxed,
             binary_identity: identity.into_result(),
             destination,
             socket,
@@ -933,12 +1312,12 @@ async fn complete_network_open(
     mut boundary: BoundaryDuplexStream,
     mut transport: tokio::io::DuplexStream,
     completion: tokio::sync::oneshot::Receiver<TcpOpenDecision>,
-) {
+) -> bool {
     let decision = completion
         .await
         .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
     let Ok(payload) = serde_json::to_vec(&decision) else {
-        return;
+        return false;
     };
     if write_stream_frame(
         &mut boundary,
@@ -948,11 +1327,14 @@ async fn complete_network_open(
     .await
     .is_err()
     {
-        return;
+        return false;
     }
     if matches!(decision, TcpOpenDecision::RelayReady) {
-        let _ = tokio::io::copy_bidirectional(&mut boundary, &mut transport).await;
+        return tokio::io::copy_bidirectional(&mut boundary, &mut transport)
+            .await
+            .is_ok();
     }
+    false
 }
 
 const MEDIATION_EVENT_QUEUE: usize = 256;
@@ -1102,6 +1484,7 @@ struct BoundaryClient {
     credential_monitor_started: AtomicBool,
     network_streams: Arc<tokio::sync::Semaphore>,
     network_streams_exhausted: AtomicBool,
+    observation: std::sync::OnceLock<Arc<OrdinaryBoundary>>,
 }
 
 #[derive(Clone)]
@@ -1265,6 +1648,7 @@ impl BoundaryClient {
             credential_monitor_started: AtomicBool::new(false),
             network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
             network_streams_exhausted: AtomicBool::new(false),
+            observation: std::sync::OnceLock::new(),
         }
     }
 
@@ -1740,6 +2124,17 @@ impl BoundaryClient {
         envelope: &RequestEnvelope,
         credential: &BoundaryCredential,
     ) -> Result<Response, BackendError> {
+        self.exchange_stream_on_channel(channel, envelope, credential)
+            .await
+            .map(|(_, response)| response)
+    }
+
+    async fn exchange_stream_on_channel(
+        &self,
+        channel: tonic::transport::Channel,
+        envelope: &RequestEnvelope,
+        credential: &BoundaryCredential,
+    ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let request_id = envelope.request_id.clone();
         let mut stream = open_grpc_client_stream_with_authorization(
             channel,
@@ -1768,7 +2163,7 @@ impl BoundaryClient {
         }
         match response.response {
             Response::Error { kind, message } => Err(guest_error(kind, message)),
-            response => Ok(response),
+            response => Ok((stream, response)),
         }
     }
 
@@ -2308,6 +2703,14 @@ mod tests {
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
                         response: match envelope.request {
+                            Request::WitnessCapability
+                            | Request::ObservationPath
+                            | Request::WitnessPrepare(_)
+                            | Request::WitnessPermit(_)
+                            | Request::WitnessFence(_) => Response::Error {
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
+                                message: "optional witness unsupported by legacy fixture".into(),
+                            },
                             Request::DiscoverPolicy => Response::ImagePolicy {
                                 yaml: None,
                                 invalid: false,
@@ -3604,5 +4007,241 @@ mod tests {
         // The server observes the client's fatal alert and may fail its accept;
         // completing the task is sufficient for this rejection test.
         let _ = server.await;
+    }
+    #[tokio::test]
+    async fn witness_transport_never_adopts_replacement_connection_generation() {
+        use openshell_core::provider_credentials::ProviderWitnessBoundary as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: requests.clone(),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
+            provider_environment_generation: 0,
+            confirmation: test_confirmation(),
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBoundaryServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(address, test_certificate().client_tls),
+            test_bearer(&"a".repeat(32)),
+        ));
+        let original = CachedGrpcChannel {
+            credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            bearer_fingerprint: BoundaryCredential::capture(&client.sandbox_bearer)
+                .unwrap()
+                .fingerprint,
+            generation: 1,
+            channel,
+            transport: Arc::default(),
+        };
+        *client.grpc_channel.lock().await = Some(original.clone());
+        let adapter = NativeWitnessBoundary::pin(&client, &original);
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            generation: 2,
+            ..original.clone()
+        });
+        assert!(adapter.capability().await.is_none());
+        assert_eq!(
+            requests.load(Ordering::Acquire),
+            0,
+            "replacement transport must not receive an old adapter's request"
+        );
+        *client.grpc_channel.lock().await = None;
+        assert!(adapter.capability().await.is_none());
+        assert!(client.grpc_channel.lock().await.is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 0);
+        *client.grpc_channel.lock().await = Some(original.clone());
+        assert!(adapter.capability().await.is_none()); // One typed legacy refusal.
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            bearer_fingerprint: [0; 32],
+            ..original.clone()
+        });
+        assert!(adapter.capability().await.is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        *client.grpc_channel.lock().await = Some(original.clone());
+        original.transport.abort();
+        assert!(adapter.capability().await.is_none());
+        assert_eq!(requests.load(Ordering::Acquire), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn ordinary_owned_bridge_drop_releases_original_permit_before_and_after_ready() {
+        use openshell_core::provider_credentials::ordinary_observation::StreamRegistry;
+        for phase in 0..3 {
+            let permits = Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS));
+            let permit = permits.clone().acquire_owned().await.unwrap();
+            let registry = StreamRegistry::new();
+            let (original, mut peer) = tokio::io::duplex(4096);
+            let (proxy, transport) = tokio::io::duplex(4096);
+            let (decision, receiver) = tokio::sync::oneshot::channel();
+            let bridge = tokio::spawn(async move {
+                let _permit = permit;
+                complete_network_open(Box::new(original), transport, receiver).await;
+            });
+            let mut boxed = Box::new(ObservedNetworkStream {
+                stream: proxy,
+                owner: None,
+                bridge,
+            });
+            boxed.owner = Some(
+                registry
+                    .register(&boxed, 7, uuid::Uuid::new_v4().to_string())
+                    .unwrap(),
+            );
+            let lease = if phase != 0 {
+                Some(registry.take(&boxed, 7).unwrap())
+            } else {
+                None
+            };
+            if phase == 2 {
+                decision.send(TcpOpenDecision::RelayReady).unwrap();
+                let (kind, _payload) =
+                    tokio::time::timeout(Duration::from_secs(1), read_stream_frame(&mut peer))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(kind, crate::boundary_protocol::STREAM_NETWORK_DECISION);
+            } else {
+                drop(decision);
+            }
+            drop(boxed); // revokes synchronously, aborts even a live relay
+            assert!(lease.as_ref().is_none_or(|lease| !lease.live()));
+            let all = tokio::time::timeout(
+                Duration::from_secs(1),
+                permits
+                    .clone()
+                    .acquire_many_owned(MAX_NETWORK_STREAMS as u32),
+            )
+            .await
+            .expect("bridge leaked original permit")
+            .unwrap();
+            drop(all);
+            assert_eq!(permits.available_permits(), MAX_NETWORK_STREAMS);
+        }
+    }
+    #[tokio::test]
+    async fn ordinary_failed_take_drop_cancels_original_bridge_and_permit() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let bridge = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        let registry =
+            openshell_core::provider_credentials::ordinary_observation::StreamRegistry::new();
+        let (stream, _peer) = tokio::io::duplex(64);
+        let mut boxed = Box::new(ObservedNetworkStream {
+            stream,
+            owner: None,
+            bridge,
+        });
+        boxed.owner = Some(
+            registry
+                .register(&boxed, 9, uuid::Uuid::new_v4().to_string())
+                .unwrap(),
+        );
+        let lease = registry.take(&boxed, 9).unwrap();
+        assert!(registry.take(&boxed, 9).is_none());
+        drop(boxed);
+        assert!(!lease.live());
+        let all = tokio::time::timeout(
+            Duration::from_secs(1),
+            permits
+                .clone()
+                .acquire_many_owned(MAX_NETWORK_STREAMS as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(all);
+    }
+    #[tokio::test]
+    async fn ordinary_failed_registration_cancels_bridge_and_does_not_leak_permit() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let bridge = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        let registry =
+            openshell_core::provider_credentials::ordinary_observation::StreamRegistry::new();
+        registry.invalidate();
+        let (stream, _other) = tokio::io::duplex(64);
+        let boxed = Box::new(ObservedNetworkStream {
+            stream,
+            owner: None,
+            bridge,
+        });
+        assert!(
+            registry
+                .register(&boxed, 8, uuid::Uuid::new_v4().to_string())
+                .is_none()
+        );
+        drop(boxed);
+        let all = tokio::time::timeout(
+            Duration::from_secs(1),
+            permits
+                .clone()
+                .acquire_many_owned(MAX_NETWORK_STREAMS as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(all);
+    }
+    #[tokio::test]
+    async fn ordinary_original_pin_change_is_permanent_without_opening_or_recovering() {
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(
+                "127.0.0.1:1".parse().unwrap(),
+                test_certificate().client_tls,
+            ),
+            test_bearer(&"a".repeat(32)),
+        ));
+        let original = CachedGrpcChannel {
+            credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            bearer_fingerprint: BoundaryCredential::capture(&client.sandbox_bearer)
+                .unwrap()
+                .fingerprint,
+            generation: 1,
+            channel: tonic::transport::Endpoint::from_static("https://not-contacted.invalid")
+                .connect_lazy(),
+            transport: Arc::default(),
+        };
+        *client.grpc_channel.lock().await = Some(original.clone());
+        let ordinary = OrdinaryBoundary {
+            pin: NativeWitnessBoundary::pin(&client, &original),
+            streams:
+                openshell_core::provider_credentials::ordinary_observation::StreamRegistry::new(),
+        };
+        assert!(ordinary.current().await.is_some());
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            generation: 2,
+            ..original.clone()
+        });
+        assert!(ordinary.current().await.is_none());
+        *client.grpc_channel.lock().await = Some(original);
+        assert!(
+            ordinary.current().await.is_none(),
+            "restoring cache must not renew a lost original"
+        );
+        assert!(!ordinary.streams.is_live());
     }
 }

@@ -1093,6 +1093,7 @@ mod tests {
         let mut req = Request::new(GetCurrentUserRequest {});
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: "oidc-subject-123".to_string(),
                 display_name: Some("Alice".to_string()),
                 roles: vec!["openshell-user".to_string()],
@@ -1561,6 +1562,7 @@ mod tests {
         });
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
+                provider_detach_witness_approval: None,
                 subject: "alice".to_string(),
                 display_name: None,
                 roles: vec![],

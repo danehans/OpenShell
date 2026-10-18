@@ -15,6 +15,10 @@ use openshell_core::policy::{
 };
 use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
+use openshell_core::provider_credentials::{
+    ProviderCredentialState, WitnessCommittedPermit, WitnessLaunchGate, WitnessOperation,
+    WitnessSourceGuard,
+};
 use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol, PolicyViolation};
 use openshell_policy_schema::{
     FilesystemPolicy as AuthoredFilesystemPolicy, LandlockPolicy as AuthoredLandlockPolicy,
@@ -155,6 +159,7 @@ pub struct SandboxConfig {
 /// because policy evaluation is fast (microseconds) and contention is low
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
+    witness_gate: Arc<WitnessLaunchGate>,
     engine: Mutex<regorus::Engine>,
     binary_identity_required: bool,
     generation: Arc<AtomicU64>,
@@ -294,6 +299,7 @@ impl OpaEngine {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
+            witness_gate: WitnessLaunchGate::new(),
             engine: Mutex::new(engine),
             binary_identity_required,
             generation,
@@ -310,10 +316,62 @@ impl OpaEngine {
         self.binary_identity_required
     }
 
-    fn advance_generation(&self) -> u64 {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    /// Trusted bootstrap binds the one live credential gate before sharing the
+    /// engine. Rebinding a shared engine is intentionally not an API.
+    pub fn bind_witness_launch_gate(&mut self, credentials: &ProviderCredentialState) {
+        self.witness_gate = credentials.witness_launch_gate();
+    }
+
+    pub fn witness_launch_gate(&self) -> Arc<WitnessLaunchGate> {
+        self.witness_gate.clone()
+    }
+
+    fn advance_generation(&self, guard: &mut WitnessSourceGuard<'_>) -> Result<u64> {
+        if !guard.belongs_to(&self.witness_gate) {
+            return Err(miette::miette!("witness source gate owner mismatch"));
+        }
+        guard.invalidate();
+        let generation = self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                old.checked_add(1)
+            })
+            .map_err(|_| {
+                guard.disable();
+                miette::miette!("OPA generation exhausted")
+            })?
+            + 1;
         self.generation_tx.send_replace(generation);
-        generation
+        Ok(generation)
+    }
+
+    /// The source authorization linearization point L, with the same lock order
+    /// as every effective writer. No network/compilation/spawn occurs here.
+    pub fn commit_provider_witness(
+        &self,
+        credentials: &ProviderCredentialState,
+        operation: &WitnessOperation,
+        now_ms: i64,
+    ) -> Result<WitnessCommittedPermit> {
+        let mut source = self.witness_gate.lock();
+        if !source.belongs_to(&credentials.witness_launch_gate()) {
+            return Err(miette::miette!("witness source gate owner mismatch"));
+        }
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        if self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA state poisoned"))?
+            .is_some()
+        {
+            return Err(miette::miette!("witness policy is fail-closed"));
+        }
+        credentials
+            .commit_provider_witness_under_source_gate(&mut source, operation, now_ms)
+            .ok_or_else(|| miette::miette!("witness source authorization refused"))
     }
 
     /// Load policy from a `.rego` rules file and data from a YAML file.
@@ -710,16 +768,18 @@ impl OpaEngine {
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
+        let mut source_gate = self.witness_gate.lock();
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        *engine = new_engine;
-        *self
+        let mut fail_closed = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
+        self.advance_generation(&mut source_gate)?;
+        *engine = new_engine;
+        *fail_closed = None;
         Ok(())
     }
 
@@ -744,7 +804,7 @@ impl OpaEngine {
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
     ) -> Result<PolicyGenerationGuard> {
-        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, None, || {})
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, None, |_| {})
     }
 
     /// Reload the policy and middleware registry as one runtime generation.
@@ -754,7 +814,7 @@ impl OpaEngine {
         entrypoint_pid: u32,
         registry: MiddlewareRegistry,
     ) -> Result<PolicyGenerationGuard> {
-        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, Some(registry), || {})
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, Some(registry), |_| {})
     }
 
     /// Validate a complete candidate before publishing policy, middleware, and
@@ -769,7 +829,7 @@ impl OpaEngine {
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
         registry: Option<MiddlewareRegistry>,
-        commit_credentials: impl FnOnce(),
+        commit_credentials: impl FnOnce(&mut WitnessSourceGuard<'_>),
     ) -> Result<PolicyGenerationGuard> {
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
         let new_engine = new
@@ -777,6 +837,7 @@ impl OpaEngine {
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
         // Match clone_engine_for_tunnel's lock order (engine, then runner).
+        let mut source_gate = self.witness_gate.lock();
         let mut engine = self
             .engine
             .lock()
@@ -790,8 +851,8 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
         let new_runner = registry.map(|registry| runner.with_replacement_registry(registry));
-        let generation = self.advance_generation();
-        commit_credentials();
+        let generation = self.advance_generation(&mut source_gate)?;
+        commit_credentials(&mut source_gate);
         *engine = new_engine;
         if let Some(new_runner) = new_runner {
             *runner = new_runner;
@@ -808,16 +869,18 @@ impl OpaEngine {
     /// decisions deny with `reason` while the quarantine is active. Advancing
     /// the generation invalidates and wakes every pinned relay.
     pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
+        let mut source_gate = self.witness_gate.lock();
         let _engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        *self
+        let mut fail_closed = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
-            Some(reason.into());
-        Ok(self.advance_generation())
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
+        let generation = self.advance_generation(&mut source_gate)?;
+        *fail_closed = Some(reason.into());
+        Ok(generation)
     }
 
     pub fn fail_closed_reason(&self) -> Option<String> {
@@ -830,18 +893,19 @@ impl OpaEngine {
     /// Reactivate the compiled last-known-good engine after an operator
     /// explicitly selects the availability-oriented retention posture.
     pub fn exit_fail_closed(&self) -> Result<u64> {
+        let mut source_gate = self.witness_gate.lock();
         let _engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        let was_fail_closed = self
+        let mut fail_closed = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
-            .take()
-            .is_some();
-        if was_fail_closed {
-            Ok(self.advance_generation())
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
+        if fail_closed.is_some() {
+            let generation = self.advance_generation(&mut source_gate)?;
+            *fail_closed = None;
+            Ok(generation)
         } else {
             Ok(self.current_generation())
         }
@@ -880,6 +944,7 @@ impl OpaEngine {
     pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
         // Generation changes serialize through the engine lock so guarded
         // publication cannot overlap any runtime generation transition.
+        let mut source_gate = self.witness_gate.lock();
         let _engine = self
             .engine
             .lock()
@@ -888,8 +953,8 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        self.advance_generation(&mut source_gate)?;
         *runner = runner.with_replacement_registry(registry);
-        self.advance_generation();
         Ok(())
     }
 
@@ -3017,6 +3082,76 @@ mod tests {
                     .any(|event| event.contains("private-warning"))
             );
         });
+    }
+
+    #[test]
+    fn witness_gate_covers_actual_opa_policy_and_fail_closed_publication() {
+        let engine = test_engine();
+        let gate = engine.witness_launch_gate();
+        let mut epoch = gate.snapshot().epoch;
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+        assert!(gate.snapshot().epoch > epoch);
+        epoch = gate.snapshot().epoch;
+        engine.enter_fail_closed("synthetic gate test").unwrap();
+        assert!(gate.snapshot().epoch > epoch);
+        epoch = gate.snapshot().epoch;
+        engine.exit_fail_closed().unwrap();
+        assert!(gate.snapshot().epoch > epoch);
+        epoch = gate.snapshot().epoch;
+        let credentials =
+            ProviderCredentialState::from_child_env_snapshot(1, std::collections::HashMap::new());
+        engine
+            .reload_configuration_from_proto_with_pid(&test_proto(), 0, None, |source| {
+                assert!(source.belongs_to(&gate));
+                // The actual Core publication uses the borrowed outer guard rather
+                // than recursively acquiring it under OPA's engine lock.
+                let mut live = ProviderCredentialState::from_child_env_snapshot(
+                    1,
+                    std::collections::HashMap::new(),
+                );
+                assert!(live.bind_witness_launch_gate(gate.clone()));
+                live.install_prepared_under_source_gate(&credentials, source);
+            })
+            .unwrap();
+        assert!(gate.snapshot().epoch > epoch);
+    }
+    #[tokio::test]
+    async fn witness_gate_covers_actual_middleware_registry_publication() {
+        let engine = test_engine();
+        let gate = engine.witness_launch_gate();
+        let original = gate.snapshot().epoch;
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        engine.replace_middleware_registry(registry).unwrap();
+        assert!(gate.snapshot().epoch > original);
+    }
+    #[test]
+    fn witness_publication_waits_for_outer_gate_before_effective_generation() {
+        let engine = Arc::new(test_engine());
+        let gate = engine.witness_launch_gate();
+        let held = gate.lock();
+        let original = engine.current_generation();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                engine.enter_fail_closed("controlled ordering").unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        entered_rx.recv().unwrap();
+        assert_eq!(engine.current_generation(), original);
+        assert!(done_rx.try_recv().is_err());
+        drop(held);
+        done_rx.recv().unwrap();
+        writer.join().unwrap();
+        assert!(engine.current_generation() > original);
     }
 
     fn test_engine() -> OpaEngine {
@@ -11330,7 +11465,7 @@ network_policies:
             },
         );
         engine
-            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, |_| {
                 panic!("invalid candidate must not publish credentials");
             })
             .expect_err("invalid candidate");
@@ -11345,7 +11480,7 @@ network_policies:
         engine.enter_fail_closed("invalid candidate").unwrap();
         let mut committed = false;
         engine
-            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, |_| {
                 assert!(old.generation_guard().is_stale());
                 assert_eq!(engine.current_generation(), 2);
                 committed = true;

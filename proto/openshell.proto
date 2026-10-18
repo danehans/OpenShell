@@ -149,6 +149,76 @@ service OpenShell {
   }
 
   // Detach a provider record from an existing sandbox.
+  // Exact original execution/attachment boundary. No legacy fallback is safe.
+  rpc ConditionalDetachSandboxProvider(ConditionalDetachSandboxProviderRequest)
+      returns (ConditionalDetachSandboxProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach"
+      workspace_role: "user"
+    };
+  }
+  // Explicit optional attempt metadata write, never a detach or invocation.
+  rpc ArmProviderDetachAttempt(ArmProviderDetachAttemptRequest)
+      returns (ArmProviderDetachAttemptResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach"
+      workspace_role: "user"
+    };
+  }
+  // Reserve one original fixed-profile witness; never arms or detaches.
+  rpc ReserveProviderDetachWitness(ReserveProviderDetachWitnessRequest)
+      returns (ReserveProviderDetachWitnessResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:witness"
+      workspace_role: "user"
+    };
+  }
+  // First durable dispatch claim only; ambiguous outcomes never authorize replay.
+  rpc InvokeProviderDetachWitness(InvokeProviderDetachWitnessRequest)
+      returns (InvokeProviderDetachWitnessResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:witness"
+      workspace_role: "user"
+    };
+  }
+  // Read the original invocation only; never reserves, arms, refreshes or sends.
+  rpc GetProviderDetachWitnessInvocation(GetProviderDetachWitnessInvocationRequest)
+      returns (GetProviderDetachWitnessInvocationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:witness:read"
+      workspace_role: "user"
+    };
+  }
+  // Optional ordinary observer metadata only; no input, detach or model operation.
+  rpc BeginProviderDetachObservation(BeginProviderDetachObservationRequest) returns (BeginProviderDetachObservationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:observe"
+      workspace_role: "user"
+    };
+  }
+  // Optional ordinary observer metadata only; no input, detach or model operation.
+  rpc GetProviderDetachObservation(GetProviderDetachObservationRequest) returns (GetProviderDetachObservationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:observe:read"
+      workspace_role: "user"
+    };
+  }
+  // Closed read-only resolve/recover/observe queries; never redispatches mutation.
+  rpc GetConditionalProviderDetachState(GetConditionalProviderDetachStateRequest)
+      returns (GetConditionalProviderDetachStateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:provider-detach:read"
+      workspace_role: "user"
+    };
+  }
   rpc DetachSandboxProvider(DetachSandboxProviderRequest)
       returns (DetachSandboxProviderResponse) {
     option (openshell.options.v1.authorization) = {
@@ -1817,6 +1887,8 @@ message ProviderReadinessObservation {
   bool launch_environment_installed = 9;
   string process_instance_id = 10;
   ProviderReadinessReason reason = 11;
+  // Absent/unsupported by default; authenticated optional attempt reporting.
+  ProviderDetachSupervisorReportV1 provider_detach = 12;
 }
 
 // Operator view of desired and observed state; contains no credential material.
@@ -1864,6 +1936,11 @@ message ReportProviderReadinessResponse {
   reserved "report_interval_seconds", "observation_ttl_seconds";
   google.protobuf.Duration report_interval = 102;
   google.protobuf.Duration observation_ttl = 103;
+  // Native boot binding and original pending seal; no invocation authority.
+  string provider_detach_gateway_boot_id = 104;
+  ProviderDetachArmSealV1 provider_detach_pending = 105;
+  // Original server acceptance of installation, never a refreshed timestamp.
+  ProviderDetachArmSealV1 provider_detach_installed = 106;
 }
 
 // Delete sandbox response.
@@ -3135,6 +3212,8 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ProviderDetachWitnessControlV1 provider_detach_witness = 5;
+    ProviderObservationControlV1 provider_detach_observation = 6;
   }
 }
 
@@ -3146,6 +3225,8 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    ProviderDetachWitnessRequestV1 provider_detach_witness = 6;
+    ProviderObservationControlV1 provider_detach_observation = 7;
   }
 }
 
@@ -3997,4 +4078,496 @@ message IssueTrafficTokenResponse {
   string execution_id = 3;
   openshell.sandbox.v1.TrafficIdentityTarget target = 4;
   string configuration_sha256 = 5;
+}
+
+// Immutable resource authorization is separate from the freshly resolved action
+// target. IDs here are exact authentication/mutation preconditions, not selectors.
+message ProviderDetachResourceV1 {
+  string authority = 1;
+  string workspace = 2;
+  string sandbox = 3;
+  string sandbox_id = 4;
+  string execution_id = 5;
+  string provider = 6;
+  string provider_id = 7;
+}
+
+// Metadata only. uint64 values retain exact integer wire semantics; the v1
+// canonical target JSON projection encodes them as decimal strings.
+message ProviderDetachTargetV1 {
+  string authority = 1;
+  string workspace = 2;
+  string sandbox = 3;
+  string sandbox_id = 4;
+  string execution_id = 5;
+  uint64 sandbox_resource_version = 6;
+  string provider = 7;
+  string provider_id = 8;
+  uint64 provider_resource_version = 9;
+  string attachment_epoch = 10;
+  string configuration_fingerprint = 11;
+  string configuration_instance = 12;
+  uint64 config_revision = 13;
+  uint64 provider_env_revision = 14;
+  string native_policy_hash = 15;
+  uint32 native_policy_version = 16;
+}
+
+// Closed original Controller hash preimage. The gateway alias is distinct from
+// the native target authority; neither identity may be inferred from the other.
+message ProviderDetachSourceTargetV1 {
+  string gateway_id = 1;
+  string workspace = 2;
+  string sandbox = 3;
+  string sandbox_id = 4;
+  string execution_id = 5;
+  // Must be empty for provider detachment; retained to reject substitution.
+  string runtime_handle = 6;
+}
+
+message ProviderDetachIntentV1 {
+  uint32 schema_version = 1;
+  string profile_id = 2;
+  string violation_sha256 = 3;
+  ProviderDetachTargetV1 target = 4;
+  string target_sha256 = 5;
+}
+
+message ProviderDetachOriginalIntentV1 {
+  uint32 schema_version = 1;
+  ProviderDetachSourceTargetV1 target = 2;
+  string event_id = 3;
+  string policy_revision = 4;
+  string policy_hash = 5;
+  string rule_id = 6;
+  ProviderDetachIntentV1 detach = 7;
+}
+
+message ProviderDetachActionV1 {
+  uint32 schema_version = 1;
+  string action_id = 2;
+  string profile_id = 3;
+  string event_id = 4;
+  string intent_sha256 = 5;
+  ProviderDetachTargetV1 target = 6;
+  string target_sha256 = 7;
+  // Required, independently revalidated and pinned for the native hold lifetime.
+  ProviderDetachOriginalIntentV1 original_intent = 8;
+}
+
+message ProviderDetachReceiptV1 {
+  string action_id = 1;
+  string intent_sha256 = 2;
+  string target_sha256 = 3;
+  ProviderDetachTargetV1 target = 4;
+  string before_attachment_epoch = 5;
+  string after_attachment_epoch = 6;
+  string native_receipt_id = 7;
+  string hold_id = 8;
+  uint64 config_revision = 9;
+  uint64 provider_env_revision = 10;
+  string configuration_instance = 11;
+  string native_policy_hash = 12;
+  uint32 native_policy_version = 13;
+  google.protobuf.Timestamp recorded_time = 14;
+}
+
+// Missing is unknown, not authorization to call ConditionalDetach again.
+message ProviderDetachOutcomeV1 {
+  string state = 1;
+  ProviderDetachReceiptV1 receipt = 2;
+}
+
+message ProviderDetachObservationContextV1 {
+  string attempt_id = 1;
+  string challenge = 2;
+  google.protobuf.Timestamp not_before = 3;
+  google.protobuf.Timestamp deadline = 4;
+}
+
+message ProviderDetachACKV1 {
+  string action_id = 1;
+  string target_sha256 = 2;
+  string native_receipt_id = 3;
+  string hold_id = 4;
+  string sandbox_id = 5;
+  string execution_id = 6;
+  string provider_id = 7;
+  string attachment_epoch = 8;
+  string configuration_instance = 9;
+  uint64 config_revision = 10;
+  uint64 provider_env_revision = 11;
+  string native_policy_hash = 12;
+  uint32 native_policy_version = 13;
+  string supervisor_instance = 14;
+  string supervisor_session = 15;
+  uint64 sequence = 16;
+  string state = 17;
+  bool credentials_installed = 18;
+  bool policy_active = 19;
+  bool launch_environment_acknowledged = 20;
+  google.protobuf.Timestamp evaluated_time = 21;
+  google.protobuf.Timestamp observed_time = 22;
+}
+
+message ProviderDetachRefusalV1 {
+  string action_id = 1;
+  string target_sha256 = 2;
+  string attempt_id = 3;
+  string challenge = 4;
+  string supervisor_instance = 5;
+  string supervisor_session = 6;
+  uint64 sequence = 7;
+  string attachment_epoch = 8;
+  string configuration_instance = 9;
+  uint64 config_revision = 10;
+  uint64 provider_env_revision = 11;
+  bool unavailable = 12;
+  google.protobuf.Timestamp attempted_time = 13;
+  google.protobuf.Timestamp observed_time = 14;
+}
+
+message ProviderDetachObservationV1 {
+  ProviderDetachACKV1 ack = 1;
+  // Absent unless trusted fresh-attempt association is actually supported.
+  ProviderDetachRefusalV1 refusal = 2;
+}
+
+message ConditionalDetachSandboxProviderRequest {
+  // Only an explicitly named workspace is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderDetachActionV1 action = 2;
+}
+message ConditionalDetachSandboxProviderResponse { ProviderDetachOutcomeV1 outcome = 1; }
+
+message ResolveProviderDetachV1 { ProviderDetachResourceV1 resource = 1; }
+message RecoverProviderDetachV1 { ProviderDetachActionV1 action = 1; }
+message ObserveProviderDetachV1 {
+  ProviderDetachActionV1 action = 1;
+  ProviderDetachReceiptV1 receipt = 2;
+  ProviderDetachObservationContextV1 context = 3;
+}
+message GetConditionalProviderDetachStateRequest {
+  // Only an explicitly named workspace is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  oneof query {
+    ResolveProviderDetachV1 resolve = 2;
+    RecoverProviderDetachV1 recover = 3;
+    ObserveProviderDetachV1 observe = 4;
+    ProviderDetachArmRequestV1 query_attempt = 5;
+  }
+}
+message GetConditionalProviderDetachStateResponse {
+  oneof result {
+    ProviderDetachTargetV1 target = 1;
+    ProviderDetachOutcomeV1 outcome = 2;
+    ProviderDetachObservationV1 observation = 3;
+    ProviderDetachAttemptReadbackV1 attempt = 4;
+  }
+}
+
+// Closed v3 attempt identity. Exact JSON projection uses decimal-string uint64
+// and timestamp seconds; generated wire values alone confer no authority.
+message ProviderDetachAttemptV1 {
+  uint32 schema_version = 1;
+  string dispatcher_decision_id = 2;
+  string action_id = 3;
+  string intent_sha256 = 4;
+  string target_sha256 = 5;
+  string native_receipt_id = 6;
+  string hold_id = 7;
+  string authority = 8;
+  string gateway_boot_id = 9;
+  string workspace = 10;
+  string sandbox_id = 11;
+  string execution_id = 12;
+  string provider_id = 13;
+  string attachment_epoch = 14;
+  string configuration_instance = 15;
+  uint64 config_revision = 16;
+  uint64 provider_env_revision = 17;
+  string native_policy_hash = 18;
+  uint32 native_policy_version = 19;
+  string supervisor_instance = 20;
+  string supervisor_session = 21;
+  uint64 arm_capture_sequence = 22;
+  string challenge = 23;
+  google.protobuf.Timestamp not_before = 24;
+  google.protobuf.Timestamp deadline = 25;
+}
+message ProviderDetachArmRequestV1 {
+  ProviderDetachActionV1 original_action = 1;
+  ProviderDetachReceiptV1 original_receipt = 2;
+  ProviderDetachAttemptV1 attempt = 3;
+  string attempt_id = 4;
+  string request_sha256 = 5;
+}
+enum ProviderDetachArmStateV1 {
+  PROVIDER_DETACH_ARM_STATE_V1_UNSPECIFIED = 0;
+  PROVIDER_DETACH_ARM_STATE_V1_PENDING_DELIVERY = 1;
+  PROVIDER_DETACH_ARM_STATE_V1_ARMED = 2;
+  PROVIDER_DETACH_ARM_STATE_V1_CONSUMING = 3;
+  PROVIDER_DETACH_ARM_STATE_V1_TERMINAL = 4;
+  PROVIDER_DETACH_ARM_STATE_V1_EXPIRED = 5;
+  PROVIDER_DETACH_ARM_STATE_V1_UNKNOWN_OR_UNSUPPORTED = 6;
+}
+enum ProviderDetachAttemptResultV1 {
+  PROVIDER_DETACH_ATTEMPT_RESULT_V1_UNSPECIFIED = 0;
+  PROVIDER_DETACH_ATTEMPT_RESULT_V1_REFUSED = 1;
+  PROVIDER_DETACH_ATTEMPT_RESULT_V1_NOT_REFUSED = 2;
+  PROVIDER_DETACH_ATTEMPT_RESULT_V1_UNSUPPORTED = 3;
+  PROVIDER_DETACH_ATTEMPT_RESULT_V1_INVALIDATED = 4;
+}
+message ProviderDetachArmSealV1 {
+  ProviderDetachArmRequestV1 request = 1;
+  uint64 hold_generation = 2;
+  uint64 row_resource_version = 3;
+  uint64 install_sequence = 4;
+  google.protobuf.Timestamp installed_time = 5;
+}
+message ProviderDetachAttemptCurrentV1 {
+  string gateway_boot_id = 1;
+  uint64 hold_generation = 2;
+  uint64 row_resource_version = 3;
+  ProviderDetachACKV1 ack = 4;
+}
+message ProviderDetachAttemptReadbackV1 {
+  ProviderDetachArmStateV1 state = 1;
+  ProviderDetachArmSealV1 seal = 2;
+  ProviderDetachAttemptResultV1 result = 3;
+  ProviderDetachObservationV1 proof = 4;
+  ProviderDetachAttemptCurrentV1 current = 5;
+}
+message ArmProviderDetachAttemptRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderDetachArmRequestV1 request = 2;
+}
+message ArmProviderDetachAttemptResponse {
+  ProviderDetachAttemptReadbackV1 readback = 1;
+}
+
+// Closed fixed-profile identity. No executable, argv, environment, body or PTY.
+message ProviderDetachWitnessRequestV1 {
+  string run_id = 1;
+  string profile_id = 2;
+  string profile_sha256 = 3;
+  ProviderDetachArmSealV1 installed_arm = 4;
+  string source_incarnation = 5;
+  string boundary_incarnation = 6;
+  // Domain-separated digest of this message with this field cleared.
+  string request_sha256 = 7;
+}
+
+message ReserveProviderDetachWitnessRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderDetachWitnessRequestV1 request = 2;
+}
+message ReserveProviderDetachWitnessResponse {
+  ProviderDetachWitnessInvocationV1 invocation = 1;
+}
+message InvokeProviderDetachWitnessRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderDetachWitnessRequestV1 request = 2;
+}
+message InvokeProviderDetachWitnessResponse {
+  ProviderDetachWitnessInvocationV1 invocation = 1;
+}
+message GetProviderDetachWitnessInvocationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // EXACTLY ONE mode: original request OR exactly one metadata resource.
+  ProviderDetachWitnessRequestV1 request = 2;
+  // Repeated only to preserve and reject duplicate metadata selectors.
+  // This is not a batch/list API; zero or more than one resource refuses.
+  repeated ProviderDetachResourceV1 capability_resources = 3;
+}
+message GetProviderDetachWitnessInvocationResponse {
+  // Exactly one result mode. Original reads have no metadata-mode extras.
+  ProviderDetachWitnessInvocationV1 invocation = 1;
+  ProviderDetachWitnessControlV1 capability = 2;
+  ProviderDetachResourceV1 capability_resource = 3;
+  string capability_supervisor_session = 4;
+}
+
+message ProviderDetachWitnessInvocationV1 {
+  string original_key = 1;
+  string request_sha256 = 2;
+  // reserved, dispatching, unknown, terminal-refused, terminal-not-refused or invalidated.
+  string state = 3;
+  // Original Native proof remains independent of process exit/start/cancellation.
+  ProviderDetachAttemptReadbackV1 native_observation = 4;
+  bool source_invalidated = 5;
+  bool boundary_cancel_pending = 6;
+  bool boundary_quiesced = 7;
+}
+
+// Authenticated session metadata only, not standalone evidence or a credential.
+// Capability is sent after SessionAccepted, never inferred from a driver label.
+message ProviderDetachWitnessControlV1 {
+  string original_key = 1;
+  string request_sha256 = 2;
+  string source_incarnation = 3;
+  string boundary_incarnation = 4;
+  string profile_sha256 = 5;
+  // capability, unknown, source-invalidated, cancel-pending, boundary-quiesced.
+  string state = 6;
+  // Actual Native boundary execution, never derived from a caller's resource.
+  string execution_id = 7;
+}
+// Capability defaults false. A report belongs to the original authenticated
+// readiness sequence; retries never rewrite a prior observation or event time.
+message ProviderDetachSupervisorReportV1 {
+  bool supported = 1;
+  string gateway_boot_id = 2;
+  string attempt_id = 3;
+  string request_sha256 = 4;
+  uint64 install_sequence = 5;
+  google.protobuf.Timestamp installed_time = 6;
+  ProviderDetachAttemptResultV1 result = 7;
+  ProviderDetachRefusalV1 refusal = 8;
+}
+
+// Optional ordinary traffic observation. This never launches an agent or model.
+enum ProviderObservationPhaseV1 {
+  PROVIDER_OBSERVATION_PHASE_V1_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_PHASE_V1_BASELINE = 1;
+  PROVIDER_OBSERVATION_PHASE_V1_DETACHED = 2;
+}
+enum ProviderObservationStateV1 {
+  PROVIDER_OBSERVATION_STATE_V1_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_STATE_V1_PENDING_INSTALL = 1;
+  PROVIDER_OBSERVATION_STATE_V1_OPEN = 2;
+  PROVIDER_OBSERVATION_STATE_V1_TERMINAL = 3;
+  PROVIDER_OBSERVATION_STATE_V1_UNKNOWN = 4;
+  PROVIDER_OBSERVATION_STATE_V1_EXPIRED = 5;
+}
+enum ProviderObservationRewriteV1 {
+  PROVIDER_OBSERVATION_REWRITE_V1_UNOBSERVED = 0;
+  PROVIDER_OBSERVATION_REWRITE_V1_EXPECTED_MATERIALIZED = 1;
+  PROVIDER_OBSERVATION_REWRITE_V1_EXPECTED_UNAVAILABLE = 2;
+  PROVIDER_OBSERVATION_REWRITE_V1_OTHER_FAILURE = 3;
+  PROVIDER_OBSERVATION_REWRITE_V1_UNSUPPORTED = 4;
+}
+message ProviderObservationRequestV1 {
+  ProviderDetachResourceV1 resource = 1;
+  string run_id = 2;
+  string step_id = 3;
+  string profile_id = 4;
+  string profile_sha256 = 5;
+  string source_incarnation = 6;
+  string boundary_incarnation = 7;
+  google.protobuf.Timestamp deadline = 8;
+  ProviderObservationPhaseV1 phase = 9;
+  ProviderDetachArmSealV1 installed_arm = 10;
+  string baseline_mediation_path_receipt_sha256 = 11;
+  string request_sha256 = 12;
+  string evidence_scope = 13;
+}
+message ProviderObservationSnapshotV1 {
+  ProviderDetachResourceV1 resource = 1;
+  string profile_id = 2;
+  string profile_sha256 = 3;
+  string source_incarnation = 4;
+  string boundary_incarnation = 5;
+  string gateway_boot_id = 6;
+  string supervisor_instance = 7;
+  string supervisor_session = 8;
+  string configuration_sha256 = 9;
+  uint64 policy_generation = 10;
+  uint64 resolver_generation = 11;
+  string mediation_path_receipt_sha256 = 12;
+  uint64 current_ingress_sequence = 13;
+  string evidence_scope = 14;
+  ProviderObservationProcessWriterAttributionV1 process_writer_attribution = 15;
+  string mediation_path_id = 16;
+}
+message ProviderObservationWindowV1 {
+  ProviderObservationRequestV1 request = 1;
+  ProviderObservationSnapshotV1 installed_snapshot = 2;
+  string window_id = 3;
+  uint64 install_sequence = 4;
+  google.protobuf.Timestamp installed_time = 5;
+  uint64 ingress_watermark = 6;
+  string window_sha256 = 7;
+  google.protobuf.Timestamp capture_end = 8;
+}
+message ProviderObservationEventV1 {
+  string native_request_id = 1;
+  string native_connection_id = 2;
+  uint64 ingress_sequence = 3;
+  google.protobuf.Timestamp captured_time = 4;
+  string mediation_stream_receipt_sha256 = 5;
+  string route_class = 6;
+  string request_stream_class = 7;
+  ProviderObservationRewriteV1 rewrite = 8;
+  uint64 upstream_application_request_bytes = 9;
+  string native_response_id = 10;
+  string response_origin = 11;
+  uint64 response_sequence = 12;
+  string http_framing = 13;
+  string client_socket_write = 14;
+  uint64 upstream_response_bytes = 15;
+  google.protobuf.Timestamp closed_time = 16;
+  uint64 policy_generation = 17;
+  uint64 resolver_generation = 18;
+  string attempt_kind = 19;
+}
+message ProviderObservationResultV1 {
+  ProviderObservationWindowV1 window = 1;
+  ProviderObservationStateV1 state = 2;
+  repeated ProviderObservationEventV1 events = 3;
+  google.protobuf.Timestamp closed_time = 4;
+  string terminal_sha256 = 5;
+  ProviderObservationSnapshotV1 current_snapshot = 6;
+  ProviderDetachACKV1 detached_ack = 7;
+  uint64 current_report_sequence = 8;
+  string ack_window_sha256 = 9;
+  string ack_terminal_sha256 = 10;
+  ProviderObservationCurrentReplyV1 current_read = 11;
+}
+message ProviderObservationControlV1 {
+  oneof payload {
+    ProviderObservationRequestV1 install_request = 1;
+    ProviderObservationSnapshotV1 current_snapshot = 2;
+    ProviderObservationResultV1 report = 3;
+    ProviderObservationCurrentReadV1 current_read = 4;
+    ProviderObservationCurrentReplyV1 current_reply = 5;
+  }
+}
+message BeginProviderDetachObservationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderObservationRequestV1 request = 2;
+}
+message BeginProviderDetachObservationResponse {
+  ProviderObservationResultV1 result = 1;
+}
+message GetProviderDetachObservationRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  ProviderObservationRequestV1 original_request = 2;
+  ProviderDetachResourceV1 resource = 3;
+}
+message GetProviderDetachObservationResponse {
+  ProviderObservationResultV1 result = 1;
+  ProviderObservationSnapshotV1 snapshot = 2;
+  ProviderObservationCurrentReplyV1 current_read = 3;
+}
+message ProviderObservationCurrentReadV1 {
+  GetProviderDetachObservationRequest selector = 1;
+  ProviderObservationSnapshotV1 expected_identity = 2;
+  bytes read_correlation = 3;
+  google.protobuf.Timestamp read_deadline = 4;
+  string window_sha256 = 5;
+  string terminal_sha256 = 6;
+}
+message ProviderObservationCurrentReplyV1 {
+  ProviderObservationCurrentReadV1 original_read = 1;
+  ProviderObservationSnapshotV1 sampled_snapshot = 2;
+  uint32 active_attempts = 3;
+  bool accounting_fault = 4;
+  google.protobuf.Timestamp sampled_time = 5;
+}
+
+// This profile makes no per-process writer assertion. Zero is invalid.
+enum ProviderObservationProcessWriterAttributionV1 {
+  PROVIDER_OBSERVATION_PROCESS_WRITER_ATTRIBUTION_V1_UNSPECIFIED = 0;
+  PROVIDER_OBSERVATION_PROCESS_WRITER_ATTRIBUTION_V1_PROCESS_WRITER_UNPROVEN = 1;
 }

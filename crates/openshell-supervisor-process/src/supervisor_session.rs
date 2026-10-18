@@ -37,12 +37,55 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Closed, optional fixed-witness control path. Implementations must not
+/// retry an original request or translate it into ordinary Exec/RelayOpen.
+#[async_trait::async_trait]
+pub trait ProviderWitnessControl: Send + Sync {
+    fn capability(
+        &self,
+        session_id: &str,
+    ) -> Option<openshell_core::proto::ProviderDetachWitnessControlV1>;
+    async fn invoke(
+        &self,
+        session_id: &str,
+        request: openshell_core::proto::ProviderDetachWitnessRequestV1,
+    ) -> openshell_core::proto::ProviderDetachWitnessControlV1;
+    /// Optional ordinary factory is independent of fixed ELF support.
+    fn observation_capability(
+        &self,
+        _session: &str,
+        _instance: &str,
+    ) -> Option<openshell_core::proto::ProviderObservationSnapshotV1> {
+        None
+    }
+    async fn observation_command(
+        &self,
+        _session: &str,
+        _command: openshell_core::proto::ProviderObservationControlV1,
+    ) -> Option<openshell_core::proto::ProviderObservationControlV1> {
+        None
+    }
+    fn observation_reports(
+        &self,
+    ) -> Option<mpsc::Receiver<openshell_core::proto::ProviderObservationControlV1>> {
+        None
+    }
+    /// Source R happens before publishing session loss/reconnect.
+    fn disconnect(&self);
+    fn observations(
+        &self,
+    ) -> Option<mpsc::Receiver<openshell_core::proto::ProviderDetachWitnessControlV1>> {
+        None
+    }
+}
+
 /// Runtime identity and status channel shared with a supervisor session task.
 pub struct SessionRuntimeContext {
     /// Identifies the local supervisor process across gateway reconnects.
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    pub witness_control: Option<Arc<dyn ProviderWitnessControl>>,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -335,6 +378,7 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        witness_control: runtime.witness_control,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -350,6 +394,7 @@ struct SessionConfig {
     instance_id: String,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    witness_control: Option<Arc<dyn ProviderWitnessControl>>,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -360,7 +405,10 @@ async fn run_session_loop(config: SessionConfig) {
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config, attempt).await;
+        let result = Box::pin(run_single_session(&config, attempt)).await;
+        if let Some(control) = &config.witness_control {
+            control.disconnect();
+        }
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
@@ -408,17 +456,20 @@ async fn run_single_session(
     let (tx, rx) = mpsc::channel::<SupervisorMessage>(64);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-    // Send hello as the first message.
-    tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: config.sandbox_id.clone(),
-            instance_id: config.instance_id.clone(),
-            connection_epoch,
-            supports_provider_readiness: true,
-        })),
-    })
-    .await
-    .map_err(|_| "failed to queue hello")?;
+    // Reserve the bounded queue slot before constructing the large optional
+    // control enum. This preserves one send and the existing backpressure while
+    // avoiding a message-sized send future on the session task's stack.
+    tx.reserve()
+        .await
+        .map_err(|_| "failed to queue hello")?
+        .send(SupervisorMessage {
+            payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+                sandbox_id: config.sandbox_id.clone(),
+                instance_id: config.instance_id.clone(),
+                connection_epoch,
+                supports_provider_readiness: true,
+            })),
+        });
 
     // Open the bidirectional stream.
     let response = client
@@ -458,21 +509,83 @@ async fn run_single_session(
     ocsf_emit!(event);
     config.ready_tx.send_replace(true);
 
+    if let Some(control) = &config.witness_control
+        && let Some(capability) = control.capability(&accepted.session_id)
+    {
+        tx.reserve()
+            .await
+            .map_err(|_| "witness capability transport lost")?
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ProviderDetachWitness(
+                    capability,
+                )),
+            });
+    }
+
+    if let Some(snapshot) = config
+        .witness_control
+        .as_ref()
+        .and_then(|c| c.observation_capability(&accepted.session_id, &config.instance_id))
+    {
+        tx.try_send(SupervisorMessage { payload: Some(supervisor_message::Payload::ProviderDetachObservation(openshell_core::proto::ProviderObservationControlV1 { payload: Some(openshell_core::proto::provider_observation_control_v1::Payload::CurrentSnapshot(snapshot)) })) }).map_err(|_| "ordinary capability transport lost")?;
+    }
+    let mut ordinary_reports = config
+        .witness_control
+        .as_ref()
+        .and_then(|c| c.observation_reports());
+    let mut witness_observations = config
+        .witness_control
+        .as_ref()
+        .and_then(|c| c.observations());
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.tick().await; // skip immediate tick
 
     loop {
         tokio::select! {
-            msg = inbound.message() => {
-                let msg = match map_session_stream_message(
-                    msg,
-                    "gateway closed stream",
-                    &config.terminating,
-                )? {
+            ordinary = Box::pin(async { match &mut ordinary_reports { Some(rx) => rx.recv().await.map(Box::new), None => std::future::pending().await } }) => {
+                match ordinary {
+                    Some(value) => tx.try_send(SupervisorMessage { payload: Some(supervisor_message::Payload::ProviderDetachObservation(*value)) }).map_err(|_| "ordinary report transport unknown")?,
+                    None => { ordinary_reports = None; }
+                }
+            }
+            observation = async {
+                match &mut witness_observations {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match observation {
+                    Some(control) => { tx.try_send(SupervisorMessage { payload:Some(supervisor_message::Payload::ProviderDetachWitness(control)) })
+                        .map_err(|_| "witness observation transport unknown")?; }
+                    None => {witness_observations=None;}
+                }
+            }
+            // Keep the bounded but large optional control payload off the
+            // select union's stack; stream-close authorization is unchanged.
+            msg = Box::pin(async {
+                map_session_stream_message(inbound.message().await, "gateway closed stream", &config.terminating).map(Box::new)
+            }) => {
+                let msg = match *msg? {
                     SessionStreamMessage::Message(msg) => msg,
                     SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
                 };
+                if let Some(gateway_message::Payload::ProviderDetachObservation(request)) = &msg.payload {
+                    if let Some(control) = &config.witness_control
+                        && let Some(outcome) = control.observation_command(&accepted.session_id, request.clone()).await {
+                        tx.try_send(SupervisorMessage { payload: Some(supervisor_message::Payload::ProviderDetachObservation(outcome)) }).map_err(|_| "ordinary read/report transport unknown")?;
+                    }
+                    continue;
+                }
+                if let Some(gateway_message::Payload::ProviderDetachWitness(request)) = &msg.payload {
+                    if let Some(control) = &config.witness_control {
+                        let outcome = control.invoke(&accepted.session_id, request.clone()).await;
+                        // One send only. Queue/stream loss never retries execution.
+                        tx.try_send(SupervisorMessage { payload: Some(supervisor_message::Payload::ProviderDetachWitness(outcome)) })
+                            .map_err(|_| "witness original outcome unknown")?;
+                    }
+                    continue;
+                }
                 let context = GatewayMessageContext {
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,
@@ -493,9 +606,7 @@ async fn run_single_session(
                         SupervisorHeartbeat {},
                     )),
                 };
-                if tx.send(hb).await.is_err() {
-                    return Err("outbound channel closed".into());
-                }
+                tx.reserve().await.map_err(|_| "outbound channel closed")?.send(hb);
             }
         }
     }
@@ -588,7 +699,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
-                match handle_relay_open(
+                match Box::pin(handle_relay_open(
                     relay_open,
                     &ssh_socket_path,
                     port_forward,
@@ -596,7 +707,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                     channel,
                     tx,
                     terminating,
-                )
+                ))
                 .await
                 {
                     Ok(()) => {
@@ -665,12 +776,24 @@ async fn handle_relay_open(
     {
         Ok(target) => target,
         Err(err) => {
-            send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
+            Box::pin(send_relay_open_result(
+                &tx,
+                &channel_id,
+                false,
+                err.to_string(),
+            ))
+            .await;
             return Err(err);
         }
     };
 
-    send_relay_open_result(&tx, &channel_id, true, String::new()).await;
+    Box::pin(send_relay_open_result(
+        &tx,
+        &channel_id,
+        true,
+        String::new(),
+    ))
+    .await;
 
     let mut client = OpenShellClient::new(channel);
 
@@ -832,17 +955,16 @@ async fn send_relay_open_result(
     success: bool,
     error: String,
 ) {
-    let _ = tx
-        .send(SupervisorMessage {
-            payload: Some(supervisor_message::Payload::RelayOpenResult(
-                RelayOpenResult {
-                    channel_id: channel_id.to_string(),
-                    success,
-                    error,
-                },
-            )),
-        })
-        .await;
+    let _ = Box::pin(tx.send(SupervisorMessage {
+        payload: Some(supervisor_message::Payload::RelayOpenResult(
+            RelayOpenResult {
+                channel_id: channel_id.to_string(),
+                success,
+                error,
+            },
+        )),
+    }))
+    .await;
 }
 
 async fn open_target(
