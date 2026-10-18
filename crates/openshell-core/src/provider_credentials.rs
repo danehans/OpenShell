@@ -5382,7 +5382,12 @@ pub mod ordinary_observation {
                 },
                 |mut s| {
                     if s.entries.get(&key).is_some_and(|v| v.id == life.id) {
-                        if !life.complete.load(Ordering::Acquire) {
+                        // A clean byte bridge close is not evidence of an inspected route.
+                        if !life.complete.load(Ordering::Acquire)
+                            || !life.inspected.load(Ordering::Acquire)
+                            || !life.ready.load(Ordering::Acquire)
+                            || life.requests.load(Ordering::Acquire) != 0
+                        {
                             s.fault = true;
                         }
                         s.entries.remove(&key)
@@ -6508,6 +6513,7 @@ pub mod ordinary_observation {
             assert!(lease.authorized(Some(3)));
             let old_key = (std::ptr::from_ref(&*stream).cast::<()>() as usize, 11);
             let old_life = lease.life.clone();
+            lease.life.inspected.store(true, Ordering::Release);
             stream.guard.as_ref().unwrap().complete();
             // Reuse actual owned storage without any unsafe duplicate Box or
             // pointer dereference. Assignment must DROP the old stream first.
@@ -6520,11 +6526,12 @@ pub mod ordinary_observation {
             stream.guard = Some(r.register(&stream, 11, uuid()).unwrap());
             let fresh = r.take(&stream, 11).unwrap();
             assert!(fresh.authorized(Some(3)));
+            fresh.life.inspected.store(true, Ordering::Release);
             r.revoke(old_key, &old_life); // delayed old cleanup must not evict new
             assert!(fresh.live());
             assert!(
                 r.view(|pending, fault| Some((pending, fault)))
-                    .is_some_and(|v| v == (1, false))
+                    .is_some_and(|v| v == (0, false))
             );
             stream.guard.as_ref().unwrap().complete();
             drop(stream);
@@ -6615,8 +6622,36 @@ pub mod ordinary_observation {
             stream.guard = Some(r.register(&stream, 94, uuid()).unwrap());
             stream.guard.as_ref().unwrap().complete();
             let lease = r.take(&stream, 94).unwrap();
+            assert!(lease.authorized(Some(1)));
+            lease.life.inspected.store(true, Ordering::Release);
             drop(stream);
             assert!(closed.load(Ordering::Acquire));
+            assert!(!lease.live());
+        }
+        #[test]
+        fn ordinary_authorized_raw_close_does_not_erase_uninspected_fault() {
+            let registry = StreamRegistry::new();
+            let stream = registered(&registry, 96);
+            let lease = registry.take(&stream, 96).unwrap();
+            assert!(lease.authorized(Some(1)));
+            stream.guard.as_ref().unwrap().complete();
+            drop(stream);
+            assert_eq!(registry.view(|p, f| Some((p, f))), Some((0, true)));
+            assert!(!lease.live());
+        }
+        #[tokio::test]
+        async fn ordinary_clean_uninspected_close_keeps_window_unknown() {
+            let (observer, q, subject, boundary) = fixture().await;
+            observer.install(q.clone(), subject, 1000).unwrap();
+            let stream = registered(&boundary.streams, 95);
+            let lease = boundary.streams.take(&stream, 95).unwrap();
+            stream.guard.as_ref().unwrap().complete();
+            drop(stream);
+            assert_eq!(boundary.streams.view(|p, f| Some((p, f))), Some((0, true)));
+            assert_eq!(
+                observer.close(&q.request_sha256, 1010).unwrap().state,
+                ProviderObservationStateV1::Unknown as i32
+            );
             assert!(!lease.live());
         }
         #[test]
