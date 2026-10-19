@@ -18,6 +18,38 @@ use openshell_isolation_interface::contract::{BoundaryExec, ProviderEnvironmentI
 use openshell_supervisor_network::opa::PolicyGenerationGuard;
 use tokio::sync::watch;
 
+/// Enable only explicitly compiled observation support after the source gate is bound.
+/// This selects support, not a grant, Arm, task input or fixed-launcher profile.
+pub(crate) fn configure_provider_detach_observation(
+    credentials: &ProviderCredentialState,
+) -> miette::Result<()> {
+    configure_observation_profile(
+        credentials,
+        option_env!("OPENSHELL_ORDINARY_OBSERVATION_PROFILE"),
+        openshell_core::provider_credentials::fixed_provider_witness_profile().is_some(),
+    )
+}
+
+fn configure_observation_profile(
+    credentials: &ProviderCredentialState,
+    ordinary: Option<&str>,
+    fixed_profile_present: bool,
+) -> miette::Result<()> {
+    let ordinary_enabled = match ordinary {
+        None => false,
+        Some(openshell_core::provider_credentials::ordinary_observation::PROFILE) => true,
+        Some(_) => {
+            return Err(miette::miette!(
+                "unsupported compiled ordinary observation profile"
+            ));
+        }
+    };
+    if ordinary_enabled || fixed_profile_present {
+        credentials.enable_provider_detach_attempts();
+    }
+    Ok(())
+}
+
 /// Authority captured before consuming a provider response's credential fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnvironmentIdentity {
@@ -2075,6 +2107,88 @@ mod ordinary_factory_tests {
             self.streams.clone()
         }
     }
+    fn state() -> ProviderCredentialState {
+        ProviderCredentialState::from_environment(
+            1,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn ordinary_activation_default_off_invalid_refuses_and_fixed_compatibility() {
+        let disabled = state();
+        configure_observation_profile(&disabled, None, false).unwrap();
+        assert!(!disabled.provider_detach_attempts_enabled());
+        for invalid in [
+            "",
+            "1",
+            " ordinary-sandbox-mediation-static-bearer-v1",
+            "ordinary-sandbox-mediation-static-bearer-v2",
+        ] {
+            for fixed in [false, true] {
+                let credentials = state();
+                assert!(configure_observation_profile(&credentials, Some(invalid), fixed).is_err());
+                assert!(!credentials.provider_detach_attempts_enabled());
+            }
+        }
+        let legacy = state();
+        configure_observation_profile(&legacy, None, true).unwrap();
+        assert!(legacy.provider_detach_attempts_enabled());
+    }
+
+    #[test]
+    fn ordinary_both_production_initializers_use_the_shared_compiled_selector() {
+        // Guards the two actual assembly sites, not a standalone parser seam.
+        let source = include_str!("lib.rs");
+        assert_eq!(source.matches("provider_readiness::configure_provider_detach_observation(&provider_credentials)?").count(), 2);
+        assert!(!source.contains("provider_credentials.enable_provider_detach_attempts()"));
+        let credentials = state();
+        let configured = configure_provider_detach_observation(&credentials);
+        let compiled = option_env!("OPENSHELL_ORDINARY_OBSERVATION_PROFILE");
+        if compiled.is_some_and(|p| {
+            p != openshell_core::provider_credentials::ordinary_observation::PROFILE
+        }) {
+            assert!(configured.is_err());
+            assert!(!credentials.provider_detach_attempts_enabled());
+        } else {
+            configured.unwrap();
+            assert_eq!(
+                credentials.provider_detach_attempts_enabled(),
+                compiled.is_some()
+                    || openshell_core::provider_credentials::fixed_provider_witness_profile()
+                        .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_opt_in_does_not_supply_a_missing_original_boundary() {
+        let credentials = state();
+        configure_observation_profile(
+            &credentials,
+            Some(openshell_core::provider_credentials::ordinary_observation::PROFILE),
+            false,
+        )
+        .unwrap();
+        let engine = Arc::new(
+            openshell_supervisor_network::opa::OpaEngine::from_strings(
+                include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap(),
+        );
+        assert!(
+            ordinary_observation_control(credentials.clone(), engine.clone(), Tracker::new(), None)
+                .await
+                .is_none()
+        );
+        if openshell_core::provider_credentials::fixed_provider_witness_profile().is_none() {
+            assert!(fixed_witness_control(credentials, engine).await.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn ordinary_factory_is_independent_of_fixed_elf_and_disabled_by_default() {
         let credentials = ProviderCredentialState::from_environment(
@@ -2106,7 +2220,20 @@ mod ordinary_factory_tests {
                 .is_none()
         );
         assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        credentials.enable_provider_detach_attempts();
+        if option_env!("OPENSHELL_ORDINARY_OBSERVATION_PROFILE")
+            == Some(openshell_core::provider_credentials::ordinary_observation::PROFILE)
+        {
+            // In the explicitly opted-in build, exercise the same actual selector
+            // used by both production initializers before entering the real factory.
+            configure_provider_detach_observation(&credentials).unwrap();
+        } else {
+            configure_observation_profile(
+                &credentials,
+                Some(openshell_core::provider_credentials::ordinary_observation::PROFILE),
+                false,
+            )
+            .unwrap();
+        }
         let control = ordinary_observation_control(credentials, engine, Tracker::new(), None)
             .await
             .expect("ordinary factory must not require a compiled fixed ELF");
@@ -2116,6 +2243,26 @@ mod ordinary_factory_tests {
                 .capability(&uuid::Uuid::new_v4().to_string())
                 .is_none(),
             "ordinary factory must not enable fixed Invoke"
+        );
+        let session = uuid::Uuid::new_v4().to_string();
+        let instance = uuid::Uuid::new_v4().to_string();
+        // An activation flag supplies neither a replacement session nor readiness.
+        let _ = control.observation_capability(&session, &instance);
+        assert!(
+            control
+                .observation_capability(&uuid::Uuid::new_v4().to_string(), &instance)
+                .is_none()
+        );
+        assert!(
+            control
+                .observation_capability(&session, &uuid::Uuid::new_v4().to_string())
+                .is_none()
+        );
+        control.disconnect();
+        assert!(
+            control
+                .observation_capability(&session, &instance)
+                .is_none()
         );
     }
 }

@@ -113,6 +113,17 @@ witness schema, and retain all older public/durable/private compatibility guards
 
 ## Optional manual sandbox mediation-path observation
 
+Ordinary observation is an independent compile-time opt-in on the supervisor:
+`OPENSHELL_ORDINARY_OBSERVATION_PROFILE=ordinary-sandbox-mediation-static-bearer-v1`.
+An absent value leaves ordinary support off unless the existing real fixed-witness
+profile already enables shared observation support. Any other supplied value,
+including an empty value, fails supervisor initialization. Both production
+credential initialization paths apply this selector after binding the source gate.
+Record the value and exact source/binary identities when building matching runtime
+images. Ordinary-only opt-in requires no fixed ELF or artifact hash and does not
+enable the fixed launcher. It grants no OIDC scope, Arm, task input or model access;
+the original boundary, readiness and authorization checks still apply.
+
 The separate ordinary observer records traffic metadata on one original,
 inspected sandbox execution path. It does not run a task or model. Its profile
 is `ordinary-sandbox-mediation-static-bearer-v1`, with evidence scope
@@ -188,3 +199,65 @@ or phase checks, permit relaunch, or adopt a replacement session. Matching
 runtime/images, actual TLS/reference injection, narrow grants, model/spending
 allocation and live enforcement remain separate qualification gates. The
 synthetic TLS/SSE client trials establish none of those live properties.
+
+### Manual canonical preparation and original recovery
+
+The same `provider-detach-observe` example also offers `resolve`,
+`prepare-response`, `dispatch`, `recover`, `prepare-arm`, `arm`, `query-arm` and
+`prepare-observation`. These are closed SDK operations, not arbitrary RPC or
+command execution. Build this tool from the same reviewed SDK source; no installed
+executable or working issuer is implied by these examples.
+
+Use private owner-only metadata files and an existing private ledger directory.
+`prepare-response` reads the retained original `SecurityResponse` object, pins its
+name, namespace, UID and resource version, and projects the complete original spec
+through SDK validation. It copies the persisted `spec.requestID`; it never invents
+an action ID or refreshes the original target from `resolve`. The original object
+must fit the tool's existing 32 KiB metadata limit. Preserve the full export
+privately; do not substitute a later status, remove required original provenance
+or raise the limit to accommodate an unknown object.
+
+Every journal-derived action is controller-owned and **recover-only**, including
+when `status.attempts` is zero. `dispatch` refuses it. Optional separately admitted
+manual-original actions require an explicit protected custody record binding the
+operator session, original action/intent and resource digest. That record is
+custody metadata, not a grant or a controller fence; absence of a Kubernetes object
+is not manual ownership. The operator must already have actual exclusive custody.
+The tool cannot establish distributed exclusion or protect against a hostile host.
+Use one approved protected ledger directory throughout the operation.
+
+`dispatch` and `arm` exclusively persist consumed records keyed by the original
+action before constructing the client or sending once. Changing a session, token,
+input filename or challenge cannot reopen that action in the original ledger.
+Partial writes, fsync failure, constructor failure and lost responses stay consumed.
+Use `recover` or `query-arm` with the retained exact original, never delete or repair
+a record to retry. An expired Arm cannot be sent again.
+
+`prepare-arm` requires the actual bound Native receipt, an explicitly admitted
+decision UUID/challenge/deadline, and a current read of the exact action/receipt's
+zero-attempt bootstrap. It uses the authenticated boot/session, installed `REVOKED`
+ACK and sequence from that read, then SDK attempt-ID/hash/validation. Bootstrap is
+preparation metadata, not an installed Arm or refusal. Preparation consumes its own
+original intent before reading; an unknown read cannot renew the deadline, issue
+a new challenge or authorize another preparation. `arm` installs that one retained
+request; only `query-arm` may follow uncertainty.
+
+`prepare-observation` consumes its original run/step preparation intent before
+resource discovery. It uses actual ordinary metadata independently of any fixed
+ELF. Baseline carries no fake Arm or hold. Detached preparation queries the retained
+original Arm with a separate detach grant and requires its actual current seal;
+the gateway still independently validates it at `begin`. Use a different admitted
+step for each phase. Neither preparation command performs a task or begins an
+observation automatically. The existing `begin`, `consume-input` and `outcome`
+semantics remain unchanged.
+
+Observer operations use `-grant-file`; detach/Arm operations use
+`-detach-grant-file`. Detached preparation constructs distinct clients and refuses
+reused token bytes. The gateway remains the authority for the two disjoint scope
+allowlists, exact resource and workspace membership. Supply `-address` and `-ca`
+explicitly. Optional `-client-cert` and `-client-key` must be supplied together and
+are passed to the existing verified TLS client only when the actual gateway route
+requires mTLS. There is no insecure, ambient-credential or administrator fallback.
+All outputs are bounded metadata; manual outcomes remain separate from Native
+model-completion proof. Actual grants, matching images, deployment, real model
+budget and independent containment/control evidence require separate authorization.
