@@ -14,14 +14,138 @@ import (
 	"time"
 )
 
-const OrdinaryObservationProfile = "ordinary-sandbox-mediation-static-bearer-v1"
+const LegacyOrdinaryObservationProfile = "ordinary-sandbox-mediation-static-bearer-v1"
+const OrdinaryObservationProfile = "ordinary-sandbox-mediation-static-bearer-v2"
 const ordinaryMaxResult = 16384
-
+const ordinaryMaxResultV2 = 32780
 const OrdinaryObservationEvidenceScope = "original-sandbox-mediation-path/v1"
 
-func OrdinaryObservationProfileSHA256() string {
-	h := sha256.Sum256([]byte("openshell.provider-detach.sandbox-mediation-profile/v1\nordinary-sandbox-mediation-static-bearer-v1\nevidence_scope:original-sandbox-mediation-path/v1\nprocess_writer_identity:unproven\nhttp1:static-authorization-bearer\nstream:true,false,unobserved\nwindow:60s\nevents:8\nevent:512\nresult:16384\ncurrent:original-channel-read-v1\nassociation:retained-original-stream-allocation-v1\n"))
+func ordinaryProfileSHA256(profile string) string {
+	var descriptor string
+	switch profile {
+	case LegacyOrdinaryObservationProfile:
+		descriptor = "openshell.provider-detach.sandbox-mediation-profile/v1\nordinary-sandbox-mediation-static-bearer-v1\nevidence_scope:original-sandbox-mediation-path/v1\nprocess_writer_identity:unproven\nhttp1:static-authorization-bearer\nstream:true,false,unobserved\nwindow:60s\nevents:8\nevent:512\nresult:16384\ncurrent:original-channel-read-v1\nassociation:retained-original-stream-allocation-v1\n"
+	case OrdinaryObservationProfile:
+		descriptor = "openshell.provider-detach.sandbox-mediation-profile/v2\nordinary-sandbox-mediation-static-bearer-v2\nevidence_scope:original-sandbox-mediation-path/v1\nprocess_writer_identity:unproven\nhttp1:static-authorization-bearer\nstream:true,false,unobserved\nwindow:60s\nevents:8\nevent:512\nrequest:12291\nread:12293\nreply:12294\nresult:32780\narm:8192\nstripped:request4096,read4096,reply4096,result16384\ncurrent:original-channel-read-v1\nassociation:retained-original-stream-allocation-v1\n"
+	default:
+		return ""
+	}
+	h := sha256.Sum256([]byte(descriptor))
 	return hex.EncodeToString(h[:])
+}
+func OrdinaryObservationProfileSHA256() string {
+	return ordinaryProfileSHA256(OrdinaryObservationProfile)
+}
+func ordinaryProfileOK(profile, hash string) bool {
+	h := ordinaryProfileSHA256(profile)
+	return h != "" && h == hash
+}
+
+// Size projections never alter a borrowed message, wire bytes or canonical hash.
+func ordinaryStripRead(q *pb.ProviderObservationCurrentReadV1) {
+	if q != nil && q.Selector != nil && q.Selector.OriginalRequest != nil {
+		q.Selector.OriginalRequest.InstalledArm = nil
+	}
+}
+func ordinaryRequestFits(q *pb.ProviderObservationRequestV1) bool {
+	if q == nil || !ordinaryProfileOK(q.ProfileId, q.ProfileSha256) {
+		return false
+	}
+	if q.ProfileId == LegacyOrdinaryObservationProfile {
+		return proto.Size(q) <= 4096
+	}
+	if proto.Size(q) > 12291 || (q.InstalledArm != nil && proto.Size(q.InstalledArm) > 8192) {
+		return false
+	}
+	c := proto.Clone(q).(*pb.ProviderObservationRequestV1)
+	c.InstalledArm = nil
+	return proto.Size(c) <= 4096
+}
+func ordinaryQueryFits(q *pb.GetProviderDetachObservationRequest) bool {
+	if q == nil {
+		return false
+	}
+	if q.OriginalRequest == nil {
+		return proto.Size(q) <= 8192
+	}
+	if !ordinaryRequestFits(q.OriginalRequest) {
+		return false
+	}
+	if q.OriginalRequest.ProfileId == LegacyOrdinaryObservationProfile {
+		return proto.Size(q) <= 8192
+	}
+	if proto.Size(q) > 12293 {
+		return false
+	}
+	c := proto.Clone(q).(*pb.GetProviderDetachObservationRequest)
+	c.OriginalRequest.InstalledArm = nil
+	return proto.Size(c) <= 8192
+}
+func ordinaryReadFits(q *pb.ProviderObservationCurrentReadV1) bool {
+	if q == nil || proto.Size(q) > 12293 || q.ExpectedIdentity == nil || !ordinaryQueryFits(q.Selector) {
+		return false
+	}
+	s := q.ExpectedIdentity
+	if !ordinaryProfileOK(s.ProfileId, s.ProfileSha256) {
+		return false
+	}
+	if q.Selector != nil && q.Selector.OriginalRequest != nil {
+		r := q.Selector.OriginalRequest
+		if r.ProfileId != s.ProfileId || r.ProfileSha256 != s.ProfileSha256 || !ordinaryRequestFits(r) {
+			return false
+		}
+	}
+	if s.ProfileId == LegacyOrdinaryObservationProfile {
+		return proto.Size(q) <= 4096
+	}
+	if proto.Size(q) > 12293 {
+		return false
+	}
+	c := proto.Clone(q).(*pb.ProviderObservationCurrentReadV1)
+	ordinaryStripRead(c)
+	return proto.Size(c) <= 4096
+}
+func ordinaryReplyFits(q *pb.ProviderObservationCurrentReplyV1) bool {
+	if q == nil || proto.Size(q) > 12294 || !ordinaryReadFits(q.OriginalRead) || q.SampledSnapshot == nil {
+		return false
+	}
+	s := q.OriginalRead.ExpectedIdentity
+	if q.SampledSnapshot.ProfileId != s.ProfileId || q.SampledSnapshot.ProfileSha256 != s.ProfileSha256 {
+		return false
+	}
+	if s.ProfileId == LegacyOrdinaryObservationProfile {
+		return proto.Size(q) <= 4096
+	}
+	if proto.Size(q) > 12294 {
+		return false
+	}
+	c := proto.Clone(q).(*pb.ProviderObservationCurrentReplyV1)
+	ordinaryStripRead(c.OriginalRead)
+	return proto.Size(c) <= 4096
+}
+func ordinaryResultFits(q *pb.ProviderObservationResultV1) bool {
+	if q == nil || proto.Size(q) > ordinaryMaxResultV2 {
+		return false
+	}
+	if q.Window == nil || q.Window.Request == nil {
+		return proto.Size(q) <= ordinaryMaxResult
+	}
+	r := q.Window.Request
+	if !ordinaryRequestFits(r) || (q.CurrentRead != nil && !ordinaryReplyFits(q.CurrentRead)) {
+		return false
+	}
+	if r.ProfileId == LegacyOrdinaryObservationProfile {
+		return proto.Size(q) <= ordinaryMaxResult
+	}
+	if proto.Size(q) > ordinaryMaxResultV2 {
+		return false
+	}
+	c := proto.Clone(q).(*pb.ProviderObservationResultV1)
+	c.Window.Request.InstalledArm = nil
+	if c.CurrentRead != nil {
+		ordinaryStripRead(c.CurrentRead.OriginalRead)
+	}
+	return proto.Size(c) <= ordinaryMaxResult
 }
 
 // OrdinaryObservationRequest authorizes metadata observation only, never input.
@@ -96,7 +220,7 @@ func (q OrdinaryObservationRequest) SHA256() string {
 	return ordinaryDigest("openshell.provider-detach.sandbox-mediation-request/v1", n)
 }
 func (q OrdinaryObservationRequest) Validate() error {
-	if q.Resource.Validate() != nil || !detachValidUUID(q.RunID) || !detachValidUUID(q.StepID) || !detachValidUUID(q.SourceIncarnation) || !detachValidUUID(q.BoundaryIncarnation) || q.EvidenceScope != OrdinaryObservationEvidenceScope || q.ProfileID != OrdinaryObservationProfile || q.ProfileSHA256 != OrdinaryObservationProfileSHA256() || q.RequestSHA256 != q.SHA256() || q.Deadline.IsZero() || q.native().Deadline.CheckValid() != nil || proto.Size(q.native()) > 4096 {
+	if q.Resource.Validate() != nil || !detachValidUUID(q.RunID) || !detachValidUUID(q.StepID) || !detachValidUUID(q.SourceIncarnation) || !detachValidUUID(q.BoundaryIncarnation) || q.EvidenceScope != OrdinaryObservationEvidenceScope || !ordinaryProfileOK(q.ProfileID, q.ProfileSHA256) || q.RequestSHA256 != q.SHA256() || q.Deadline.IsZero() || q.native().Deadline.CheckValid() != nil || !ordinaryRequestFits(q.native()) {
 		return detachNativeError()
 	}
 	if q.Phase == "baseline" {
@@ -141,7 +265,7 @@ func ordinaryPathSHA256(n *pb.ProviderObservationSnapshotV1) string {
 
 func ordinaryMetadata(n *pb.ProviderObservationSnapshotV1, r ProviderDetachResource) (OrdinaryObservationMetadata, error) {
 	empty := OrdinaryObservationMetadata{}
-	if n == nil || n.EvidenceScope != OrdinaryObservationEvidenceScope || n.ProcessWriterAttribution != pb.ProviderObservationProcessWriterAttributionV1_PROVIDER_OBSERVATION_PROCESS_WRITER_ATTRIBUTION_V1_PROCESS_WRITER_UNPROVEN || !detachValidUUID(n.MediationPathId) || n.MediationPathReceiptSha256 != ordinaryPathSHA256(n) || !proto.Equal(n.Resource, detachResourceToProto(r)) || n.ProfileId != OrdinaryObservationProfile || n.ProfileSha256 != OrdinaryObservationProfileSHA256() || !detachValidUUID(n.SourceIncarnation) || !detachValidUUID(n.BoundaryIncarnation) || !detachValidUUID(n.GatewayBootId) || !detachValidUUID(n.SupervisorSession) || n.SupervisorInstance == "" || !detachHashPattern.MatchString(n.MediationPathReceiptSha256) || !detachHashPattern.MatchString(n.ConfigurationSha256) {
+	if n == nil || n.EvidenceScope != OrdinaryObservationEvidenceScope || n.ProcessWriterAttribution != pb.ProviderObservationProcessWriterAttributionV1_PROVIDER_OBSERVATION_PROCESS_WRITER_ATTRIBUTION_V1_PROCESS_WRITER_UNPROVEN || !detachValidUUID(n.MediationPathId) || n.MediationPathReceiptSha256 != ordinaryPathSHA256(n) || !proto.Equal(n.Resource, detachResourceToProto(r)) || !ordinaryProfileOK(n.ProfileId, n.ProfileSha256) || !detachValidUUID(n.SourceIncarnation) || !detachValidUUID(n.BoundaryIncarnation) || !detachValidUUID(n.GatewayBootId) || !detachValidUUID(n.SupervisorSession) || n.SupervisorInstance == "" || !detachHashPattern.MatchString(n.MediationPathReceiptSha256) || !detachHashPattern.MatchString(n.ConfigurationSha256) {
 		return empty, detachNativeError()
 	}
 	return OrdinaryObservationMetadata{r, n.SourceIncarnation, n.BoundaryIncarnation, n.GatewayBootId, n.SupervisorInstance, n.SupervisorSession, n.ProfileSha256, n.ConfigurationSha256, n.MediationPathReceiptSha256, n.CurrentIngressSequence, n.EvidenceScope, n.MediationPathId, false}, nil
@@ -189,7 +313,7 @@ func ordinarySame(a, b *pb.ProviderObservationSnapshotV1) bool {
 	return proto.Equal(x, y)
 }
 func ordinaryRead(n *pb.ProviderObservationCurrentReplyV1, selector *pb.GetProviderDetachObservationRequest, expected *pb.ProviderObservationSnapshotV1, window, terminal string, now time.Time) error {
-	if n == nil || proto.Size(n) > 4096 || n.OriginalRead == nil || n.SampledSnapshot == nil || n.SampledTime == nil || n.SampledTime.CheckValid() != nil {
+	if !ordinaryReplyFits(n) || n.OriginalRead == nil || n.SampledSnapshot == nil || n.SampledTime == nil || n.SampledTime.CheckValid() != nil {
 		return detachNativeError()
 	}
 	q := n.OriginalRead
@@ -216,7 +340,7 @@ func ordinaryRead(n *pb.ProviderObservationCurrentReplyV1, selector *pb.GetProvi
 }
 func ordinaryResult(n *pb.ProviderObservationResultV1, q OrdinaryObservationRequest, now time.Time) (OrdinaryObservationEvidence, error) {
 	out := OrdinaryObservationEvidence{HistoricalOnly: true, EvidenceScope: OrdinaryObservationEvidenceScope, ProcessWriterIdentityProven: false}
-	if n == nil || proto.Size(n) > ordinaryMaxResult {
+	if !ordinaryResultFits(n) {
 		return out, detachNativeError()
 	}
 	switch n.State {
@@ -244,7 +368,7 @@ func ordinaryResult(n *pb.ProviderObservationResultV1, q OrdinaryObservationRequ
 		out.CaptureEnd = w.CaptureEnd.AsTime()
 		out.IngressWatermark = w.IngressWatermark
 	}
-	if w.Request == nil || !proto.Equal(w.Request, q.native()) || w.InstalledSnapshot == nil || w.InstalledTime == nil || w.CaptureEnd == nil || w.CaptureEnd.CheckValid() != nil || w.InstalledTime.CheckValid() != nil || w.InstallSequence == 0 || !detachValidUUID(w.WindowId) || w.CaptureEnd.AsTime().After(q.Deadline.Add(-5*time.Second)) || !w.CaptureEnd.AsTime().After(w.InstalledTime.AsTime()) || w.CaptureEnd.AsTime().Sub(w.InstalledTime.AsTime()) > 60*time.Second {
+	if w.Request == nil || !proto.Equal(w.Request, q.native()) || w.InstalledSnapshot == nil || w.InstalledSnapshot.ProfileId != q.ProfileID || w.InstalledSnapshot.ProfileSha256 != q.ProfileSHA256 || w.InstalledTime == nil || w.CaptureEnd == nil || w.CaptureEnd.CheckValid() != nil || w.InstalledTime.CheckValid() != nil || w.InstallSequence == 0 || !detachValidUUID(w.WindowId) || w.CaptureEnd.AsTime().After(q.Deadline.Add(-5*time.Second)) || !w.CaptureEnd.AsTime().After(w.InstalledTime.AsTime()) || w.CaptureEnd.AsTime().Sub(w.InstalledTime.AsTime()) > 60*time.Second {
 		return out, detachNativeError()
 	}
 	copyWindow := proto.Clone(w).(*pb.ProviderObservationWindowV1)
@@ -381,7 +505,11 @@ func (c *ProviderDetachmentClient) QueryOrdinaryObservation(ctx context.Context,
 		return empty, err
 	}
 	defer cancel()
-	n, err := c.rpc.GetProviderDetachObservation(bounded, &pb.GetProviderDetachObservationRequest{WorkspaceScope: namedWorkspaceScope(c.resource.Workspace), OriginalRequest: q.native()})
+	selector := &pb.GetProviderDetachObservationRequest{WorkspaceScope: namedWorkspaceScope(c.resource.Workspace), OriginalRequest: q.native()}
+	if !ordinaryQueryFits(selector) {
+		return empty, detachNativeError()
+	}
+	n, err := c.rpc.GetProviderDetachObservation(bounded, selector)
 	if err != nil {
 		return empty, converter.FromGRPCError(err)
 	}

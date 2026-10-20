@@ -20,7 +20,7 @@ use tokio::sync::watch;
 
 /// Enable only explicitly compiled observation support after the source gate is bound.
 /// This selects support, not a grant, Arm, task input or fixed-launcher profile.
-pub(crate) fn configure_provider_detach_observation(
+pub fn configure_provider_detach_observation(
     credentials: &ProviderCredentialState,
 ) -> miette::Result<()> {
     configure_observation_profile(
@@ -30,6 +30,19 @@ pub(crate) fn configure_provider_detach_observation(
     )
 }
 
+// Without explicit v2 opt-in, the existing optional fixed-profile route
+// retains the legacy ordinary profile and its original byte ceilings.
+fn ordinary_profile_selection(ordinary: Option<&str>) -> &'static str {
+    use openshell_core::provider_credentials::ordinary_observation as obs;
+    match ordinary {
+        Some(obs::PROFILE) => obs::PROFILE,
+        _ => obs::LEGACY_PROFILE,
+    }
+}
+fn compiled_ordinary_profile() -> &'static str {
+    ordinary_profile_selection(option_env!("OPENSHELL_ORDINARY_OBSERVATION_PROFILE"))
+}
+
 fn configure_observation_profile(
     credentials: &ProviderCredentialState,
     ordinary: Option<&str>,
@@ -37,7 +50,10 @@ fn configure_observation_profile(
 ) -> miette::Result<()> {
     let ordinary_enabled = match ordinary {
         None => false,
-        Some(openshell_core::provider_credentials::ordinary_observation::PROFILE) => true,
+        Some(
+            openshell_core::provider_credentials::ordinary_observation::PROFILE
+            | openshell_core::provider_credentials::ordinary_observation::LEGACY_PROFILE,
+        ) => true,
         Some(_) => {
             return Err(miette::miette!(
                 "unsupported compiled ordinary observation profile"
@@ -1865,8 +1881,8 @@ impl OrdinaryControl {
                     ..Default::default()
                 })
             }),
-            profile_id: obs::PROFILE.into(),
-            profile_sha256: obs::profile_digest(),
+            profile_id: compiled_ordinary_profile().into(),
+            profile_sha256: obs::profile_digest_for(compiled_ordinary_profile())?,
             source_incarnation: self
                 .credentials
                 .witness_launch_gate()
@@ -2002,8 +2018,7 @@ impl openshell_supervisor_process::supervisor_session::ProviderWitnessControl fo
     ) -> Option<openshell_core::proto::ProviderObservationControlV1> {
         use openshell_core::proto::provider_observation_control_v1::Payload;
         use openshell_core::provider_credentials::ordinary_observation as obs;
-        use prost::Message;
-        if command.encoded_len() > obs::MAX_RESULT {
+        if !obs::control_fits(&command) {
             return None;
         }
         let payload = match command.payload? {
@@ -2125,7 +2140,7 @@ mod ordinary_factory_tests {
             "",
             "1",
             " ordinary-sandbox-mediation-static-bearer-v1",
-            "ordinary-sandbox-mediation-static-bearer-v2",
+            "ordinary-sandbox-mediation-static-bearer-v3",
         ] {
             for fixed in [false, true] {
                 let credentials = state();
@@ -2139,6 +2154,26 @@ mod ordinary_factory_tests {
     }
 
     #[test]
+    fn ordinary_v2_and_legacy_compile_profiles_are_explicit_not_fixed_artifacts() {
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        assert_eq!(ordinary_profile_selection(None), obs::LEGACY_PROFILE);
+        assert_eq!(
+            ordinary_profile_selection(Some(obs::LEGACY_PROFILE)),
+            obs::LEGACY_PROFILE
+        );
+        assert_eq!(ordinary_profile_selection(Some(obs::PROFILE)), obs::PROFILE);
+        for profile in [obs::LEGACY_PROFILE, obs::PROFILE] {
+            let credentials = state();
+            configure_observation_profile(&credentials, Some(profile), false).unwrap();
+            assert!(credentials.provider_detach_attempts_enabled());
+        }
+        assert_ne!(
+            obs::profile_digest_for(obs::LEGACY_PROFILE),
+            obs::profile_digest_for(obs::PROFILE)
+        );
+    }
+
+    #[test]
     fn ordinary_both_production_initializers_use_the_shared_compiled_selector() {
         // Guards the two actual assembly sites, not a standalone parser seam.
         let source = include_str!("lib.rs");
@@ -2149,6 +2184,7 @@ mod ordinary_factory_tests {
         let compiled = option_env!("OPENSHELL_ORDINARY_OBSERVATION_PROFILE");
         if compiled.is_some_and(|p| {
             p != openshell_core::provider_credentials::ordinary_observation::PROFILE
+                && p != openshell_core::provider_credentials::ordinary_observation::LEGACY_PROFILE
         }) {
             assert!(configured.is_err());
             assert!(!credentials.provider_detach_attempts_enabled());

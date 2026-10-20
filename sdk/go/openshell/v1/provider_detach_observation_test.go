@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 	proto "google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,5 +128,195 @@ func TestOrdinaryObservationActualClientOneSendAndExactRecovery(t *testing.T) {
 	}
 	if f.get != 1 || f.query.OriginalRequest == nil || f.query.Resource != nil {
 		t.Fatal("recovery changed mode")
+	}
+}
+
+// Byte-envelope fixtures are not authorization fixtures. Existing client and
+// Arm tests plus the retained private regression cover complete semantic checks.
+func byteOrdinaryArm(t *testing.T, size int) *pb.ProviderDetachArmSealV1 {
+	t.Helper()
+	for n := 0; n <= size; n++ {
+		a := &pb.ProviderDetachArmSealV1{Request: &pb.ProviderDetachArmRequestV1{AttemptId: strings.Repeat("a", n)}}
+		if proto.Size(a) == size {
+			return a
+		}
+	}
+	t.Fatal("unreachable seal size")
+	return nil
+}
+func byteOrdinaryRequest() *pb.ProviderObservationRequestV1 {
+	return &pb.ProviderObservationRequestV1{ProfileId: OrdinaryObservationProfile, ProfileSha256: OrdinaryObservationProfileSHA256(), Resource: &pb.ProviderDetachResourceV1{}}
+}
+func padOrdinaryRequest(t *testing.T, q *pb.ProviderObservationRequestV1, size int) {
+	t.Helper()
+	for n := 0; n <= size; n++ {
+		q.Resource.Authority = strings.Repeat("a", n)
+		if proto.Size(q) == size {
+			return
+		}
+	}
+	t.Fatal("unreachable size")
+}
+func TestOrdinaryV2RequestExactBoundaryAndLegacySeparation(t *testing.T) {
+	if ordinaryProfileSHA256(LegacyOrdinaryObservationProfile) != "d0d289d4154d013b241b7db743d73c57281e4217d75676187892ba9af75cc3fb" || OrdinaryObservationProfileSHA256() != "3a3eb5c329052de53d7df9379e90ee6aa2a8caeaeeae2b7608af2035b6cbc01b" {
+		t.Fatal("profile vector")
+	}
+	q := byteOrdinaryRequest()
+	padOrdinaryRequest(t, q, 4096)
+	q.InstalledArm = byteOrdinaryArm(t, 8192)
+	before := proto.Clone(q)
+	if proto.Size(q) != 12291 || !ordinaryRequestFits(q) || !proto.Equal(q, before) {
+		t.Fatal("exact request bound/mutation")
+	}
+	q.Resource.Authority += "x"
+	if proto.Size(q) != 12292 || ordinaryRequestFits(q) {
+		t.Fatal("oversize request")
+	}
+	q = proto.Clone(before).(*pb.ProviderObservationRequestV1)
+	q.InstalledArm = byteOrdinaryArm(t, 8193)
+	if ordinaryRequestFits(q) {
+		t.Fatal("oversize seal")
+	}
+	q = proto.Clone(before).(*pb.ProviderObservationRequestV1)
+	q.ProfileId = LegacyOrdinaryObservationProfile
+	q.ProfileSha256 = ordinaryProfileSHA256(q.ProfileId)
+	if ordinaryRequestFits(q) {
+		t.Fatal("legacy silently widened")
+	}
+	q.InstalledArm = nil
+	if !ordinaryRequestFits(q) {
+		t.Fatal("legacy exact4096")
+	}
+	q.Resource.Authority += "x"
+	if ordinaryRequestFits(q) {
+		t.Fatal("legacy4097")
+	}
+}
+func TestOrdinaryV2ReadReplyResultFullAndStrippedBudgets(t *testing.T) {
+	q, r, _ := ordinaryFixture(t)
+	arm := byteOrdinaryArm(t, 3809)
+	r.Window.Request.InstalledArm = arm
+	r.CurrentRead.OriginalRead.Selector.OriginalRequest.InstalledArm = proto.Clone(arm).(*pb.ProviderDetachArmSealV1)
+	before := proto.Clone(r)
+	if proto.Size(r.CurrentRead) <= 4096 || !ordinaryReadFits(r.CurrentRead.OriginalRead) || !ordinaryReplyFits(r.CurrentRead) || !ordinaryResultFits(r) || !proto.Equal(r, before) {
+		t.Fatal("complete arm accounting/mutation")
+	}
+	for _, which := range []string{"read", "reply", "result", "mixed"} {
+		t.Run(which, func(t *testing.T) {
+			n := proto.Clone(r).(*pb.ProviderObservationResultV1)
+			switch which {
+			case "read":
+				n.CurrentRead.OriginalRead.ReadCorrelation = make([]byte, 12294)
+			case "reply":
+				n.CurrentRead.SampledSnapshot.SupervisorInstance = strings.Repeat("x", 12295)
+			case "result":
+				n.AckWindowSha256 = strings.Repeat("x", 32781)
+			case "mixed":
+				n.CurrentRead.SampledSnapshot.ProfileSha256 = ordinaryProfileSHA256(LegacyOrdinaryObservationProfile)
+			}
+			if ordinaryResultFits(n) {
+				t.Fatal("oversize or version mix accepted")
+			}
+		})
+	}
+	// Full ceilings are conservative maxima, not a promise every shape at the
+	// ceiling is admissible. The old stripped ceiling also applies independently.
+	for _, limit := range []int{12293, 12294, 32780} {
+		n := proto.Clone(r).(*pb.ProviderObservationResultV1)
+		n.AckWindowSha256 = strings.Repeat("x", limit)
+		if ordinaryResultFits(n) {
+			t.Fatal("ignored stripped16384")
+		}
+	}
+	_ = q
+}
+func TestOrdinaryV1HistoricalAndCurrentVectorsRemainReadable(t *testing.T) {
+	q, r, now := ordinaryFixture(t)
+	q.ProfileID = LegacyOrdinaryObservationProfile
+	q.ProfileSHA256 = ordinaryProfileSHA256(q.ProfileID)
+	q.RequestSHA256 = q.SHA256()
+	r.Window.Request = q.native()
+	for _, s := range []*pb.ProviderObservationSnapshotV1{r.Window.InstalledSnapshot, r.CurrentSnapshot, r.CurrentRead.OriginalRead.ExpectedIdentity, r.CurrentRead.SampledSnapshot} {
+		s.ProfileId = q.ProfileID
+		s.ProfileSha256 = q.ProfileSHA256
+		s.MediationPathReceiptSha256 = ordinaryPathSHA256(s)
+	}
+	r.Events[0].MediationStreamReceiptSha256 = r.Window.InstalledSnapshot.MediationPathReceiptSha256
+	r.Window.WindowSha256 = ""
+	r.Window.WindowSha256 = ordinaryDigest("openshell.provider-detach.sandbox-mediation-window/v1", r.Window)
+	r.CurrentRead = nil
+	r.CurrentSnapshot = nil
+	r.CurrentReportSequence = 0
+	r.AckWindowSha256 = ""
+	r.AckTerminalSha256 = ""
+	r.TerminalSha256 = ""
+	r.TerminalSha256 = ordinaryDigest("openshell.provider-detach.sandbox-mediation-terminal/v1", r)
+	if q.Validate() != nil {
+		t.Fatal("legacy request refused")
+	}
+	v, e := ordinaryResult(r, q, now)
+	if e != nil || !v.HistoricalOnly || v.Current {
+		t.Fatal("legacy history reinterpreted", e)
+	}
+}
+
+func TestOrdinaryV2NestedExactReadReplyResultEdges(t *testing.T) {
+	q := byteOrdinaryRequest()
+	q.InstalledArm = byteOrdinaryArm(t, 8192)
+	snapshot := &pb.ProviderObservationSnapshotV1{ProfileId: OrdinaryObservationProfile, ProfileSha256: OrdinaryObservationProfileSHA256()}
+	small := &pb.ProviderObservationCurrentReadV1{Selector: &pb.GetProviderDetachObservationRequest{OriginalRequest: q}, ExpectedIdentity: snapshot}
+	read := proto.Clone(small).(*pb.ProviderObservationCurrentReadV1)
+	found := false
+	for n := 0; n < 4096; n++ {
+		read.ReadCorrelation = make([]byte, n)
+		if proto.Size(read) == 12293 {
+			found = true
+			break
+		}
+	}
+	if !found || !ordinaryReadFits(read) {
+		t.Fatal("exact read edge")
+	}
+	read.ReadCorrelation = append(read.ReadCorrelation, 1)
+	if proto.Size(read) != 12294 || ordinaryReadFits(read) {
+		t.Fatal("read edge+1")
+	}
+	reply := &pb.ProviderObservationCurrentReplyV1{OriginalRead: proto.Clone(small).(*pb.ProviderObservationCurrentReadV1), SampledSnapshot: proto.Clone(snapshot).(*pb.ProviderObservationSnapshotV1)}
+	found = false
+	for n := 0; n < 4096; n++ {
+		reply.SampledSnapshot.SupervisorInstance = strings.Repeat("s", n)
+		if proto.Size(reply) == 12293 {
+			found = true
+			break
+		}
+	}
+	if !found || !ordinaryReplyFits(reply) {
+		t.Fatal("reachable reply edge")
+	}
+	reply.SampledSnapshot.SupervisorInstance += "s"
+	if proto.Size(reply) != 12294 || ordinaryReplyFits(reply) {
+		t.Fatal("full reply ceiling must not waive stripped4096")
+	}
+	reply.SampledSnapshot.SupervisorInstance += "s"
+	if proto.Size(reply) != 12295 || ordinaryReplyFits(reply) {
+		t.Fatal("reply+1")
+	}
+	result := &pb.ProviderObservationResultV1{Window: &pb.ProviderObservationWindowV1{Request: q}, CurrentRead: &pb.ProviderObservationCurrentReplyV1{OriginalRead: small, SampledSnapshot: snapshot}}
+	found = false
+	for n := 0; n < 16384; n++ {
+		result.AckWindowSha256 = strings.Repeat("a", n)
+		if proto.Size(result) == 32778 {
+			found = true
+			break
+		}
+	}
+	if !found || !ordinaryResultFits(result) {
+		t.Fatal("reachable result edge")
+	}
+	for _, target := range []int{32779, 32780, 32781} {
+		result.AckWindowSha256 += "a"
+		if proto.Size(result) != target || ordinaryResultFits(result) {
+			t.Fatal("full result ceiling waived stripped16384", target)
+		}
 	}
 }

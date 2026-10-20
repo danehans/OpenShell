@@ -706,7 +706,7 @@ impl SqliteStore {
         use base64::{Engine, engine::general_purpose::STANDARD};
         use openshell_core::provider_credentials::ordinary_observation as obs;
         let bad = || PersistenceError::Config("ordinary terminal binding refused".into());
-        if result.encoded_len() > obs::MAX_RESULT
+        if !obs::result_fits(result)
             || result.window.as_ref().and_then(|w| w.request.as_ref()) != Some(q)
             || result.terminal_sha256.is_empty()
             || result.terminal_sha256 != obs::terminal_digest(result)

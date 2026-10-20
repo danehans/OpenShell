@@ -700,6 +700,15 @@ impl SupervisorSessionRegistry {
             GatewayMessage, ProviderObservationControlV1, gateway_message,
             provider_observation_control_v1::Payload,
         };
+        use openshell_core::provider_credentials::ordinary_observation as obs;
+        if !obs::request_fits(&request)
+            || request.profile_id != expected.profile_id
+            || request.profile_sha256 != expected.profile_sha256
+        {
+            return Err(Status::resource_exhausted(
+                "ordinary original envelope refused",
+            ));
+        }
         let mut sessions = self
             .sessions
             .lock()
@@ -764,7 +773,6 @@ impl SupervisorSessionRegistry {
             gateway_message, provider_observation_control_v1,
         };
         use openshell_core::provider_credentials::ordinary_observation as obs;
-        use prost::Message;
         let now = crate::persistence::current_time_ms();
         let deadline = selector
             .original_request
@@ -797,7 +805,7 @@ impl SupervisorSessionRegistry {
                 .map(|r| r.terminal_sha256.clone())
                 .unwrap_or_default(),
         };
-        if read.encoded_len() > obs::MAX_READ {
+        if !obs::read_fits(&read) {
             return Err(Status::resource_exhausted("ordinary read capacity"));
         }
         let (tx, rx) = oneshot::channel();
@@ -913,8 +921,7 @@ impl SupervisorSessionRegistry {
     ) -> bool {
         use openshell_core::proto::provider_observation_control_v1::Payload;
         use openshell_core::provider_credentials::ordinary_observation as obs;
-        use prost::Message;
-        if command.encoded_len() > obs::MAX_RESULT {
+        if !obs::control_fits(&command) {
             return false;
         }
         let Ok(mut sessions) = self.sessions.lock() else {
@@ -929,8 +936,7 @@ impl SupervisorSessionRegistry {
         match command.payload {
             Some(Payload::CurrentSnapshot(snapshot)) => {
                 if snapshot.supervisor_session != session_id
-                    || snapshot.profile_id != obs::PROFILE
-                    || snapshot.profile_sha256 != obs::profile_digest()
+                    || !obs::valid_profile(&snapshot.profile_id, &snapshot.profile_sha256)
                     || !obs::valid_snapshot(&snapshot)
                     || session.ordinary.capability.is_some()
                 {
@@ -1004,7 +1010,7 @@ impl SupervisorSessionRegistry {
                         .as_ref()
                         .and_then(obs::time_ms)
                         .is_none_or(|end| crate::persistence::current_time_ms() >= end)
-                    || reply.encoded_len() > obs::MAX_READ
+                    || !obs::reply_fits(&reply)
                     || reply.sampled_snapshot.as_ref().is_none_or(|s| {
                         s.supervisor_session != session_id
                             || !obs::valid_snapshot(s)
@@ -5784,6 +5790,35 @@ mod ordinary_barrier_tests {
         ));
         (registry, snapshot, rx)
     }
+    #[tokio::test]
+    async fn ordinary_v2_rejects_oversize_before_delivery_or_uncertainty() {
+        let (registry, expected, mut rx) = fixture();
+        let resource = expected.resource.clone().unwrap();
+        let mut q = ProviderObservationRequestV1 {
+            resource: Some(resource.clone()),
+            profile_id: expected.profile_id.clone(),
+            profile_sha256: expected.profile_sha256.clone(),
+            ..Default::default()
+        };
+        q.run_id = "x".repeat(obs::MAX_REQUEST_V2 + 1);
+        assert!(
+            registry
+                .ordinary_send_once(&resource, &expected, q.clone())
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(registry.ordinary_result(&resource, &q).is_none());
+        q.run_id = Uuid::new_v4().to_string();
+        q.profile_id = obs::LEGACY_PROFILE.into();
+        q.profile_sha256 = obs::profile_digest_for(obs::LEGACY_PROFILE).unwrap();
+        assert!(
+            registry
+                .ordinary_send_once(&resource, &expected, q)
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn ordinary_original_install_report_cannot_adopt_new_configuration() {
         let (registry, expected, mut rx) = fixture();

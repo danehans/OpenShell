@@ -114,9 +114,10 @@ witness schema, and retain all older public/durable/private compatibility guards
 ## Optional manual sandbox mediation-path observation
 
 Ordinary observation is an independent compile-time opt-in on the supervisor:
-`OPENSHELL_ORDINARY_OBSERVATION_PROFILE=ordinary-sandbox-mediation-static-bearer-v1`.
-An absent value leaves ordinary support off unless the existing real fixed-witness
-profile already enables shared observation support. Any other supplied value,
+`OPENSHELL_ORDINARY_OBSERVATION_PROFILE=ordinary-sandbox-mediation-static-bearer-v2`.
+The exact v1 value remains supported with its original limits. An absent value
+leaves ordinary support off unless the existing real fixed-witness profile already
+enables shared v1 observation support. V2 requires its explicit compiled value. Any other supplied value,
 including an empty value, fails supervisor initialization. Both production
 credential initialization paths apply this selector after binding the source gate.
 Record the value and exact source/binary identities when building matching runtime
@@ -126,10 +127,29 @@ the original boundary, readiness and authorization checks still apply.
 
 The separate ordinary observer records traffic metadata on one original,
 inspected sandbox execution path. It does not run a task or model. Its profile
-is `ordinary-sandbox-mediation-static-bearer-v1`, with evidence scope
+is `ordinary-sandbox-mediation-static-bearer-v2`, with evidence scope
 `original-sandbox-mediation-path/v1`. Every snapshot explicitly declares process
 writer attribution **unproven**. This is distinct from the fixed witness above;
 an unsupported writer query is never converted into a successful path proof.
+
+The v2 profile retains the complete original installed Arm and its authorization
+bindings. Its protobuf ceilings are 12,291 bytes for a request, 12,293 for an
+original-channel read, 12,294 for its reply, and 32,780 for a complete result.
+These are payload ceilings; the outer control envelope allows at most 32,784
+bytes. The installed Arm remains at most 8,192 bytes. Size-only clones remove
+the Arm at its known locations to additionally enforce the original 4,096-byte
+request/read/reply and 16,384-byte complete-result budgets. Nothing is removed
+from transmitted messages, canonical hashes, validation or audit records.
+
+The distinct v1 profile and digest retain their original ceilings. A profile or
+digest mismatch refuses qualification; existing originals are never converted or
+renewed. Build the matching gateway, supervisor and helper with the explicit v2 profile
+before using it. Both versions retain all eight event allowances and the same
+original-channel read barrier. The durable JSON row still must fit 32,768 bytes,
+including base64 and duplicated original metadata, before a permanent claim.
+An otherwise valid request can therefore be refused below an individual wire
+ceiling. V2 does not reset combined original claims or extend grants, capture
+deadlines, window counts, task inputs or runtime spending authority.
 
 The trusted backend retains each original accepted stream and its authenticated
 connection generation. A private stream-owned lease is taken once before proxy
