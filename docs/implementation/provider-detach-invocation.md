@@ -113,12 +113,43 @@ witness schema, and retain all older public/durable/private compatibility guards
 
 ## Optional manual sandbox mediation-path observation
 
+Ordinary observation is an independent compile-time opt-in on the supervisor:
+`OPENSHELL_ORDINARY_OBSERVATION_PROFILE=ordinary-sandbox-mediation-static-bearer-v2`.
+The exact v1 value remains supported with its original limits. An absent value
+leaves ordinary support off unless the existing real fixed-witness profile already
+enables shared v1 observation support. V2 requires its explicit compiled value. Any other supplied value,
+including an empty value, fails supervisor initialization. Both production
+credential initialization paths apply this selector after binding the source gate.
+Record the value and exact source/binary identities when building matching runtime
+images. Ordinary-only opt-in requires no fixed ELF or artifact hash and does not
+enable the fixed launcher. It grants no OIDC scope, Arm, task input or model access;
+the original boundary, readiness and authorization checks still apply.
+
 The separate ordinary observer records traffic metadata on one original,
 inspected sandbox execution path. It does not run a task or model. Its profile
-is `ordinary-sandbox-mediation-static-bearer-v1`, with evidence scope
+is `ordinary-sandbox-mediation-static-bearer-v2`, with evidence scope
 `original-sandbox-mediation-path/v1`. Every snapshot explicitly declares process
 writer attribution **unproven**. This is distinct from the fixed witness above;
 an unsupported writer query is never converted into a successful path proof.
+
+The v2 profile retains the complete original installed Arm and its authorization
+bindings. Its protobuf ceilings are 12,291 bytes for a request, 12,293 for an
+original-channel read, 12,294 for its reply, and 32,780 for a complete result.
+These are payload ceilings; the outer control envelope allows at most 32,784
+bytes. The installed Arm remains at most 8,192 bytes. Size-only clones remove
+the Arm at its known locations to additionally enforce the original 4,096-byte
+request/read/reply and 16,384-byte complete-result budgets. Nothing is removed
+from transmitted messages, canonical hashes, validation or audit records.
+
+The distinct v1 profile and digest retain their original ceilings. A profile or
+digest mismatch refuses qualification; existing originals are never converted or
+renewed. Build the matching gateway, supervisor and helper with the explicit v2 profile
+before using it. Both versions retain all eight event allowances and the same
+original-channel read barrier. The durable JSON row still must fit 32,768 bytes,
+including base64 and duplicated original metadata, before a permanent claim.
+An otherwise valid request can therefore be refused below an individual wire
+ceiling. V2 does not reset combined original claims or extend grants, capture
+deadlines, window counts, task inputs or runtime spending authority.
 
 The trusted backend retains each original accepted stream and its authenticated
 connection generation. A private stream-owned lease is taken once before proxy
@@ -188,3 +219,130 @@ or phase checks, permit relaunch, or adopt a replacement session. Matching
 runtime/images, actual TLS/reference injection, narrow grants, model/spending
 allocation and live enforcement remain separate qualification gates. The
 synthetic TLS/SSE client trials establish none of those live properties.
+
+### Manual canonical preparation and original recovery
+
+The same `provider-detach-observe` example also offers `resolve`,
+`prepare-response`, `dispatch`, `recover`, `prepare-arm`, `arm`, `query-arm` and
+`prepare-observation`. These are closed SDK operations, not arbitrary RPC or
+command execution. Build this tool from the same reviewed SDK source; no installed
+executable or working issuer is implied by these examples.
+
+Use private owner-only metadata files and an existing private ledger directory.
+`prepare-response` reads the retained original `SecurityResponse` object, pins its
+name, namespace, UID and resource version, and projects the complete original spec
+through SDK validation. It copies the persisted `spec.requestID`; it never invents
+an action ID or refreshes the original target from `resolve`. The original object
+must fit the tool's existing 32 KiB metadata limit. Preserve the full export
+privately; do not substitute a later status, remove required original provenance
+or raise the limit to accommodate an unknown object.
+
+Every journal-derived action is controller-owned and **recover-only**, including
+when `status.attempts` is zero. `dispatch` refuses it. Optional separately admitted
+manual-original actions require an explicit protected custody record binding the
+operator session, original action/intent and resource digest. That record is
+custody metadata, not a grant or a controller fence; absence of a Kubernetes object
+is not manual ownership. The operator must already have actual exclusive custody.
+The tool cannot establish distributed exclusion or protect against a hostile host.
+Use one approved protected ledger directory throughout the operation.
+
+`dispatch` and `arm` exclusively persist consumed records keyed by the original
+action before constructing the client or sending once. Changing a session, token,
+input filename or challenge cannot reopen that action in the original ledger.
+Partial writes, fsync failure, constructor failure and lost responses stay consumed.
+Use `recover` or `query-arm` with the retained exact original, never delete or repair
+a record to retry. An expired Arm cannot be sent again.
+
+`prepare-arm` requires the actual bound Native receipt, an explicitly admitted
+decision UUID/challenge/deadline, and a current read of the exact action/receipt's
+zero-attempt bootstrap. It uses the authenticated boot/session, installed `REVOKED`
+ACK and sequence from that read, then SDK attempt-ID/hash/validation. Bootstrap is
+preparation metadata, not an installed Arm or refusal. Preparation consumes its own
+original intent before reading; an unknown read cannot renew the deadline, issue
+a new challenge or authorize another preparation. `arm` installs that one retained
+request; only `query-arm` may follow uncertainty.
+
+`prepare-observation` consumes its original run/step preparation intent before
+resource discovery. It uses actual ordinary metadata independently of any fixed
+ELF. Baseline carries no fake Arm or hold. Detached preparation queries the retained
+original Arm with a separate detach grant and requires its actual current seal;
+the gateway still independently validates it at `begin`. Use a different admitted
+step for each phase. Neither preparation command performs a task or begins an
+observation automatically. The existing `begin`, `consume-input` and `outcome`
+semantics remain unchanged.
+
+Observer operations use `-grant-file`; detach/Arm operations use
+`-detach-grant-file`. Detached preparation constructs distinct clients and refuses
+reused token bytes. The gateway remains the authority for the two disjoint scope
+allowlists, exact resource and workspace membership. Supply `-address` and `-ca`
+explicitly. Optional `-client-cert` and `-client-key` must be supplied together and
+are passed to the existing verified TLS client only when the actual gateway route
+requires mTLS. There is no insecure, ambient-credential or administrator fallback.
+All outputs are bounded metadata; manual outcomes remain separate from Native
+model-completion proof. Actual grants, matching images, deployment, real model
+budget and independent containment/control evidence require separate authorization.
+
+### Finite manual OpenAI request gate
+
+The opt-in manual demo gate is separate from ordinary-observation byte budgets
+and management RPC rate limits. Normal behavior is unchanged when neither
+`OPENSHELL_M1_PAID_LEDGER` nor `OPENSHELL_M1_PAID_RUN` is configured. A partial or
+invalid configuration refuses requests. This mode requires Linux and inspected
+REST; credentialed passthrough refuses while it is enabled.
+
+A trusted launcher supplies both supervisors with the same private, owner-only
+regular ledger inode and the same 32-hex original run identifier. The workload
+must have no access to that file or its parent, and the mount must not permit
+replacement. The ledger is created exclusively before launch, contains the
+original Linux boot ID and a `CLOCK_BOOTTIME` deadline at most 300 seconds away,
+and allows at most eight requests across target and control. The trusted host
+and operator must not truncate, replace, copy or reinitialize it. The runtime
+never creates, repairs, refunds or replenishes a ledger. A nonblocking exclusive
+file lock serializes appends; contention refuses. A permit is usable only after
+its append is synchronized. Malformed tails, changed identity, restart with a
+different boot, exhaustion and expiry refuse. The original relay deadline is
+not renewed. An absolute Linux `CLOCK_BOOTTIME` timer cancels the original
+pending relay even across suspend, without translating its authority into a
+monotonic-duration timeout. Both upstream and client I/O check the same original
+clock before forwarding, including already buffered responses, flush and
+shutdown; newly read bytes are discarded if the clock expires during a read.
+An unmeasurable clock or unavailable timer refuses. Bytes already accepted by a
+transport before expiry cannot be recalled.
+
+Before credential rewriting or forwarding, the gate buffers at most 256 KiB
+with a five-second body-read timeout and validates the final complete JSON.
+Only `POST https://api.openai.com:443/v1/responses`, the pinned
+`gpt-5.4-mini-2026-03-17` model, text message and bounded prior-reasoning inputs, and explicit streaming or
+nonstreaming requests are admitted. Duplicate JSON keys, ambiguous headers,
+compression, chunked framing, upgrades, alternate billing headers, unsupported
+fields and hosted tools refuse. The finite benign profile removes client
+function definitions and forces no tools, default service tier, no background
+work, no storage, text output and at most 128 output tokens per request. The
+output ceiling includes reasoning tokens. This is deliberately not a general
+tool-using-agent profile. Unsupported client history shapes refuse rather than
+being relabeled compatible.
+
+Every reconnect and followup needs another permit, even after a truncated
+stream, cancellation, HTTP failure or unknown outcome. No result refunds one.
+Policy must deny alternate credentialed or uninspected routes, and both
+supervisors must actually receive this activation and shared inode; quiet logs
+are not evidence of those deployment properties. Existing provider resolution,
+authorization, generation checks and original observation/ACK guards remain in
+force. The gate is not an account-wide dollar limit. Input, history and
+instructions are billable; request bytes are not token counts. Reasoning is
+already part of output usage, not an additional output allowance. A paid run
+still needs separately approved account/model access, applicable prices and
+bounds, Native trust/grants, runtime assembly and independent CNI evidence.
+
+The Docker backend's gateway-local `manual_paid_run` configuration carries only
+`run` and `ledger_path`. It defaults to absent and is rejected in caller-supplied
+sandbox driver JSON. For example, an explicitly admitted private gateway can
+name a fresh original ledger at `/srv/m1/private/paid-ledger`; that exact file
+must be metadata-visible at the same absolute path in the gateway and Docker
+host. The launcher refuses a missing, nonregular, symlinked, multiply-linked or
+nonprivate file. It requires the actual supervisor UID 65534 and mode 0600.
+Only supervisor containers receive the two activation variables and the one
+read-write file bind at `/run/m1-paid-ledger`. The workload receives neither.
+The host setup and inspection of these exact mounts are separate runtime
+actions; the configuration does not create a ledger or transfer credential or
+sandbox authority. Existing images remain unchanged until separately rebuilt.

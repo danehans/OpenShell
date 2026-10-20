@@ -4942,17 +4942,249 @@ pub mod ordinary_observation {
     use prost::Message;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    pub const PROFILE: &str = "ordinary-sandbox-mediation-static-bearer-v1";
+    pub const LEGACY_PROFILE: &str = "ordinary-sandbox-mediation-static-bearer-v1";
+    pub const PROFILE: &str = "ordinary-sandbox-mediation-static-bearer-v2";
+    // The legacy ceilings are intentionally unchanged. V2 adds only a bounded
+    // complete Arm at its known paths; every stripped envelope still fits v1.
     pub const MAX_RESULT: usize = 16 * 1024;
+    pub const MAX_READ: usize = 4096;
+    pub const MAX_ARM: usize = 8192;
+    pub const MAX_REQUEST_V2: usize = 12_291;
+    pub const MAX_READ_V2: usize = 12_293;
+    pub const MAX_REPLY_V2: usize = 12_294;
+    pub const MAX_RESULT_V2: usize = 32_780;
     pub const MAX_EVENT: usize = 512;
     pub const MAX_EVENTS: usize = 8;
     pub const MAX_WINDOWS: usize = 16;
-    pub const MAX_READ: usize = 4096;
-
     pub const EVIDENCE_SCOPE: &str = "original-sandbox-mediation-path/v1";
     pub const WRITER_UNPROVEN: i32 = 1;
+
+    pub fn profile_digest_for(profile: &str) -> Option<String> {
+        let descriptor = match profile {
+            LEGACY_PROFILE => LEGACY_DESCRIPTOR,
+            PROFILE => V2_DESCRIPTOR,
+            _ => return None,
+        };
+        Some(witness_sha256(descriptor.as_bytes()))
+    }
+    const LEGACY_DESCRIPTOR: &str = "openshell.provider-detach.sandbox-mediation-profile/v1\nordinary-sandbox-mediation-static-bearer-v1\nevidence_scope:original-sandbox-mediation-path/v1\nprocess_writer_identity:unproven\nhttp1:static-authorization-bearer\nstream:true,false,unobserved\nwindow:60s\nevents:8\nevent:512\nresult:16384\ncurrent:original-channel-read-v1\nassociation:retained-original-stream-allocation-v1\n";
+    const V2_DESCRIPTOR: &str = "openshell.provider-detach.sandbox-mediation-profile/v2\nordinary-sandbox-mediation-static-bearer-v2\nevidence_scope:original-sandbox-mediation-path/v1\nprocess_writer_identity:unproven\nhttp1:static-authorization-bearer\nstream:true,false,unobserved\nwindow:60s\nevents:8\nevent:512\nrequest:12291\nread:12293\nreply:12294\nresult:32780\narm:8192\nstripped:request4096,read4096,reply4096,result16384\ncurrent:original-channel-read-v1\nassociation:retained-original-stream-allocation-v1\n";
     pub fn profile_digest() -> String {
-        witness_sha256("openshell.provider-detach.sandbox-mediation-profile/v1\nordinary-sandbox-mediation-static-bearer-v1\nevidence_scope:original-sandbox-mediation-path/v1\nprocess_writer_identity:unproven\nhttp1:static-authorization-bearer\nstream:true,false,unobserved\nwindow:60s\nevents:8\nevent:512\nresult:16384\ncurrent:original-channel-read-v1\nassociation:retained-original-stream-allocation-v1\n".as_bytes())
+        profile_digest_for(PROFILE).expect("known compiled ordinary profile")
+    }
+    pub fn valid_profile(profile: &str, hash: &str) -> bool {
+        profile_digest_for(profile).is_some_and(|expected| expected == hash)
+    }
+    fn v2(profile: &str, hash: &str) -> Option<bool> {
+        valid_profile(profile, hash).then_some(profile == PROFILE)
+    }
+    // These clones are size-only projections, never wire/hash/auth projections.
+    fn strip_arm(q: &mut ProviderObservationRequestV1) {
+        q.installed_arm = None;
+    }
+    fn strip_read_arm(q: &mut ProviderObservationCurrentReadV1) {
+        if let Some(q) = q
+            .selector
+            .as_mut()
+            .and_then(|s| s.original_request.as_mut())
+        {
+            strip_arm(q);
+        }
+    }
+    fn strip_result_arms(q: &mut ProviderObservationResultV1) {
+        if let Some(q) = q.window.as_mut().and_then(|w| w.request.as_mut()) {
+            strip_arm(q);
+        }
+        if let Some(q) = q
+            .current_read
+            .as_mut()
+            .and_then(|r| r.original_read.as_mut())
+        {
+            strip_read_arm(q);
+        }
+    }
+    pub fn request_fits(q: &ProviderObservationRequestV1) -> bool {
+        let Some(is_v2) = v2(&q.profile_id, &q.profile_sha256) else {
+            return false;
+        };
+        if !is_v2 {
+            return q.encoded_len() <= MAX_READ;
+        }
+        if q.encoded_len() > MAX_REQUEST_V2
+            || q.installed_arm
+                .as_ref()
+                .is_some_and(|a| a.encoded_len() > MAX_ARM)
+        {
+            return false;
+        }
+        let mut stripped = q.clone();
+        strip_arm(&mut stripped);
+        stripped.encoded_len() <= MAX_READ
+    }
+    pub fn query_fits(q: &GetProviderDetachObservationRequest) -> bool {
+        let Some(original) = &q.original_request else {
+            return q.encoded_len() <= 8192;
+        };
+        if !request_fits(original) {
+            return false;
+        }
+        if original.profile_id == LEGACY_PROFILE {
+            return q.encoded_len() <= 8192;
+        }
+        // An original selector must fit inside the already bounded read.
+        if q.encoded_len() > MAX_READ_V2 {
+            return false;
+        }
+        let mut stripped = q.clone();
+        strip_arm(
+            stripped
+                .original_request
+                .as_mut()
+                .expect("checked original"),
+        );
+        stripped.encoded_len() <= 8192
+    }
+    pub fn read_fits(q: &ProviderObservationCurrentReadV1) -> bool {
+        if q.encoded_len() > MAX_READ_V2 {
+            return false;
+        }
+        if q.selector.as_ref().is_none_or(|s| !query_fits(s)) {
+            return false;
+        }
+        let Some(s) = &q.expected_identity else {
+            return false;
+        };
+        let Some(is_v2) = v2(&s.profile_id, &s.profile_sha256) else {
+            return false;
+        };
+        if let Some(original) = q
+            .selector
+            .as_ref()
+            .and_then(|s| s.original_request.as_ref())
+            && (original.profile_id != s.profile_id
+                || original.profile_sha256 != s.profile_sha256
+                || !request_fits(original))
+        {
+            return false;
+        }
+        if !is_v2 {
+            return q.encoded_len() <= MAX_READ;
+        }
+        if q.encoded_len() > MAX_READ_V2 {
+            return false;
+        }
+        let mut stripped = q.clone();
+        strip_read_arm(&mut stripped);
+        stripped.encoded_len() <= MAX_READ
+    }
+    pub fn reply_fits(q: &ProviderObservationCurrentReplyV1) -> bool {
+        if q.encoded_len() > MAX_REPLY_V2 {
+            return false;
+        }
+        let Some(read) = &q.original_read else {
+            return false;
+        };
+        if !read_fits(read) {
+            return false;
+        }
+        let Some(s) = &read.expected_identity else {
+            return false;
+        };
+        let Some(sample) = &q.sampled_snapshot else {
+            return false;
+        };
+        if sample.profile_id != s.profile_id || sample.profile_sha256 != s.profile_sha256 {
+            return false;
+        }
+        if s.profile_id == LEGACY_PROFILE {
+            return q.encoded_len() <= MAX_READ;
+        }
+        if q.encoded_len() > MAX_REPLY_V2 {
+            return false;
+        }
+        let mut stripped = q.clone();
+        strip_read_arm(stripped.original_read.as_mut().expect("checked read"));
+        stripped.encoded_len() <= MAX_READ
+    }
+    fn result_bound(q: &ProviderObservationResultV1, reserve: usize) -> Option<usize> {
+        let full = q.encoded_len().checked_add(reserve)?;
+        if full > MAX_RESULT_V2 {
+            return None;
+        }
+        let Some(original) = q.window.as_ref().and_then(|w| w.request.as_ref()) else {
+            return (full <= MAX_RESULT).then_some(full);
+        };
+        if !request_fits(original) || q.current_read.as_ref().is_some_and(|r| !reply_fits(r)) {
+            return None;
+        }
+        if original.profile_id == LEGACY_PROFILE {
+            return (full <= MAX_RESULT).then_some(full);
+        }
+        if full > MAX_RESULT_V2 {
+            return None;
+        }
+        let mut stripped = q.clone();
+        strip_result_arms(&mut stripped);
+        (stripped.encoded_len().checked_add(reserve)? <= MAX_RESULT).then_some(full)
+    }
+    pub fn result_fits(q: &ProviderObservationResultV1) -> bool {
+        result_bound(q, 0).is_some()
+    }
+    pub fn control_fits(q: &crate::proto::ProviderObservationControlV1) -> bool {
+        use crate::proto::provider_observation_control_v1::Payload;
+        if q.encoded_len() > MAX_RESULT_V2 + 4 {
+            return false;
+        }
+        let (profile, hash, fits) = match &q.payload {
+            Some(Payload::InstallRequest(r)) => (&r.profile_id, &r.profile_sha256, request_fits(r)),
+            Some(Payload::CurrentSnapshot(s)) => {
+                (&s.profile_id, &s.profile_sha256, valid_snapshot(s))
+            }
+            Some(Payload::CurrentRead(r)) => {
+                let Some(s) = &r.expected_identity else {
+                    return false;
+                };
+                (&s.profile_id, &s.profile_sha256, read_fits(r))
+            }
+            Some(Payload::CurrentReply(r)) => {
+                let Some(s) = &r.sampled_snapshot else {
+                    return false;
+                };
+                (&s.profile_id, &s.profile_sha256, reply_fits(r))
+            }
+            Some(Payload::Report(r)) => {
+                let Some(s) = r.window.as_ref().and_then(|w| w.request.as_ref()) else {
+                    return false;
+                };
+                (&s.profile_id, &s.profile_sha256, result_fits(r))
+            }
+            None => return false,
+        };
+        let Some(is_v2) = v2(profile, hash) else {
+            return false;
+        };
+        if !fits {
+            return false;
+        }
+        if !is_v2 {
+            return q.encoded_len() <= MAX_RESULT;
+        }
+        if q.encoded_len() > MAX_RESULT_V2 + 4 {
+            return false;
+        }
+        let mut stripped = q.clone();
+        match &mut stripped.payload {
+            Some(Payload::InstallRequest(r)) => strip_arm(r),
+            Some(Payload::CurrentRead(r)) => strip_read_arm(r),
+            Some(Payload::CurrentReply(r)) => {
+                if let Some(r) = &mut r.original_read {
+                    strip_read_arm(r);
+                }
+            }
+            Some(Payload::Report(r)) => strip_result_arms(r),
+            _ => {}
+        }
+        stripped.encoded_len() <= MAX_RESULT
     }
     pub fn digest<M: Message>(domain: &str, value: &M) -> String {
         let mut raw = domain.as_bytes().to_vec();
@@ -5020,7 +5252,7 @@ pub mod ordinary_observation {
             accounting_fault: true,
             sampled_time: Some(max_time),
         };
-        if read.encoded_len() > MAX_READ || reply.encoded_len() > MAX_READ {
+        if !read_fits(&read) || !reply_fits(&reply) {
             return None;
         }
         let ack = q
@@ -5074,10 +5306,7 @@ pub mod ordinary_observation {
             ack_terminal_sha256: "f".repeat(64),
             current_read: Some(reply),
         };
-        let bound = result
-            .encoded_len()
-            .checked_add(MAX_EVENTS * (MAX_EVENT + 4))?;
-        (bound <= MAX_RESULT).then_some(bound)
+        result_bound(&result, MAX_EVENTS * (MAX_EVENT + 4))
     }
 
     pub fn system_now() -> Option<i64> {
@@ -5113,10 +5342,9 @@ pub mod ordinary_observation {
         a == b
     }
     pub fn shape(q: &ProviderObservationRequestV1) -> bool {
-        q.encoded_len() <= 4096
+        request_fits(q)
             && q.resource.is_some()
-            && q.profile_id == PROFILE
-            && q.profile_sha256 == profile_digest()
+            && valid_profile(&q.profile_id, &q.profile_sha256)
             && q.evidence_scope == EVIDENCE_SCOPE
             && id(&q.run_id)
             && id(&q.step_id)
@@ -5182,8 +5410,7 @@ pub mod ordinary_observation {
         digest("openshell.provider-detach.sandbox-mediation-path/v1", &s)
     }
     pub fn valid_snapshot(s: &ProviderObservationSnapshotV1) -> bool {
-        s.profile_id == PROFILE
-            && s.profile_sha256 == profile_digest()
+        valid_profile(&s.profile_id, &s.profile_sha256)
             && s.evidence_scope == EVIDENCE_SCOPE
             && s.process_writer_attribution == WRITER_UNPROVEN
             && id(&s.mediation_path_id)
@@ -5848,8 +6075,7 @@ pub mod ordinary_observation {
             if snapshot.boundary_incarnation != path.boundary_incarnation
                 || snapshot.mediation_path_id != path.mediation_path_id
                 || snapshot.resource.as_ref()?.execution_id != path.execution_id
-                || snapshot.profile_id != PROFILE
-                || snapshot.profile_sha256 != profile_digest()
+                || !valid_profile(&snapshot.profile_id, &snapshot.profile_sha256)
                 || !id(&snapshot.source_incarnation)
                 || !id(&snapshot.supervisor_session)
                 || !valid_snapshot(&snapshot)
@@ -5905,7 +6131,9 @@ pub mod ordinary_observation {
             let Some(mut s) = self.lock(now) else {
                 return false;
             };
-            if s.snapshot.source_incarnation != snapshot.source_incarnation
+            if s.snapshot.profile_id != snapshot.profile_id
+                || s.snapshot.profile_sha256 != snapshot.profile_sha256
+                || s.snapshot.source_incarnation != snapshot.source_incarnation
                 || s.snapshot.boundary_incarnation != snapshot.boundary_incarnation
                 || s.snapshot.mediation_path_id != snapshot.mediation_path_id
                 || s.snapshot.gateway_boot_id != snapshot.gateway_boot_id
@@ -5963,6 +6191,8 @@ pub mod ordinary_observation {
                 if end <= now
                     || end - now > 60_000
                     || s.windows.len() >= MAX_WINDOWS
+                    || s.snapshot.profile_id != q.profile_id
+                    || s.snapshot.profile_sha256 != q.profile_sha256
                     || s.snapshot.resource != q.resource
                     || s.snapshot.source_incarnation != q.source_incarnation
                     || s.snapshot.boundary_incarnation != q.boundary_incarnation
@@ -6217,7 +6447,7 @@ pub mod ordinary_observation {
             q: ProviderObservationCurrentReadV1,
             now: i64,
         ) -> Option<ProviderObservationCurrentReplyV1> {
-            if q.encoded_len() > MAX_READ
+            if !read_fits(&q)
                 || q.read_correlation.len() != 16
                 || time_ms(q.read_deadline.as_ref()?)? <= now
                 || time_ms(q.read_deadline.as_ref()?)? - now > 2000
@@ -6275,7 +6505,7 @@ pub mod ordinary_observation {
                     accounting_fault: fault || registry_fault,
                     sampled_time: Some(timestamp(now)),
                 };
-                (reply.encoded_len() <= MAX_READ).then_some(reply)
+                reply_fits(&reply).then_some(reply)
             })
         }
     }
@@ -6793,6 +7023,289 @@ pub mod ordinary_observation {
             let state = ProviderCredentialState::from_child_env_snapshot(1, HashMap::new());
             assert!(state.ordinary_observer().is_none());
             assert!(state.observation_boundary().is_none());
+        }
+        // Boundary fixtures deliberately isolate byte accounting from semantic
+        // authorization. shape/install/client tests retain all semantic checks.
+        fn byte_request() -> ProviderObservationRequestV1 {
+            ProviderObservationRequestV1 {
+                profile_id: PROFILE.into(),
+                profile_sha256: profile_digest(),
+                resource: Some(Default::default()),
+                ..Default::default()
+            }
+        }
+        fn byte_arm(size: usize) -> crate::proto::ProviderDetachArmSealV1 {
+            for n in 0..=size {
+                let arm = crate::proto::ProviderDetachArmSealV1 {
+                    request: Some(crate::proto::ProviderDetachArmRequestV1 {
+                        attempt_id: "a".repeat(n),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                if arm.encoded_len() == size {
+                    return arm;
+                }
+            }
+            panic!("unreachable synthetic seal size");
+        }
+        fn pad_request(q: &mut ProviderObservationRequestV1, size: usize) {
+            for n in 0..=size {
+                q.resource.as_mut().unwrap().authority = "a".repeat(n);
+                if q.encoded_len() == size {
+                    return;
+                }
+            }
+            panic!("unreachable synthetic request size");
+        }
+        #[test]
+        fn ordinary_v2_profiles_and_request_exact_limits_preserve_v1() {
+            assert_eq!(
+                profile_digest_for(LEGACY_PROFILE).unwrap(),
+                "d0d289d4154d013b241b7db743d73c57281e4217d75676187892ba9af75cc3fb"
+            );
+            assert_eq!(
+                profile_digest(),
+                "3a3eb5c329052de53d7df9379e90ee6aa2a8caeaeeae2b7608af2035b6cbc01b"
+            );
+            assert!(!valid_profile(
+                PROFILE,
+                &profile_digest_for(LEGACY_PROFILE).unwrap()
+            ));
+            let mut q = byte_request();
+            pad_request(&mut q, MAX_READ);
+            q.installed_arm = Some(byte_arm(MAX_ARM));
+            let before = q.encode_to_vec();
+            assert_eq!(q.encoded_len(), MAX_REQUEST_V2);
+            assert!(request_fits(&q));
+            assert_eq!(
+                q.encode_to_vec(),
+                before,
+                "size projection mutated original"
+            );
+            let mut excess = q.clone();
+            excess.resource.as_mut().unwrap().authority.push('x');
+            assert_eq!(excess.encoded_len(), MAX_REQUEST_V2 + 1);
+            assert!(!request_fits(&excess));
+            let mut excess = q.clone();
+            excess.installed_arm = Some(byte_arm(MAX_ARM + 1));
+            assert!(!request_fits(&excess));
+            q.profile_id = LEGACY_PROFILE.into();
+            q.profile_sha256 = profile_digest_for(LEGACY_PROFILE).unwrap();
+            assert!(!request_fits(&q));
+            q.installed_arm = None;
+            assert!(request_fits(&q));
+            q.resource.as_mut().unwrap().authority.push('x');
+            assert!(!request_fits(&q));
+        }
+        #[tokio::test]
+        async fn ordinary_v2_detached_size_does_not_drop_arm_or_reset_original() {
+            let (observer, mut q, subject, _) = fixture().await;
+            q.phase = ProviderObservationPhaseV1::Detached as i32;
+            q.baseline_mediation_path_receipt_sha256 = observer
+                .inner
+                .lock()
+                .unwrap()
+                .snapshot
+                .mediation_path_receipt_sha256
+                .clone();
+            let mut arm = byte_arm(3809);
+            arm.install_sequence = 1;
+            arm.installed_time = Some(timestamp(1000));
+            let r = arm.request.as_mut().unwrap();
+            r.attempt_id = uuid();
+            r.request_sha256 = "a".repeat(64);
+            r.attempt = Some(crate::proto::ProviderDetachAttemptV1 {
+                schema_version: 1,
+                ..Default::default()
+            });
+            // A synthetic complete seal sufficiently large to reproduce the old
+            // nested request/read rejection; real Arm checks occur before this seam.
+            r.original_action = Some(crate::proto::ProviderDetachActionV1 {
+                event_id: "x".repeat(3500),
+                ..Default::default()
+            });
+            q.installed_arm = Some(arm);
+            q.request_sha256 = request_digest(&q);
+            assert!(q.encoded_len() > 4096);
+            assert!(shape(&q));
+            let snap = observer.inner.lock().unwrap().snapshot.clone();
+            assert!(install_budget(&q, &snap).is_some());
+            let installed = observer.install(q.clone(), subject.clone(), 1000).unwrap();
+            assert_eq!(
+                installed.window.as_ref().unwrap().request.as_ref(),
+                Some(&q)
+            );
+            assert!(observer.install(q.clone(), subject, 1000).is_none());
+            let mut legacy = q.clone();
+            legacy.profile_id = LEGACY_PROFILE.into();
+            legacy.profile_sha256 = profile_digest_for(LEGACY_PROFILE).unwrap();
+            legacy.request_sha256 = request_digest(&legacy);
+            assert!(!shape(&legacy));
+            let mut swapped = snap.clone();
+            swapped.profile_id = LEGACY_PROFILE.into();
+            swapped.profile_sha256 = profile_digest_for(LEGACY_PROFILE).unwrap();
+            swapped.mediation_path_receipt_sha256 = path_digest(&swapped);
+            assert!(!observer.update_snapshot(swapped, 1001));
+        }
+        #[tokio::test]
+        async fn ordinary_v2_read_reply_result_and_control_account_complete_arms() {
+            let (observer, mut q, _, _) = fixture().await;
+            let snapshot = observer.inner.lock().unwrap().snapshot.clone();
+            q.installed_arm = Some(byte_arm(3809));
+            let read = ProviderObservationCurrentReadV1 {
+                selector: Some(GetProviderDetachObservationRequest {
+                    original_request: Some(q.clone()),
+                    ..Default::default()
+                }),
+                expected_identity: Some(snapshot.clone()),
+                read_correlation: vec![1; 16],
+                ..Default::default()
+            };
+            let reply = ProviderObservationCurrentReplyV1 {
+                original_read: Some(read.clone()),
+                sampled_snapshot: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            assert!(read.encoded_len() > MAX_READ);
+            assert!(read_fits(&read));
+            assert!(reply_fits(&reply));
+            let result = ProviderObservationResultV1 {
+                window: Some(ProviderObservationWindowV1 {
+                    request: Some(q),
+                    installed_snapshot: Some(snapshot),
+                    ..Default::default()
+                }),
+                current_read: Some(reply.clone()),
+                ..Default::default()
+            };
+            let wire = result.encode_to_vec();
+            assert!(result_fits(&result));
+            assert_eq!(wire, result.encode_to_vec());
+            for payload in [
+                crate::proto::provider_observation_control_v1::Payload::CurrentRead(read.clone()),
+                crate::proto::provider_observation_control_v1::Payload::CurrentReply(reply),
+                crate::proto::provider_observation_control_v1::Payload::Report(result.clone()),
+            ] {
+                assert!(control_fits(&crate::proto::ProviderObservationControlV1 {
+                    payload: Some(payload)
+                }));
+            }
+            let mut mixed = read.clone();
+            mixed.expected_identity.as_mut().unwrap().profile_sha256 =
+                profile_digest_for(LEGACY_PROFILE).unwrap();
+            assert!(!read_fits(&mixed));
+            let mut oversized = read;
+            oversized.read_correlation = vec![0; MAX_READ_V2 + 1];
+            assert!(!read_fits(&oversized));
+            let mut oversized = result;
+            oversized.ack_window_sha256 = "x".repeat(MAX_RESULT_V2 + 1);
+            assert!(!result_fits(&oversized));
+            for size in [127, 128, 16_383, 16_384] {
+                // Preserve actual prost varint framing, rather than summing raw fields.
+                let mut nested = byte_request();
+                nested.installed_arm = Some(byte_arm(size));
+                assert_eq!(request_fits(&nested), size <= MAX_ARM);
+            }
+        }
+        #[test]
+        fn ordinary_v2_nested_exact_edges_keep_independent_stripped_bounds() {
+            let mut q = byte_request();
+            q.installed_arm = Some(byte_arm(MAX_ARM));
+            let snapshot = ProviderObservationSnapshotV1 {
+                profile_id: PROFILE.into(),
+                profile_sha256: profile_digest(),
+                ..Default::default()
+            };
+            let small = ProviderObservationCurrentReadV1 {
+                selector: Some(GetProviderDetachObservationRequest {
+                    original_request: Some(q.clone()),
+                    ..Default::default()
+                }),
+                expected_identity: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            let mut read = small.clone();
+            let mut found = false;
+            for n in 0..MAX_READ {
+                read.read_correlation = vec![1; n];
+                if read.encoded_len() == MAX_READ_V2 {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found);
+            assert!(read_fits(&read));
+            read.read_correlation.push(1);
+            assert_eq!(read.encoded_len(), MAX_READ_V2 + 1);
+            assert!(!read_fits(&read));
+            let mut reply = ProviderObservationCurrentReplyV1 {
+                original_read: Some(small.clone()),
+                sampled_snapshot: Some(snapshot),
+                ..Default::default()
+            };
+            let mut found = false;
+            for n in 0..MAX_READ {
+                reply.sampled_snapshot.as_mut().unwrap().supervisor_instance = "s".repeat(n);
+                if reply.encoded_len() == MAX_REPLY_V2 - 1 {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found);
+            assert!(reply_fits(&reply));
+            reply
+                .sampled_snapshot
+                .as_mut()
+                .unwrap()
+                .supervisor_instance
+                .push('s');
+            assert_eq!(reply.encoded_len(), MAX_REPLY_V2);
+            assert!(
+                !reply_fits(&reply),
+                "conservative full ceiling cannot waive stripped4096"
+            );
+            reply
+                .sampled_snapshot
+                .as_mut()
+                .unwrap()
+                .supervisor_instance
+                .push('s');
+            assert_eq!(reply.encoded_len(), MAX_REPLY_V2 + 1);
+            assert!(!reply_fits(&reply));
+            let mut result = ProviderObservationResultV1 {
+                window: Some(ProviderObservationWindowV1 {
+                    request: Some(q),
+                    ..Default::default()
+                }),
+                current_read: Some(ProviderObservationCurrentReplyV1 {
+                    original_read: Some(small.clone()),
+                    sampled_snapshot: small.expected_identity.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut found = false;
+            for n in 0..MAX_RESULT {
+                result.ack_window_sha256 = "a".repeat(n);
+                if result.encoded_len() == MAX_RESULT_V2 - 2 {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found);
+            assert!(result_fits(&result));
+            for target in [MAX_RESULT_V2 - 1, MAX_RESULT_V2, MAX_RESULT_V2 + 1] {
+                result.ack_window_sha256.push('a');
+                assert_eq!(result.encoded_len(), target);
+                assert!(
+                    !result_fits(&result),
+                    "all size projections must fit independently"
+                );
+            }
+            let encoded = small.encode_to_vec();
+            assert!(read_fits(&small));
+            assert_eq!(small.encode_to_vec(), encoded);
         }
     }
 }

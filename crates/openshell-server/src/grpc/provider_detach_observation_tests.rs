@@ -7,6 +7,7 @@ use crate::auth::{
 };
 use crate::persistence::{PROVIDER_OBSERVATION_OBJECT_TYPE, ordinary_key};
 use openshell_core::proto::{Provider, ProviderObservationWindowV1, SandboxSpec, SandboxStatus};
+use prost::Message;
 fn identity() -> Identity {
     Identity {
         subject: "approved-user".into(),
@@ -141,8 +142,8 @@ fn expected_snapshot(q: &ProviderObservationRequestV1) -> ProviderObservationSna
         resource: q.resource.clone(),
         source_incarnation: q.source_incarnation.clone(),
         boundary_incarnation: q.boundary_incarnation.clone(),
-        profile_id: obs::PROFILE.into(),
-        profile_sha256: obs::profile_digest(),
+        profile_id: q.profile_id.clone(),
+        profile_sha256: q.profile_sha256.clone(),
         evidence_scope: obs::EVIDENCE_SCOPE.into(),
         process_writer_attribution: obs::WRITER_UNPROVEN,
         mediation_path_id: uuid::Uuid::new_v4().to_string(),
@@ -322,5 +323,60 @@ async fn ordinary_observation_retained_original_snapshot_rejects_config_adoption
     assert_eq!(
         state.store.ordinary_history(&q).await.unwrap(),
         Some(result)
+    );
+}
+
+#[tokio::test]
+async fn ordinary_v2_does_not_reopen_legacy_original_or_admit_oversize() {
+    let (state, mut q) = store_fixture().await;
+    q.profile_id = obs::LEGACY_PROFILE.into();
+    q.profile_sha256 = obs::profile_digest_for(obs::LEGACY_PROFILE).unwrap();
+    q.request_sha256 = obs::request_digest(&q);
+    let expected = expected_snapshot(&q);
+    let fence = state.store.provider_detach_fence().await.unwrap();
+    assert!(
+        state
+            .store
+            .claim_ordinary_observation(&q, &fence, &expected)
+            .await
+            .unwrap()
+    );
+    let mut v2 = q.clone();
+    v2.profile_id = obs::PROFILE.into();
+    v2.profile_sha256 = obs::profile_digest();
+    v2.request_sha256 = obs::request_digest(&v2);
+    assert!(
+        state
+            .store
+            .claim_ordinary_observation(&v2, &fence, &expected_snapshot(&v2))
+            .await
+            .is_err()
+    );
+    assert!(
+        !state
+            .store
+            .claim_ordinary_observation(&q, &fence, &expected)
+            .await
+            .unwrap()
+    );
+    let (state, q) = store_fixture().await;
+    let fence = state.store.provider_detach_fence().await.unwrap();
+    let mut oversized = q.clone();
+    oversized.resource.as_mut().unwrap().authority = "x".repeat(obs::MAX_REQUEST_V2 + 1);
+    oversized.request_sha256 = obs::request_digest(&oversized);
+    assert!(
+        state
+            .store
+            .claim_ordinary_observation(&oversized, &fence, &expected_snapshot(&oversized))
+            .await
+            .is_err()
+    );
+    assert!(
+        state
+            .store
+            .claim_ordinary_observation(&q, &fence, &expected_snapshot(&q))
+            .await
+            .unwrap(),
+        "oversize must leave no original claim"
     );
 }

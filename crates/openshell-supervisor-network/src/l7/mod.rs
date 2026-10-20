@@ -13,6 +13,7 @@ pub(crate) mod http;
 pub mod jsonrpc;
 pub(crate) mod mcp;
 pub(crate) mod middleware;
+mod paid_run;
 pub mod path;
 pub mod provider;
 pub mod relay;

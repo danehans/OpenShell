@@ -555,9 +555,7 @@ pub async fn run_network_proxy(
                 "credential source was shared before gate binding"
             ));
         }
-        if openshell_core::provider_credentials::fixed_provider_witness_profile().is_some() {
-            provider_credentials.enable_provider_detach_attempts();
-        }
+        provider_readiness::configure_provider_detach_observation(&provider_credentials)?;
     }
 
     let (_, workspace_rx) = tokio::sync::watch::channel(String::new());
@@ -910,9 +908,7 @@ async fn run_sandbox_with_backend(
                 "credential source was shared before gate binding"
             ));
         }
-        if openshell_core::provider_credentials::fixed_provider_witness_profile().is_some() {
-            provider_credentials.enable_provider_detach_attempts();
-        }
+        provider_readiness::configure_provider_detach_observation(&provider_credentials)?;
     }
 
     if credential_gating_unavailable(

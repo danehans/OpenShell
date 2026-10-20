@@ -16,7 +16,6 @@ use openshell_core::proto::{
 };
 use openshell_core::provider_credentials::ordinary_observation as obs;
 use openshell_core::{ObjectName, ObjectWorkspace};
-use prost::Message;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -24,7 +23,7 @@ fn invalid() -> Status {
     Status::failed_precondition("ordinary original/current binding unavailable")
 }
 fn resource(q: &GetProviderDetachObservationRequest) -> Result<&ProviderDetachResourceV1, Status> {
-    if q.encoded_len() > 8192 {
+    if !obs::query_fits(q) {
         return Err(Status::resource_exhausted("ordinary query capacity"));
     }
     match (&q.original_request, &q.resource) {
@@ -392,7 +391,7 @@ pub async fn get(
                 result.current_read = Some(read);
             }
         }
-        if result.encoded_len() > obs::MAX_RESULT {
+        if !obs::result_fits(&result) {
             return Err(Status::resource_exhausted(
                 "ordinary public result capacity",
             ));

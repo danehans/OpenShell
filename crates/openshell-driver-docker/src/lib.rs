@@ -230,9 +230,83 @@ pub struct DockerComputeConfig {
     /// Host UNIX socket projected into the supervisor for provider identity.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
 
+    /// Optional finite manual demo gate. Gateway-local only; never taken from
+    /// caller-supplied sandbox driver JSON or projected into the workload.
+    pub manual_paid_run: Option<ManualPaidRunConfig>,
+
     /// `AppArmor` confinement requested for the workload container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_armor_profile: Option<AppArmorProfile>,
+}
+
+/// Trusted operator input for one finite manual run, never provider authority.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPaidRunConfig {
+    pub run: String,
+    /// Same absolute path in the Docker host and gateway. The gateway must have
+    /// a metadata-visible read-only file projection; supervisors alone append.
+    pub ledger_path: PathBuf,
+}
+impl ManualPaidRunConfig {
+    fn validate_shape(&self) -> CoreResult<()> {
+        if self.run.len() != 32
+            || !self
+                .run
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            || !self.ledger_path.is_absolute()
+            || self.ledger_path.components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+            || self
+                .ledger_path
+                .to_str()
+                .is_none_or(|p| p.chars().any(char::is_control))
+        {
+            return Err(Error::config("invalid manual paid-run binding"));
+        }
+        Ok(())
+    }
+    fn validate_file(&self) -> CoreResult<()> {
+        self.validate_shape()?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::symlink_metadata(&self.ledger_path)
+                .map_err(|_| Error::config("manual paid-run original ledger unavailable"))?;
+            if md.is_file()
+                && md.uid() == SUPERVISOR_UID
+                && md.mode() & 0o7777 == 0o600
+                && md.nlink() == 1
+                && md.len() <= 4096
+            {
+                return Ok(());
+            }
+        }
+        Err(Error::config(
+            "manual paid-run requires a private Linux supervisor-owned original ledger",
+        ))
+    }
+}
+const MANUAL_PAID_LEDGER_PATH: &str = "/run/m1-paid-ledger";
+fn manual_paid_fields(c: &ManualPaidRunConfig) -> (Vec<String>, Mount) {
+    (
+        vec![
+            format!("OPENSHELL_M1_PAID_LEDGER={MANUAL_PAID_LEDGER_PATH}"),
+            format!("OPENSHELL_M1_PAID_RUN={}", c.run),
+        ],
+        Mount {
+            target: Some(MANUAL_PAID_LEDGER_PATH.to_owned()),
+            source: Some(c.ledger_path.display().to_string()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        },
+    )
 }
 
 impl DockerComputeConfig {
@@ -252,6 +326,9 @@ impl DockerComputeConfig {
         self.upstream_proxy.validate().map_err(Error::config)?;
         validate_docker_proxy_auth_file(&self.upstream_proxy)?;
         validate_docker_proxy_ca_bundle(self)?;
+        if let Some(c) = &self.manual_paid_run {
+            c.validate_file()?;
+        }
         if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
             openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
                 .map_err(Error::config)?;
@@ -289,6 +366,7 @@ impl Default for DockerComputeConfig {
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_socket: None,
             app_armor_profile: None,
+            manual_paid_run: None,
         }
     }
 }
@@ -319,6 +397,7 @@ struct DockerDriverRuntimeConfig {
     proxy_ca_bundle: Option<PathBuf>,
     provider_spiffe_workload_api_socket: Option<PathBuf>,
     app_armor_profile: Option<AppArmorProfile>,
+    manual_paid_run: Option<ManualPaidRunConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -952,6 +1031,7 @@ impl DockerComputeDriver {
                     .provider_spiffe_workload_api_socket
                     .clone(),
                 app_armor_profile: docker_config.app_armor_profile.clone(),
+                manual_paid_run: docker_config.manual_paid_run.clone(),
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -5170,6 +5250,14 @@ async fn spawn_docker_control_process(
             read_only: Some(true),
             ..Default::default()
         });
+    }
+    if let Some(c) = &config.manual_paid_run {
+        // Recheck before the original create; never create/repair/reset a ledger.
+        c.validate_file()
+            .map_err(|_| Status::failed_precondition("manual paid-run ledger invalid"))?;
+        let (env, mount) = manual_paid_fields(c);
+        environment.extend(env);
+        supervisor_mounts.push(mount);
     }
     let create = ContainerCreateBody {
         image: Some(config.supervisor_image_id.clone()),
