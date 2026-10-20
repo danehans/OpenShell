@@ -107,6 +107,14 @@ the backend. Discovery/issuance alone does not establish protection; check the
 installed supervisor/gateway capabilities and integration qualification.
 
 
+If the experimental Docker `manual_paid_run` option is enabled, compare its
+original run and ledger metadata with the installed configuration reference.
+A missing file, wrong UID/mode, expired run or exhausted allowance refuses;
+never reset or replace a consumed ledger to restore traffic. The ledger belongs
+only in supervisors, not workloads. A native GNU supervisor that cannot load
+`libgcc_s.so.1` needs a matching trusted runtime image containing the unwinder;
+do not repair running containers with ad-hoc package installs.
+
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
 For resource-admission failures, distinguish disabled caller driver config from

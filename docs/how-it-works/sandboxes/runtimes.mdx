@@ -51,6 +51,14 @@ CA and authenticate gateway RPCs with sandbox bearer tokens. Kubernetes
 projects or stages only the gateway CA from its configured TLS Secret; user
 client certificates and private keys stay outside the sandbox boundary.
 
+For the experimental single-VM manual model demonstration, Docker can project
+one private request ledger into its supervisors with
+[`manual_paid_run`](/how-it-works/gateways/configuration#finite-manual-model-gate).
+It remains off by default and does not change workload grants or runtime
+isolation. The fixed operator-released Codex workload and its offline tests are
+in `examples/manual-codex-observation/`; they do not allocate a sandbox or
+configure credentials, containment, or paid provider access.
+
 ### Extension Drivers
 
 Any name other than a built-in driver selects an extension driver. Point the gateway at the Unix socket where the driver listens:

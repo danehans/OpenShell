@@ -554,6 +554,28 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 `image_pull_policy` is a shared driver setting with the canonical values `always`, `if_not_present`, `never`, and `newer`. Set it inside the relevant driver table. Drivers translate these values to their runtime APIs; `newer` is supported only by Podman and is rejected at Docker and Kubernetes startup.
 
+## Finite Manual Model Gate
+
+The experimental Docker-only `manual_paid_run` option defaults to absent. It
+requires a matching supervisor build and an existing private ledger shared by
+all supervisors in one manual run.
+
+```toml
+[openshell.drivers.docker.manual_paid_run]
+run = "<fresh 32-character lowercase hexadecimal run ID>"
+ledger_path = "/srv/m1/private/paid-ledger"
+```
+
+The ledger must be visible at the same path in the gateway and Docker host,
+owned by supervisor UID `65534`, with mode `0600` and a single file link. The
+launcher projects it only into supervisors. It never creates or repairs it.
+The gate admits at most eight requests within the original 300-second window
+and at most 128 output tokens per request, including reasoning. Failures and
+unknown outcomes do not refund permits. It does not measure input tokens,
+establish an account-wide spending cap, grant provider access, or support
+uninspected routes. Keep the file and its parent inaccessible to workloads;
+never replace or truncate a consumed original ledger.
+
 ## Credential Drivers
 
 Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
