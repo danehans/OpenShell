@@ -224,6 +224,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         proxy_ca_bundle: None,
         provider_spiffe_workload_api_socket: None,
         app_armor_profile: Some(AppArmorProfile::Unconfined),
+        manual_paid_run: None,
     }
 }
 
@@ -3732,5 +3733,61 @@ fn normalize_pull_reference_appends_latest_only_when_untagged() {
     assert_eq!(
         normalize_pull_reference("registry:5000/team/app:v1"),
         "registry:5000/team/app:v1"
+    );
+}
+
+
+#[test]
+fn manual_paid_run_is_default_off_and_not_workload_configuration() {
+    assert!(DockerComputeConfig::default().manual_paid_run.is_none());
+    assert!(runtime_config().manual_paid_run.is_none());
+    assert!(serde_json::from_value::<DockerSandboxDriverConfig>(serde_json::json!({"manual_paid_run":{"run":"0123456789abcdef0123456789abcdef","ledger_path":"/private/original"}})).is_err());
+}
+#[test]
+fn manual_paid_run_exact_shared_supervisor_only_fields() {
+    let c = ManualPaidRunConfig {
+        run: "0123456789abcdef0123456789abcdef".into(),
+        ledger_path: PathBuf::from("/private/original"),
+    };
+    c.validate_shape().unwrap();
+    let (a, ma) = manual_paid_fields(&c);
+    let (b, mb) = manual_paid_fields(&c);
+    assert_eq!(a, b);
+    assert_eq!(a.len(), 2);
+    assert_eq!(ma.source, mb.source);
+    assert_eq!(ma.target, mb.target);
+    assert_eq!(ma.source.as_deref(), Some("/private/original"));
+    assert_eq!(ma.target.as_deref(), Some("/run/m1-paid-ledger"));
+    assert_eq!(ma.read_only, Some(false));
+    assert!(
+        a.iter()
+            .any(|v| v == "OPENSHELL_M1_PAID_LEDGER=/run/m1-paid-ledger")
+    );
+    let workload = build_boundary_environment(&test_sandbox(), &runtime_config());
+    assert!(!workload.iter().any(|v| v.starts_with("OPENSHELL_M1_PAID_")));
+}
+#[test]
+fn manual_paid_run_invalid_binding_and_unavailable_file_refuse() {
+    for (run, path) in [
+        ("bad", "/private/original"),
+        ("0123456789abcdef0123456789abcdef", "relative"),
+        ("0123456789abcdef0123456789abcdef", "/private/../original"),
+    ] {
+        assert!(
+            ManualPaidRunConfig {
+                run: run.into(),
+                ledger_path: PathBuf::from(path)
+            }
+            .validate_shape()
+            .is_err()
+        );
+    }
+    assert!(
+        ManualPaidRunConfig {
+            run: "0123456789abcdef0123456789abcdef".into(),
+            ledger_path: PathBuf::from("/not-an-original-ledger")
+        }
+        .validate_file()
+        .is_err()
     );
 }

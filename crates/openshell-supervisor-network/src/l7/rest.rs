@@ -894,11 +894,26 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    let paid_request = super::paid_run::prepare(req, client, options.host, options.port).await?;
+    if paid_request.is_some()
+        && (options.request_body_credential_rewrite
+            || options.credential_signing.is_sigv4()
+            || options.mcp_request_validation.is_some())
+    {
+        return Err(miette!("manual paid-run requires static REST headers"));
+    }
+    let req = paid_request.as_ref().map_or(req, |p| &p.request);
     let ordinary =
         openshell_core::provider_credentials::ordinary_observation::request_observation();
-    let outcome = async {
-    let mut observed_upstream = ObservedUpstream { upstream, observer, ordinary: ordinary.as_deref() };
-    let upstream = &mut observed_upstream;
+    let relay = async {
+    let permit = paid_request.as_ref().map(|p| &p.permit);
+    let mut guarded_client = super::paid_run::WindowIo::new(client, permit);
+    let client = &mut guarded_client;
+    let mut observed_upstream = ObservedUpstream {
+        upstream, observer, ordinary: ordinary.as_deref(),
+    };
+    let mut guarded_upstream = super::paid_run::WindowIo::new(&mut observed_upstream, permit);
+    let upstream = &mut guarded_upstream;
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -1319,7 +1334,9 @@ where
     .await?;
 
     Ok(outcome)
-    }.await;
+    };
+    let outcome =
+        super::paid_run::within(paid_request.as_ref().map(|p| &p.permit), relay).await;
     if let Some(native) = ordinary {
         if outcome.is_err() {
             native.relay_failed();
@@ -11130,5 +11147,39 @@ mod ordinary_mediation_tests {
             .unwrap();
             assert_eq!(r.state, ProviderObservationStateV1::Unknown as i32);
         }
+    }
+}
+
+#[cfg(test)]
+mod paid_run_relay_tests {
+    use super::*;
+    use std::collections::HashMap;
+    #[test]
+    fn paid_run_refusals_have_zero_actual_upstream_application_bytes() {
+        temp_env::with_vars(
+            [
+                (
+                    "OPENSHELL_M1_PAID_LEDGER",
+                    Some("/nonexistent-original-paid-ledger"),
+                ),
+                (
+                    "OPENSHELL_M1_PAID_RUN",
+                    Some("0123456789abcdef0123456789abcdef"),
+                ),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                for body in [br#"{"model":"other","stream":true,"input":[]}"#.as_slice(),br#"{"model":"gpt-5.4-mini-2026-03-17","stream":true,"input":[],"max_output_tokens":129}"#,br#"{"model":"gpt-5.4-mini-2026-03-17","stream":true,"input":[]}"#] {
+                    let mut raw=format!("POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",body.len()).into_bytes();raw.extend_from_slice(body);
+                    let req=L7Request{action:"POST".into(),target:"/v1/responses".into(),query_params:HashMap::new(),raw_header:raw,body_length:BodyLength::ContentLength(body.len()as u64)};
+                    let mut client=tokio::io::duplex(1024).0;
+                    let(mut upstream,mut readback)=tokio::io::duplex(65536);
+                    let result=relay_http_request_with_options_guarded(&req,&mut client,&mut upstream,RelayRequestOptions{host:"api.openai.com",port:443,..Default::default()}).await;
+                    assert!(result.is_err());drop(upstream);
+                    let mut actual=Vec::new();readback.read_to_end(&mut actual).await.unwrap();assert!(actual.is_empty());
+                }
+            });
+            },
+        );
     }
 }

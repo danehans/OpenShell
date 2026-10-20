@@ -3569,6 +3569,13 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Finite paid mode requires the inspected REST gate; no credentialed
+    // passthrough may skip its per-request final-body validation and ledger.
+    if std::env::var_os("OPENSHELL_M1_PAID_LEDGER").is_some()
+        || std::env::var_os("OPENSHELL_M1_PAID_RUN").is_some()
+    {
+        return Err(miette!("manual paid-run requires inspected REST"));
+    }
     // Passthrough path: no L7 policy is enforced here, so use default
     // (strict) canonicalization options. Calls to GitLab-style APIs that
     // need `%2F` must be configured as L7 endpoints so the per-endpoint

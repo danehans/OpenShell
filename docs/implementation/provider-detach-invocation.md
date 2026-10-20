@@ -281,3 +281,68 @@ requires mTLS. There is no insecure, ambient-credential or administrator fallbac
 All outputs are bounded metadata; manual outcomes remain separate from Native
 model-completion proof. Actual grants, matching images, deployment, real model
 budget and independent containment/control evidence require separate authorization.
+
+### Finite manual OpenAI request gate
+
+The opt-in manual demo gate is separate from ordinary-observation byte budgets
+and management RPC rate limits. Normal behavior is unchanged when neither
+`OPENSHELL_M1_PAID_LEDGER` nor `OPENSHELL_M1_PAID_RUN` is configured. A partial or
+invalid configuration refuses requests. This mode requires Linux and inspected
+REST; credentialed passthrough refuses while it is enabled.
+
+A trusted launcher supplies both supervisors with the same private, owner-only
+regular ledger inode and the same 32-hex original run identifier. The workload
+must have no access to that file or its parent, and the mount must not permit
+replacement. The ledger is created exclusively before launch, contains the
+original Linux boot ID and a `CLOCK_BOOTTIME` deadline at most 300 seconds away,
+and allows at most eight requests across target and control. The trusted host
+and operator must not truncate, replace, copy or reinitialize it. The runtime
+never creates, repairs, refunds or replenishes a ledger. A nonblocking exclusive
+file lock serializes appends; contention refuses. A permit is usable only after
+its append is synchronized. Malformed tails, changed identity, restart with a
+different boot, exhaustion and expiry refuse. The original relay deadline is
+not renewed. An absolute Linux `CLOCK_BOOTTIME` timer cancels the original
+pending relay even across suspend, without translating its authority into a
+monotonic-duration timeout. Both upstream and client I/O check the same original
+clock before forwarding, including already buffered responses, flush and
+shutdown; newly read bytes are discarded if the clock expires during a read.
+An unmeasurable clock or unavailable timer refuses. Bytes already accepted by a
+transport before expiry cannot be recalled.
+
+Before credential rewriting or forwarding, the gate buffers at most 256 KiB
+with a five-second body-read timeout and validates the final complete JSON.
+Only `POST https://api.openai.com:443/v1/responses`, the pinned
+`gpt-5.4-mini-2026-03-17` model, text message and bounded prior-reasoning inputs, and explicit streaming or
+nonstreaming requests are admitted. Duplicate JSON keys, ambiguous headers,
+compression, chunked framing, upgrades, alternate billing headers, unsupported
+fields and hosted tools refuse. The finite benign profile removes client
+function definitions and forces no tools, default service tier, no background
+work, no storage, text output and at most 128 output tokens per request. The
+output ceiling includes reasoning tokens. This is deliberately not a general
+tool-using-agent profile. Unsupported client history shapes refuse rather than
+being relabeled compatible.
+
+Every reconnect and followup needs another permit, even after a truncated
+stream, cancellation, HTTP failure or unknown outcome. No result refunds one.
+Policy must deny alternate credentialed or uninspected routes, and both
+supervisors must actually receive this activation and shared inode; quiet logs
+are not evidence of those deployment properties. Existing provider resolution,
+authorization, generation checks and original observation/ACK guards remain in
+force. The gate is not an account-wide dollar limit. Input, history and
+instructions are billable; request bytes are not token counts. Reasoning is
+already part of output usage, not an additional output allowance. A paid run
+still needs separately approved account/model access, applicable prices and
+bounds, Native trust/grants, runtime assembly and independent CNI evidence.
+
+The Docker backend's gateway-local `manual_paid_run` configuration carries only
+`run` and `ledger_path`. It defaults to absent and is rejected in caller-supplied
+sandbox driver JSON. For example, an explicitly admitted private gateway can
+name a fresh original ledger at `/srv/m1/private/paid-ledger`; that exact file
+must be metadata-visible at the same absolute path in the gateway and Docker
+host. The launcher refuses a missing, nonregular, symlinked, multiply-linked or
+nonprivate file. It requires the actual supervisor UID 65534 and mode 0600.
+Only supervisor containers receive the two activation variables and the one
+read-write file bind at `/run/m1-paid-ledger`. The workload receives neither.
+The host setup and inspection of these exact mounts are separate runtime
+actions; the configuration does not create a ledger or transfer credential or
+sandbox authority. Existing images remain unchanged until separately rebuilt.
