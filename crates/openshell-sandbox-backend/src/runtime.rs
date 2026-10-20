@@ -131,6 +131,13 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             runtime_descriptor,
             self.sandbox_bearer.clone(),
         ));
+        // Ordinary accepts must not snapshot a missing adapter while startup
+        // is still creating it. The guard follows the actual startup owner.
+        let ordinary_startup = if self.provider_credentials.provider_detach_attempts_enabled() {
+            Some(OrdinaryStartupGuard::new(&client)?)
+        } else {
+            None
+        };
         let response = client
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
@@ -148,6 +155,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         }
         Ok(Box::new(RemoteBound {
             client: client.clone(),
+            ordinary_startup,
             agent: sandbox.agent,
             policy: sandbox.policy,
             sandbox_id: sandbox.sandbox_id,
@@ -293,6 +301,7 @@ fn validate_control_port(port: u32) -> Result<(), BackendError> {
 
 struct RemoteBound {
     client: Arc<BoundaryClient>,
+    ordinary_startup: Option<OrdinaryStartupGuard>,
     agent: AgentSpec,
     policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
@@ -349,6 +358,7 @@ impl BoundBoundary for RemoteBound {
         let confirmed = ConfirmedBoundary::try_new(
             Box::new(RemoteReady {
                 client: self.client,
+                ordinary_startup: self.ordinary_startup,
                 agent: self.agent,
                 policy: self.policy,
                 sandbox_id: self.sandbox_id,
@@ -365,6 +375,7 @@ impl BoundBoundary for RemoteBound {
 
 struct RemoteReady {
     client: Arc<BoundaryClient>,
+    ordinary_startup: Option<OrdinaryStartupGuard>,
     agent: AgentSpec,
     policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
@@ -439,6 +450,7 @@ impl ReadyBoundary for RemoteReady {
         };
         // Installed only after the original Native agent starts. The weak
         // adapter cannot prolong/adopt a lost boundary or expose generic Exec.
+        let mut ordinary_installed = false;
         let original_credential = BoundaryCredential::capture(&self.client.sandbox_bearer).ok();
         let original_connection = self.client.grpc_channel.lock().await.clone();
         if let (Some(credential), Some(connection)) = (original_credential, original_connection)
@@ -450,7 +462,7 @@ impl ReadyBoundary for RemoteReady {
             if self.provider_credentials.provider_detach_attempts_enabled() {
                 let ordinary = Arc::new(OrdinaryBoundary { pin: NativeWitnessBoundary::pin(&self.client, &connection), streams: openshell_core::provider_credentials::ordinary_observation::StreamRegistry::new() });
                 if self.client.observation.set(ordinary.clone()).is_ok() {
-                    let _ = self
+                    ordinary_installed = self
                         .provider_credentials
                         .install_observation_boundary(ordinary);
                 }
@@ -458,6 +470,9 @@ impl ReadyBoundary for RemoteReady {
             let _ = self.provider_credentials.install_witness_boundary(Arc::new(
                 NativeWitnessBoundary::pin(&self.client, &connection),
             ));
+        }
+        if let Some(startup) = &self.ordinary_startup {
+            startup.finish(ordinary_installed)?;
         }
         let process = Arc::new(RemoteProcess {
             client: self.client.clone(),
@@ -1185,6 +1200,10 @@ struct RemoteNetworkMediation {
 #[async_trait]
 impl NetworkMediationSource for RemoteNetworkMediation {
     async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
+        // Startup is not an idle accept: ordinary-enabled callers must wait
+        // before opening any boundary request, never adopt an earlier legacy
+        // accept after the original adapter appears.
+        self.client.wait_ordinary_startup().await?;
         // An idle accept has no deadline. Recover transport loss before exposing
         // a source error, which permanently stops the proxy. The boundary drops
         // the interrupted pending open; a retry never replays its decision.
@@ -1485,6 +1504,69 @@ struct BoundaryClient {
     network_streams: Arc<tokio::sync::Semaphore>,
     network_streams_exhausted: AtomicBool,
     observation: std::sync::OnceLock<Arc<OrdinaryBoundary>>,
+    ordinary_startup: tokio::sync::watch::Sender<OrdinaryStartup>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrdinaryStartup {
+    Legacy,
+    Pending,
+    Ready,
+    Failed,
+}
+
+/// The Attach -> Confirm -> `StartAgent` owner keeps this guard. Dropping any
+/// interrupted stage wakes pending accepts with a permanent refusal.
+struct OrdinaryStartupGuard {
+    state: tokio::sync::watch::Sender<OrdinaryStartup>,
+}
+impl OrdinaryStartupGuard {
+    fn new(client: &BoundaryClient) -> Result<Self, BackendError> {
+        if !client.ordinary_startup.send_if_modified(|state| {
+            if *state != OrdinaryStartup::Legacy {
+                return false;
+            }
+            *state = OrdinaryStartup::Pending;
+            true
+        }) {
+            return Err(BackendError::Unavailable(
+                "ordinary startup already claimed".into(),
+            ));
+        }
+        Ok(Self {
+            state: client.ordinary_startup.clone(),
+        })
+    }
+    fn finish(&self, installed: bool) -> Result<(), BackendError> {
+        let changed = self.state.send_if_modified(|state| {
+            if *state != OrdinaryStartup::Pending {
+                return false;
+            }
+            *state = if installed {
+                OrdinaryStartup::Ready
+            } else {
+                OrdinaryStartup::Failed
+            };
+            true
+        });
+        if !changed || !installed {
+            return Err(BackendError::Unavailable(
+                "ordinary startup adapter unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+impl Drop for OrdinaryStartupGuard {
+    fn drop(&mut self) {
+        self.state.send_if_modified(|state| {
+            if *state != OrdinaryStartup::Pending {
+                return false;
+            }
+            *state = OrdinaryStartup::Failed;
+            true
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -1649,6 +1731,28 @@ impl BoundaryClient {
             network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
             network_streams_exhausted: AtomicBool::new(false),
             observation: std::sync::OnceLock::new(),
+            ordinary_startup: tokio::sync::watch::channel(OrdinaryStartup::Legacy).0,
+        }
+    }
+
+    async fn wait_ordinary_startup(&self) -> Result<(), BackendError> {
+        let mut state = self.ordinary_startup.subscribe();
+        loop {
+            let current = *state.borrow_and_update();
+            match current {
+                OrdinaryStartup::Legacy => return Ok(()),
+                OrdinaryStartup::Ready if self.observation.get().is_some() => return Ok(()),
+                OrdinaryStartup::Ready | OrdinaryStartup::Failed => {
+                    return Err(BackendError::Unavailable(
+                        "ordinary startup unavailable; no legacy fallback".into(),
+                    ));
+                }
+                OrdinaryStartup::Pending => {}
+            }
+            state
+                .changed()
+                .await
+                .map_err(|_| BackendError::Unavailable("ordinary startup owner lost".into()))?;
         }
     }
 
@@ -2632,6 +2736,17 @@ mod tests {
         assert!(socket2::SockRef::from(&client).keepalive().unwrap());
     }
 
+    struct TestAcceptGate {
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    fn test_accept_gates() -> &'static std::sync::Mutex<HashMap<String, Arc<TestAcceptGate>>> {
+        static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<TestAcceptGate>>>> =
+            std::sync::OnceLock::new();
+        GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
     #[derive(Clone)]
     struct TestGrpcBoundary {
         wait_for_half_close: bool,
@@ -2666,6 +2781,11 @@ mod tests {
                 ));
             }
             let mut inbound = request.into_inner();
+            let accept_gate = test_accept_gates()
+                .lock()
+                .unwrap()
+                .get(&self.expected_token)
+                .cloned();
             let wait_for_half_close = self.wait_for_half_close;
             let requests = self.requests.clone();
             let mediation_ready = self.mediation_ready;
@@ -2764,6 +2884,18 @@ mod tests {
                                 provider_env_revision,
                                 provider_env_generation: provider_environment_generation,
                             },
+                            Request::AcceptNetwork if accept_gate.is_some() => {
+                                let gate = accept_gate.as_ref().unwrap();
+                                gate.entered.add_permits(1);
+                                gate.release.acquire().await.unwrap().forget();
+                                Response::NetworkConnected {
+                                    identity: crate::boundary_protocol::BinaryIdentityWire::Failed { message: "synthetic identity unused by adapter test".into() },
+                                    destination: "192.0.2.19:4000".parse().unwrap(),
+                                    socket: openshell_isolation_interface::contract::NetworkSocketMetadata { socket_cookie: 42, nonblocking: false, process_generation: 1 },
+                                    policy_generation: 0,
+                                    timing: crate::boundary_protocol::MediationTimingWire { notification_to_queue_us: 0, queue_wait_us: 0 },
+                                }
+                            }
                             Request::AcceptNetwork => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
                                 message: "no pending network request".to_string(),
@@ -3365,6 +3497,7 @@ mod tests {
         ));
         let bound = RemoteBound {
             client: client.clone(),
+            ordinary_startup: None,
             agent: context.agent,
             policy: context.policy,
             sandbox_id: context.sandbox_id,
@@ -3809,6 +3942,7 @@ mod tests {
             );
         let context = sandbox();
         let ready = Box::new(RemoteReady {
+            ordinary_startup: None,
             client: Arc::new(BoundaryClient::new(
                 tls_runtime_descriptor(address, certificate.client_tls),
                 test_bearer(&"a".repeat(32)),
@@ -4243,5 +4377,214 @@ mod tests {
             "restoring cache must not renew a lost original"
         );
         assert!(!ordinary.streams.is_live());
+    }
+
+    #[tokio::test]
+    async fn ordinary_startup_accept_before_adapter_keeps_original_association() {
+        // No sleep or scheduler race: explicitly poll the actual accept future
+        // while the adapter is absent, then install it before any response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = Arc::new(TestAcceptGate {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        test_accept_gates()
+            .lock()
+            .unwrap()
+            .insert(token.clone(), gate.clone());
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: token.clone(),
+            requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
+            provider_environment_generation: 0,
+            confirmation: test_confirmation(),
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBoundaryServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(address, test_certificate().client_tls),
+            test_bearer(&token),
+        ));
+        let original = CachedGrpcChannel {
+            credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            bearer_fingerprint: BoundaryCredential::capture(&client.sandbox_bearer)
+                .unwrap()
+                .fingerprint,
+            generation: 1,
+            channel,
+            transport: Arc::default(),
+        };
+        *client.grpc_channel.lock().await = Some(original.clone());
+        let startup = OrdinaryStartupGuard::new(&client).unwrap();
+        let source = RemoteNetworkMediation {
+            client: client.clone(),
+        };
+        let pending = source.accept_tcp();
+        tokio::pin!(pending);
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(Future::poll(pending.as_mut(), cx))).await,
+            Poll::Pending
+        ));
+        assert_eq!(
+            gate.entered.available_permits(),
+            0,
+            "no AcceptNetwork may precede adapter installation"
+        );
+        let credentials =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                0,
+                HashMap::new(),
+            );
+        credentials.enable_provider_detach_attempts();
+        let context = sandbox();
+        let ready = Box::new(RemoteReady {
+            client: client.clone(),
+            ordinary_startup: Some(startup),
+            agent: context.agent,
+            policy: context.policy,
+            sandbox_id: context.sandbox_id,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials: credentials,
+        });
+        let running = ready.start_agent().await.unwrap();
+        let observation = client.observation.get().unwrap().clone();
+        gate.release.add_permits(1);
+        let connection = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = observation
+            .streams
+            .take(&connection.stream, connection.socket.socket_cookie);
+        let associated = lease.is_some();
+        drop(lease);
+        drop(connection);
+        drop(running);
+        server.abort();
+        let _ = server.await;
+        test_accept_gates().lock().unwrap().remove(&token);
+        assert!(
+            associated,
+            "TCP accept polled before adapter installation returned an unregistered legacy stream after installation"
+        );
+    }
+
+    fn startup_test_client() -> Arc<BoundaryClient> {
+        Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(
+                "127.0.0.1:1".parse().unwrap(),
+                test_certificate().client_tls,
+            ),
+            test_bearer(&"a".repeat(32)),
+        ))
+    }
+    #[tokio::test]
+    async fn ordinary_startup_drop_refuses_without_boundary_request_or_permit() {
+        let client = startup_test_client();
+        let startup = OrdinaryStartupGuard::new(&client).unwrap();
+        let source = RemoteNetworkMediation {
+            client: client.clone(),
+        };
+        let pending = source.accept_tcp();
+        tokio::pin!(pending);
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(Future::poll(pending.as_mut(), cx))).await,
+            Poll::Pending
+        ));
+        assert_eq!(
+            client.network_streams.available_permits(),
+            MAX_NETWORK_STREAMS
+        );
+        drop(startup);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap(),
+            Err(BackendError::Unavailable(_))
+        ));
+        assert!(client.grpc_channel.lock().await.is_none());
+        assert!(
+            OrdinaryStartupGuard::new(&client).is_err(),
+            "failed original cannot be restarted"
+        );
+        assert_eq!(
+            client.network_streams.available_permits(),
+            MAX_NETWORK_STREAMS
+        );
+    }
+    #[tokio::test]
+    async fn ordinary_startup_failed_adapter_and_false_ready_refuse_permanently() {
+        let client = startup_test_client();
+        let startup = OrdinaryStartupGuard::new(&client).unwrap();
+        assert!(startup.finish(false).is_err());
+        assert!(client.wait_ordinary_startup().await.is_err());
+        assert!(startup.finish(true).is_err());
+        let client = startup_test_client();
+        let startup = OrdinaryStartupGuard::new(&client).unwrap();
+        startup.finish(true).unwrap();
+        assert!(
+            client.wait_ordinary_startup().await.is_err(),
+            "ready state alone is not an installed adapter"
+        );
+    }
+    #[tokio::test]
+    async fn ordinary_startup_default_off_keeps_legacy_gate_open() {
+        let client = startup_test_client();
+        assert!(client.wait_ordinary_startup().await.is_ok());
+        assert!(client.observation.get().is_none());
+        assert_eq!(*client.ordinary_startup.borrow(), OrdinaryStartup::Legacy);
+    }
+
+    #[tokio::test]
+    async fn ordinary_startup_cancelled_actual_start_wakes_accept_without_replay() {
+        let client = startup_test_client();
+        let startup = OrdinaryStartupGuard::new(&client).unwrap();
+        let locked = client.grpc_channel.lock().await;
+        let context = sandbox();
+        let credentials =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                0,
+                HashMap::new(),
+            );
+        credentials.enable_provider_detach_attempts();
+        let ready = Box::new(RemoteReady {
+            client: client.clone(),
+            ordinary_startup: Some(startup),
+            agent: context.agent,
+            policy: context.policy,
+            sandbox_id: context.sandbox_id,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials: credentials,
+        });
+        let mut starting = ready.start_agent();
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(Future::poll(starting.as_mut(), cx))).await,
+            Poll::Pending
+        ));
+        drop(starting);
+        drop(locked);
+        assert_eq!(*client.ordinary_startup.borrow(), OrdinaryStartup::Failed);
+        assert!(client.wait_ordinary_startup().await.is_err());
+        assert!(client.grpc_channel.lock().await.is_none());
+        assert!(OrdinaryStartupGuard::new(&client).is_err());
+        assert_eq!(
+            client.network_streams.available_permits(),
+            MAX_NETWORK_STREAMS
+        );
     }
 }
